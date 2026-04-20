@@ -1,5 +1,9 @@
 # Interceptor
 
+**Interceptor lets AI agents use your real browser like a human would.**
+
+It gives agents human-style control of your existing browser session so they can read pages, click, type, navigate, observe what a site is doing underneath, and learn repeatable workflows on the live web without starting from a separate automated browser.
+
 **Interceptor** is a browser tool built from frustration.
 
 Every browser automation framework talks to Chrome through the DevTools Protocol, and every site that cares can see it. Your agent gets detected. Your session gets blocked. You're running a separate browser instance that doesn't have your cookies, your logins, your context. You start from zero every time.

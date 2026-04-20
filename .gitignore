@@ -17,3 +17,10 @@ signing.env
 notarization.env
 interceptor-bridge/.build/
 keys/
+/.vscode/
+/Auto\ Run\ Docs/
+/Plans/
+/MEMORY/
+bench-head-to-head/results/
+bench-head-to-head/results-archive-*/
+extension/dist.crx
