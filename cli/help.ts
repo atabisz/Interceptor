@@ -211,6 +211,8 @@ Recording (Session Monitor):
 Meta:
   interceptor status                         Check daemon status (local — no connection needed)
   interceptor help                           This help text
+  interceptor --version                      Print version, build SHA, and build date (alias: -V)
+    --json                                   Emit version info as JSON
 
 Flags:
   --json                              Output as JSON`
