@@ -6,11 +6,37 @@
 #     /Library/Application Support/Interceptor (system locations — needs sudo)
 #   • Developer install (install.sh): repo-relative, no sudo
 #
+# --bridge-only flag downgrades a full install back to browser-only by
+# removing ONLY the Swift-bridge artifacts (LaunchAgent + .app + symlink),
+# leaving the daemon / CLI / extension / native-messaging manifest in place.
+#
 # Run with:
 #   sudo bash /Library/Application Support/Interceptor/uninstall.sh   (pkg install)
-#   bash scripts/uninstall.sh                                          (dev install)
+#   bash scripts/uninstall.sh                                          (dev install — full)
+#   bash scripts/uninstall.sh --bridge-only                            (downgrade to browser-only)
 
 set -euo pipefail
+
+# ── Parse flags ────────────────────────────────────────────────────────────────
+BRIDGE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --bridge-only) BRIDGE_ONLY=1 ;;
+    -h|--help)
+      echo "Usage: bash scripts/uninstall.sh [--bridge-only]"
+      echo ""
+      echo "  (no flags)        Remove everything — both browser and bridge surfaces."
+      echo "  --bridge-only     Remove only the macOS bridge (LaunchAgent + .app + symlink),"
+      echo "                    leaving the browser-only install (daemon, CLI, extension,"
+      echo "                    native messaging manifests) intact. Effectively downgrades"
+      echo "                    a full install to browser-only."
+      exit 0 ;;
+    *)
+      echo "Unknown flag: $arg" >&2
+      echo "Use 'bash scripts/uninstall.sh --help' for usage." >&2
+      exit 1 ;;
+  esac
+done
 
 USER_HOME="${USER_HOME_OVERRIDE:-$HOME}"
 # Honor sudo: prefer the GUI user's home so we clean per-user files even when
@@ -22,6 +48,49 @@ fi
 PATH_MARKER_START="# >>> interceptor path >>>"
 PATH_MARKER_END="# <<< interceptor path <<<"
 
+# ── Bridge-only path (downgrade) ──────────────────────────────────────────────
+if [[ "$BRIDGE_ONLY" == "1" ]]; then
+  echo "==> Downgrading to browser-only mode (--bridge-only)..."
+
+  echo "==> Stopping bridge process..."
+  pkill -f "interceptor-bridge" 2>/dev/null || true
+  rm -f /tmp/interceptor-bridge.sock /tmp/interceptor-bridge.pid
+
+  echo "==> Removing bridge LaunchAgent..."
+  TARGET_UID="$(id -u "${SUDO_USER:-$USER}" 2>/dev/null || echo "")"
+  if [[ -n "$TARGET_UID" ]]; then
+    launchctl bootout "gui/$TARGET_UID/com.interceptor.bridge" 2>/dev/null || true
+  fi
+  rm -f "$USER_HOME/Library/LaunchAgents/com.interceptor.bridge.plist"
+  if [[ -e "/Library/LaunchAgents/com.interceptor.bridge.plist" ]]; then
+    rm -f "/Library/LaunchAgents/com.interceptor.bridge.plist" 2>/dev/null && \
+      echo "    removed /Library/LaunchAgents/com.interceptor.bridge.plist" || \
+      echo "    /Library/LaunchAgents/com.interceptor.bridge.plist — re-run with sudo"
+  fi
+
+  echo "==> Removing bridge .app bundle and symlinks..."
+  if [[ -e "$USER_HOME/.local/share/interceptor/interceptor-bridge.app" ]]; then
+    rm -rf "$USER_HOME/.local/share/interceptor/interceptor-bridge.app"
+  fi
+  # If the .local/share/interceptor dir is now empty, drop it.
+  rmdir "$USER_HOME/.local/share/interceptor" 2>/dev/null || true
+  rm -f "$USER_HOME/.local/bin/interceptor-bridge"
+  if [[ -e "/Applications/interceptor-bridge.app" ]]; then
+    rm -rf "/Applications/interceptor-bridge.app" 2>/dev/null && \
+      echo "    removed /Applications/interceptor-bridge.app" || \
+      echo "    /Applications/interceptor-bridge.app — re-run with sudo"
+  fi
+  if [[ -e "/usr/local/bin/interceptor-bridge" ]]; then
+    rm -f "/usr/local/bin/interceptor-bridge" 2>/dev/null || true
+  fi
+
+  echo ""
+  echo "Bridge removed. Browser-only install remains intact."
+  echo "Verify with: interceptor status   (expect 'mode: browser-only')"
+  exit 0
+fi
+
+# ── Full uninstall (default) ──────────────────────────────────────────────────
 echo "==> Stopping interceptor processes..."
 pkill -f "interceptor-daemon" 2>/dev/null || true
 pkill -f "interceptor-bridge" 2>/dev/null || true
@@ -57,6 +126,13 @@ if [[ -e "/Library/LaunchAgents/com.interceptor.bridge.plist" ]]; then
     echo "    removed /Library/LaunchAgents/com.interceptor.bridge.plist" || \
     echo "    /Library/LaunchAgents/com.interceptor.bridge.plist — re-run with sudo"
 fi
+
+echo "==> Removing per-user bridge .app bundle and symlinks..."
+if [[ -e "$USER_HOME/.local/share/interceptor/interceptor-bridge.app" ]]; then
+  rm -rf "$USER_HOME/.local/share/interceptor/interceptor-bridge.app"
+fi
+rmdir "$USER_HOME/.local/share/interceptor" 2>/dev/null || true
+rm -f "$USER_HOME/.local/bin/interceptor-bridge"
 
 echo "==> Removing pkg-installed system files (requires sudo to fully clean)..."
 if [[ -e "/Applications/interceptor-bridge.app" ]]; then

@@ -19,6 +19,7 @@ import { parseSseCommand } from "./commands/sse"
 import { runCompoundCommand } from "./commands/compound"
 import { runOverride } from "./commands/override"
 import { runMacosCommand } from "./commands/macos"
+import { runUpgradeCommand } from "./commands/upgrade"
 
 // Command → module routing
 const STATE_CMDS = new Set(["state", "tree", "diff", "find", "text", "html"])
@@ -37,9 +38,10 @@ const SSE_CMDS = new Set(["sse"])
 const COMPOUND_CMDS = new Set(["open", "read", "act", "inspect"])
 const OVERRIDE_CMDS = new Set(["override"])
 const MACOS_CMDS = new Set(["macos"])
+const UPGRADE_CMDS = new Set(["upgrade"])
 
 // Commands that don't require a daemon connection
-const NO_DAEMON = new Set(["status", "help", "events", "session"])
+const NO_DAEMON = new Set(["status", "help", "events", "session", "upgrade"])
 
 // Monitor subcommands that are handled locally (no daemon needed)
 const MONITOR_LOCAL_SUBCOMMANDS = new Set(["tail", "list", "export"])
@@ -87,6 +89,11 @@ async function main() {
 
   if (MACOS_CMDS.has(cmd)) {
     await runMacosCommand(filtered, { jsonMode, useWs, globalTabId })
+    return
+  }
+
+  if (UPGRADE_CMDS.has(cmd)) {
+    await runUpgradeCommand(filtered)
     return
   }
 

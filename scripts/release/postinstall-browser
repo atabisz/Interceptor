@@ -1,0 +1,45 @@
+#!/bin/bash
+# Postinstall for Interceptor-Browser-<v>.pkg.
+#
+# Symlinks the rendered native messaging host manifest into the installing
+# user's Chrome and Brave NativeMessagingHosts directories. Does NOT bootstrap
+# any LaunchAgent — the Browser pkg has no bridge, no /Applications/ payload,
+# and no /Library/LaunchAgents/ payload.
+#
+# This is the browser-only counterpart to scripts/release/postinstall-full.
+
+set -euo pipefail
+
+INSTALL_ROOT="/Library/Application Support/Interceptor"
+RENDERED_MANIFEST="$INSTALL_ROOT/com.interceptor.host.json"
+
+# ── Identify the installing user ──────────────────────────────────────────────
+# The installer sets $USER to root; we need the GUI user who initiated the
+# install. macOS exposes that via the console-owning user.
+TARGET_USER="$(stat -f '%Su' /dev/console)"
+if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
+  TARGET_USER="${USER:-}"
+fi
+
+if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
+  # No GUI user (e.g. headless install). Payload is laid down; per-user
+  # symlinks just don't get created in this run — the user can re-run the
+  # installer from their session.
+  exit 0
+fi
+
+TARGET_HOME="$(dscl . -read /Users/"$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+
+# ── Symlink manifest into Chrome + Brave per-user NMH dirs ────────────────────
+if [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]]; then
+  for browser_dir in \
+    "$TARGET_HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts" \
+    "$TARGET_HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"
+  do
+    mkdir -p "$browser_dir"
+    ln -sfn "$RENDERED_MANIFEST" "$browser_dir/com.interceptor.host.json"
+    chown -R "$TARGET_USER" "$browser_dir" 2>/dev/null || true
+  done
+fi
+
+exit 0

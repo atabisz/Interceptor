@@ -5,6 +5,7 @@
  * that get routed to the native bridge via the daemon.
  */
 
+import { existsSync } from "node:fs"
 import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
 
 type Action = { type: string; [key: string]: unknown }
@@ -29,10 +30,52 @@ async function send(
   }
 }
 
+// Bridge preflight: detect browser-only installs and short-circuit before the
+// daemon roundtrip times out at 15s with a misleading "Ensure Chrome/Brave"
+// message. Returns a reason string if the bridge is unreachable, else null.
+function bridgePreflightFailure(): string | null {
+  if (process.platform !== "darwin") {
+    return "'interceptor macos *' commands require macOS (the Swift bridge is mac-only)."
+  }
+  const home = process.env.HOME || ""
+  // Two LaunchAgent locations depending on install channel: per-user (dev
+  // path via scripts/install-bridge.sh) or system-wide (signed-pkg path via
+  // Interceptor-Full-<v>.pkg). Either is sufficient.
+  const launchAgentUser = `${home}/Library/LaunchAgents/com.interceptor.bridge.plist`
+  const launchAgentSystem = "/Library/LaunchAgents/com.interceptor.bridge.plist"
+  const bridgeSock = "/tmp/interceptor-bridge.sock"
+  const bridgePid = "/tmp/interceptor-bridge.pid"
+  const launchAgentInstalled = existsSync(launchAgentUser) || existsSync(launchAgentSystem)
+  const bridgeReachable = existsSync(bridgeSock) || existsSync(bridgePid)
+  if (!launchAgentInstalled && !bridgeReachable) {
+    return [
+      "'interceptor macos *' requires full computer-use mode.",
+      "You're currently running in browser-only mode (no bridge installed).",
+      "",
+      "To enable:",
+      "  interceptor upgrade --full",
+    ].join("\n")
+  }
+  return null
+}
+
 export async function runMacosCommand(
   filtered: string[],
   opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number }
 ): Promise<void> {
+  // Skip preflight only for "trust" — that subcommand is the user-driven
+  // first-run permission walkthrough and may legitimately be the very first
+  // call before anything else is wired up. The bridge will surface its own
+  // not-ready errors there.
+  const sub = filtered[1]
+  if (sub !== "trust") {
+    const failure = bridgePreflightFailure()
+    if (failure !== null) {
+      console.error(`error: ${failure}`)
+      process.exit(1)
+    }
+  }
+
   const action = parseMacosCommand(filtered)
   if (!action) process.exit(1)
 

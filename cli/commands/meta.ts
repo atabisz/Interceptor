@@ -33,13 +33,23 @@ export async function parseMetaCommand(filtered: string[], jsonMode = false): Pr
           }
         } catch {}
       }
-      statusLines.push(`daemon: ${daemonAlive ? "running" : "not running"}`)
-      if (daemonPid) statusLines.push(`pid: ${daemonPid}`)
-      statusLines.push(`socket: ${sockExists ? SOCKET_PATH : "not found"}`)
-      statusLines.push(`transport: ${transport}`)
 
+      // Bridge presence + state — needed for both the bridge: block and the
+      // mode: line below. Mode detection rules:
+      //   • LaunchAgent plist present AND bridge alive  → full
+      //   • LaunchAgent plist present AND bridge not alive → full (mode is the
+      //     install state; "running" is reported separately on the bridge: line)
+      //   • neither present → browser-only
+      //   • bridge alive but no LaunchAgent (manual launch) → unknown
       const BRIDGE_PID_PATH = "/tmp/interceptor-bridge.pid"
       const BRIDGE_SOCK_PATH = "/tmp/interceptor-bridge.sock"
+      // The LaunchAgent plist lands in two different places depending on the
+      // install channel. Dev install (scripts/install-bridge.sh) puts it under
+      // the user's $HOME; signed-pkg install (Interceptor-Full-<v>.pkg) puts
+      // it at the system path. Either is sufficient for `mode: full`.
+      const LAUNCH_AGENT_PATH_USER = `${process.env.HOME || ""}/Library/LaunchAgents/com.interceptor.bridge.plist`
+      const LAUNCH_AGENT_PATH_SYSTEM = "/Library/LaunchAgents/com.interceptor.bridge.plist"
+      const launchAgentInstalled = !IS_WIN && (existsSync(LAUNCH_AGENT_PATH_USER) || existsSync(LAUNCH_AGENT_PATH_SYSTEM))
       const bridgeSockExists = !IS_WIN && existsSync(BRIDGE_SOCK_PATH)
       let bridgePid: number | null = null
       let bridgeAlive = false
@@ -51,12 +61,42 @@ export async function parseMetaCommand(filtered: string[], jsonMode = false): Pr
           }
         } catch {}
       }
+
+      let mode: "browser-only" | "full" | "unknown"
+      if (IS_WIN) {
+        mode = "browser-only"
+      } else if (launchAgentInstalled) {
+        mode = "full"
+      } else if (bridgeAlive) {
+        mode = "unknown"
+      } else {
+        mode = "browser-only"
+      }
+
+      statusLines.push(`mode: ${mode}`)
       statusLines.push("")
-      statusLines.push(`bridge: ${bridgeAlive ? "running" : "not running"}`)
-      if (bridgePid) statusLines.push(`  pid: ${bridgePid}`)
-      statusLines.push(`  socket: ${bridgeSockExists ? BRIDGE_SOCK_PATH : "not found"}`)
-      if (!bridgeAlive) {
-        statusLines.push("  hint: run scripts/build-bridge.sh && scripts/install-bridge.sh for native macOS control.")
+      statusLines.push(`daemon: ${daemonAlive ? "running" : "not running"}`)
+      if (daemonPid) statusLines.push(`pid: ${daemonPid}`)
+      statusLines.push(`socket: ${sockExists ? SOCKET_PATH : "not found"}`)
+      statusLines.push(`transport: ${transport}`)
+
+      // Only render the bridge: block when in full mode (or unknown — surface
+      // it so the user can investigate). In pure browser-only mode the absence
+      // of the block is informative on its own.
+      if (mode !== "browser-only") {
+        statusLines.push("")
+        statusLines.push(`bridge: ${bridgeAlive ? "running" : "not running"}`)
+        if (bridgePid) statusLines.push(`  pid: ${bridgePid}`)
+        statusLines.push(`  socket: ${bridgeSockExists ? BRIDGE_SOCK_PATH : "not found"}`)
+        if (mode === "unknown") {
+          statusLines.push("  note: bridge is alive but no LaunchAgent plist found at ~/Library/LaunchAgents/com.interceptor.bridge.plist or /Library/LaunchAgents/com.interceptor.bridge.plist.")
+          statusLines.push("        Run 'interceptor upgrade --full' to install the LaunchAgent for persistence.")
+        } else if (!bridgeAlive) {
+          statusLines.push("  hint: LaunchAgent installed but bridge is not running. Try: launchctl kickstart -k gui/$(id -u)/com.interceptor.bridge")
+        }
+      } else if (!IS_WIN) {
+        statusLines.push("")
+        statusLines.push("To enable native macOS control:    interceptor upgrade --full")
       }
 
       if (!daemonAlive) {
@@ -66,13 +106,15 @@ export async function parseMetaCommand(filtered: string[], jsonMode = false): Pr
       }
       if (jsonMode) {
         console.log(JSON.stringify({
+          mode,
           daemon: daemonAlive,
           pid: daemonPid,
           socket: sockExists ? SOCKET_PATH : null,
           transport,
           bridge: bridgeAlive,
           bridgePid,
-          bridgeSocket: bridgeSockExists ? BRIDGE_SOCK_PATH : null
+          bridgeSocket: bridgeSockExists ? BRIDGE_SOCK_PATH : null,
+          launchAgentInstalled
         }, null, 2))
       } else {
         console.log(statusLines.join("\n"))

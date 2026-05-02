@@ -70,33 +70,54 @@ Click the preview to watch the current walkthrough. It shows the CLI flow and li
 
 ## Install In 60 Seconds
 
-Download the signed installer and double-click. macOS does the rest.
+Download a signed installer and double-click. macOS does the rest.
 
-1. Download the latest **`Interceptor-<version>.pkg`** from the [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page.
-2. Double-click the `.pkg`. Walk through the installer (admin password required once).
-3. Open **System Settings → Privacy & Security**. The first time you run `interceptor macos *`, macOS will prompt for **Accessibility**, **Screen Recording**, and **Apple Events** access for `interceptor-bridge` — allow each.
+Two installers ship per release. Pick the one that matches what you actually need:
+
+| Installer | What it installs | macOS TCC consents | When to pick it |
+|---|---|---|---|
+| **`Interceptor-Browser-<version>.pkg`** *(recommended default)* | CLI + daemon + extension | **None.** No Screen Recording / Accessibility / Apple Events prompts. | You drive web pages. Web scraping, CI flow tests, browser automation. macOS 11+. |
+| **`Interceptor-Full-<version>.pkg`** | All of the above **plus** `interceptor-bridge.app` + LaunchAgent | Screen Recording, Accessibility, Apple Events (per target app, on first dispatch) | You also drive native macOS apps (Finder, Slack, Notes), need on-screen text capture, dispatch keystrokes outside the browser. macOS 14+. |
+
+Both download from the same [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page. Start with **Browser** unless you know you need native macOS commands — you can always upgrade to Full later via `interceptor upgrade --full`.
+
+### Install steps
+
+1. Download the matching `.pkg` from Releases.
+2. Double-click it. Walk through the installer (admin password required once).
+3. *(Full pkg only)* Open **System Settings → Privacy & Security**. The first time you run `interceptor macos *`, macOS will prompt for **Accessibility**, **Screen Recording**, and **Apple Events** access for `interceptor-bridge` — allow each. The Browser pkg never triggers these prompts.
 4. Open a terminal:
 
 ```bash
-interceptor open "https://example.com"        # browser surface
-interceptor macos tree                         # macOS surface (after Privacy & Security grants)
+interceptor open "https://example.com"        # browser surface (works in both pkgs)
+interceptor macos tree                         # macOS surface (Full pkg only, after Privacy & Security grants)
 ```
 
-That's it. The pkg installs:
+### What each pkg lays down
+
+**Browser pkg** (`Interceptor-Browser-<version>.pkg`):
 
 | Component | Destination |
 |---|---|
 | `interceptor` CLI | `/usr/local/bin/interceptor` (on `PATH`) |
-| `interceptor-bridge.app` | `/Applications/interceptor-bridge.app` |
 | Daemon + extension files | `/Library/Application Support/Interceptor/` |
 | Chrome + Brave native messaging hosts | Per-user `~/Library/Application Support/.../NativeMessagingHosts/` |
 
-**Browser extension load** is the one manual step the installer cannot do for you, because Chrome and Brave do not allow programmatic extension installation outside of the Web Store. After install:
+**Full pkg** (`Interceptor-Full-<version>.pkg`) adds:
+
+| Component | Destination |
+|---|---|
+| `interceptor-bridge.app` | `/Applications/interceptor-bridge.app` |
+| LaunchAgent (auto-start at login) | `/Library/LaunchAgents/com.interceptor.bridge.plist` |
+
+**Browser extension load** is the one manual step neither installer can do for you, because Chrome and Brave do not allow programmatic extension installation outside of the Web Store. After install:
 
 - **Brave:** open `brave://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
 - **Chrome:** open `chrome://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
 
-To uninstall later: `sudo bash "/Library/Application Support/Interceptor/uninstall.sh"`.
+Verify after install with `interceptor status` — the `mode:` line reports `browser-only` or `full` depending on which pkg you installed.
+
+To uninstall later: `sudo bash "/Library/Application Support/Interceptor/uninstall.sh"`. To downgrade Full → Browser: `sudo bash "/Library/Application Support/Interceptor/uninstall.sh" --bridge-only`.
 
 Prefer to build from source instead of using the installer? See [Developer Setup](#developer-setup-build-from-source) below.
 
@@ -172,6 +193,17 @@ The recommended install path for end users is the signed `.pkg` documented in [I
 - Brave Browser (or Chrome — see Chrome path below)
 - Xcode command line tools (only required if you want to build the macOS bridge)
 
+#### Two install modes
+
+`scripts/install.sh` ships with two named install modes. Pick by what you actually need:
+
+| Mode | What it installs | macOS TCC prompts | When to pick it |
+|---|---|---|---|
+| **`--browser-only`** | CLI + daemon + extension | None | You only want browser control. Smallest footprint, no Screen Recording / Accessibility / Apple Events prompts. Works on macOS and Windows. |
+| **`--full`** | Everything in browser-only **plus** the Swift bridge `.app`, the LaunchAgent, and the macOS subcommands | Screen Recording, Accessibility, Apple Events (per-target-app on first dispatch) | You need `interceptor macos *` (native AX tree, OS-level input, ScreenCaptureKit, Vision/Speech/NLP). macOS only. |
+
+If you don't pass either flag, the script prompts. The default in the prompt is `--full` on macOS, `--browser-only` everywhere else.
+
 #### Build and Install
 
 ```bash
@@ -179,18 +211,29 @@ git clone https://github.com/Hacker-Valley-Media/Interceptor.git
 cd Interceptor
 bun install
 bash scripts/build.sh
-bash scripts/install.sh --brave --profile Default
+
+# Pick a mode:
+bash scripts/install.sh --browser-only --brave --profile Default   # browser only, no TCC
+bash scripts/install.sh --full --brave --profile Default           # browser + macOS bridge
+bash scripts/install.sh --brave --profile Default                  # interactive prompt
+bash scripts/install.sh --full --dry-run                           # print steps without running
 ```
 
-This builds the host binaries and extension, writes native messaging manifests pointing at the repo paths, and relaunches Brave with the unpacked extension from `extension/dist/`. Use `bash scripts/install.sh --brave --profiles` to list profile directories before choosing a non-default profile.
+This builds the host binaries and extension, writes native messaging manifests pointing at the repo paths, and relaunches Brave with the unpacked extension from `extension/dist/`. Under `--full` it then chains into `scripts/install-bridge.sh` to install the bridge `.app`, register it with LaunchServices, and bootstrap the LaunchAgent. Use `bash scripts/install.sh --brave --profiles` to list profile directories before choosing a non-default profile.
+
+To upgrade a `--browser-only` install later, run `interceptor upgrade --full` (macOS only).
 
 The dev install produces and uses these artifacts:
 
-| Artifact | Path |
-|----------|------|
-| CLI binary | `dist/interceptor` |
-| Background daemon | `daemon/interceptor-daemon` |
-| Chrome extension | `extension/dist/` |
+| Artifact | Browser-only | Full |
+|----------|:---:|:---:|
+| `dist/interceptor` (CLI) | ✅ | ✅ |
+| `daemon/interceptor-daemon` | ✅ | ✅ |
+| `extension/dist/` | ✅ | ✅ |
+| `~/Library/Application Support/{Chrome,Brave}/NativeMessagingHosts/com.interceptor.host.json` (symlink) | ✅ | ✅ |
+| `~/.local/share/interceptor/interceptor-bridge.app` | — | ✅ |
+| `~/.local/bin/interceptor-bridge` (symlink) | — | ✅ |
+| `~/Library/LaunchAgents/com.interceptor.bridge.plist` | — | ✅ |
 
 #### Put the CLI on PATH
 
@@ -213,14 +256,26 @@ Google Chrome ignores `--load-extension` in branded desktop builds. `scripts/ins
 #### Uninstall
 
 ```bash
-bash scripts/uninstall.sh
+bash scripts/uninstall.sh                   # Remove everything (both modes)
+bash scripts/uninstall.sh --bridge-only     # Remove only the macOS bridge (downgrade to browser-only)
 ```
 
 #### Verify
 
 ```bash
-./dist/interceptor status    # Should report daemon, extension, and browser bridge status
+./dist/interceptor status
+# Browser-only install:
+#   mode: browser-only
+#   daemon: running
+#   ...
+# Full install:
+#   mode: full
+#   daemon: running
+#   bridge: running
+#   ...
 ```
+
+In browser-only mode, running an `interceptor macos *` command returns a structured "requires full computer-use install" error within 1 second instead of timing out at 15 seconds.
 
 ## Browser Quick Start
 

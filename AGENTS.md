@@ -4,6 +4,29 @@ Interceptor is an AI-agent control surface for the user's real browser and nativ
 
 For user-facing overview material, see [README.md](README.md). For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Install Modes
+
+Interceptor ships in two install modes. Check yours with `interceptor status` and read the `mode:` line:
+
+- **`mode: browser-only`** — CLI + daemon + extension. All browser commands work. `interceptor macos *` returns a structured "requires full computer-use install" error in under one second. Smallest footprint, no macOS TCC prompts (no Screen Recording / Accessibility / Apple Events).
+- **`mode: full`** — Browser-only plus the Swift bridge `.app`, the LaunchAgent, and the macOS subcommands. Adds AX tree, OS-level input, ScreenCaptureKit capture, Vision / Speech / NLP. macOS only.
+
+The `mode:` line reflects whichever distribution path the user took. Two distinct install channels feed into the same mode taxonomy:
+
+| Install channel | How `mode:` lands |
+|---|---|
+| `Interceptor-Browser-<v>.pkg` (signed installer) | `mode: browser-only` |
+| `Interceptor-Full-<v>.pkg` (signed installer) | `mode: full` |
+| `bash scripts/install.sh --browser-only` (dev path) | `mode: browser-only` |
+| `bash scripts/install.sh --full` (dev path) | `mode: full` |
+| `interceptor upgrade --full` (promotion from any browser-only install) | `mode: full` |
+
+Operating rules:
+- Do not loop on the 15-second timeout. The `interceptor macos *` preflight short-circuits in browser-only mode with an actionable error — read it, do not retry.
+- If the user asks for something native and `interceptor status` reports `mode: browser-only`, respond: "I'm on a browser-only install. Run `interceptor upgrade --full` (macOS only) to enable that command." Don't run the macos command anyway "to see what happens" — the preflight has already answered.
+- The promotion command is `interceptor upgrade --full` (works for both pkg-installed and dev-installed browser-only). The downgrade command is `bash scripts/uninstall.sh --bridge-only` (or for pkg installs, `sudo bash "/Library/Application Support/Interceptor/uninstall.sh" --bridge-only`).
+- `mode: unknown` (rare) means the bridge is alive but the LaunchAgent plist is missing. Surface the situation; do not paper over it.
+
 ## Core Rules
 
 - Use `./dist/interceptor ...` when working inside this repository and the binary is not on `PATH`.

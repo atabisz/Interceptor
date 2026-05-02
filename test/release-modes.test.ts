@@ -1,0 +1,191 @@
+/**
+ * test/release-modes.test.ts
+ *
+ * Asserts the two release-pkg modes produce the right step lists under
+ * INTERCEPTOR_DRY_RUN=1 (or --dry-run). These tests do NOT modify any
+ * system state — they shell out to scripts/release.sh with the dry-run
+ * flag and inspect its stdout. No keychain credentials, no notarytool,
+ * no actual pkg files are produced.
+ */
+
+import { describe, expect, test } from "bun:test"
+import { spawnSync } from "node:child_process"
+import { resolve } from "node:path"
+
+const REPO_ROOT = resolve(import.meta.dir, "..")
+const RELEASE_SCRIPT = resolve(REPO_ROOT, "scripts/release.sh")
+const TEST_VERSION = "0.0.0-test"
+
+function runReleaseDryRun(args: string[]): {
+  stdout: string
+  stderr: string
+  status: number
+} {
+  const proc = spawnSync(
+    "bash",
+    [RELEASE_SCRIPT, "--dry-run", `--version=${TEST_VERSION}`, ...args],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, INTERCEPTOR_DRY_RUN: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    },
+  )
+  return {
+    stdout: proc.stdout?.toString() ?? "",
+    stderr: proc.stderr?.toString() ?? "",
+    status: proc.status ?? -1,
+  }
+}
+
+describe("release modes — dry-run", () => {
+  test("--browser-only emits Browser pkg and zero bridge artifacts", () => {
+    const { stdout, status } = runReleaseDryRun(["--browser-only"])
+    expect(status).toBe(0)
+    expect(stdout).toContain("Mode(s): browser-only")
+    expect(stdout).toContain("DRY RUN")
+    expect(stdout).toContain("distribution-browser.xml")
+    expect(stdout).toContain(`Interceptor-Browser-${TEST_VERSION}.pkg`)
+    expect(stdout).toContain("Step 6: Skipped (browser-only mode")
+
+    // The Browser pkg branch must NOT emit any bridge-related step. This is
+    // the structural enforcement: a browser-only
+    // build never references the bridge .app, the LaunchAgent plist, or
+    // bridge-component.plist.
+    expect(stdout).not.toContain("interceptor-bridge.app")
+    expect(stdout).not.toContain("com.interceptor.bridge.plist")
+    expect(stdout).not.toContain("Interceptor-Bridge.pkg")
+    expect(stdout).not.toContain("bridge-component.plist")
+    expect(stdout).not.toContain("Interceptor-Daemon-Full.pkg")
+    expect(stdout).not.toContain(`Interceptor-Full-${TEST_VERSION}`)
+    expect(stdout).not.toContain("daemon-full")
+
+    // Productbuild for browser-only must reference distribution-browser.xml,
+    // never the Full distribution.xml.
+    const productbuildLines = stdout
+      .split("\n")
+      .filter((l) => l.includes("DRY: productbuild"))
+    expect(productbuildLines.length).toBe(1)
+    expect(productbuildLines[0]).toContain("distribution-browser.xml")
+    expect(productbuildLines[0]).not.toMatch(/distribution\.xml(?!\w)/)
+  })
+
+  test("--full emits Full pkg with bridge + LaunchAgent + bridge-component artifacts", () => {
+    const { stdout, status } = runReleaseDryRun(["--full"])
+    expect(status).toBe(0)
+    expect(stdout).toContain("Mode(s): full")
+    expect(stdout).toContain("DRY RUN")
+    expect(stdout).toContain(`Interceptor-Full-${TEST_VERSION}.pkg`)
+
+    // Every full-only step must be present.
+    expect(stdout).toContain("interceptor-bridge.app")
+    expect(stdout).toContain("com.interceptor.bridge.plist")
+    expect(stdout).toContain("Interceptor-Bridge.pkg")
+    expect(stdout).toContain("bridge-component.plist")
+    expect(stdout).toContain("Interceptor-Daemon-Full.pkg")
+    expect(stdout).toContain("daemon-full")
+    expect(stdout).toContain("Step 6: Stapling bridge .app")
+
+    // No Browser pkg should be produced.
+    expect(stdout).not.toContain(`Interceptor-Browser-${TEST_VERSION}`)
+    expect(stdout).not.toContain("distribution-browser.xml")
+    expect(stdout).not.toContain("Interceptor-Daemon-Browser.pkg")
+
+    // Productbuild for full mode must reference the full distribution.xml.
+    const productbuildLines = stdout
+      .split("\n")
+      .filter((l) => l.includes("DRY: productbuild"))
+    expect(productbuildLines.length).toBe(1)
+    expect(productbuildLines[0]).toMatch(/distribution\.xml(?!\w)/)
+  })
+
+  test("default (no mode flag) builds both pkgs", () => {
+    const { stdout, status } = runReleaseDryRun([])
+    expect(status).toBe(0)
+    expect(stdout).toContain("Mode(s): browser-only full")
+    expect(stdout).toContain(`Interceptor-Browser-${TEST_VERSION}.pkg`)
+    expect(stdout).toContain(`Interceptor-Full-${TEST_VERSION}.pkg`)
+
+    // Both productbuilds must execute exactly once each, with the right
+    // distribution xml.
+    const productbuildLines = stdout
+      .split("\n")
+      .filter((l) => l.includes("DRY: productbuild"))
+    expect(productbuildLines.length).toBe(2)
+    const browserPb = productbuildLines.find((l) =>
+      l.includes("distribution-browser.xml"),
+    )
+    const fullPb = productbuildLines.find(
+      (l) =>
+        l.includes("distribution.xml") &&
+        !l.includes("distribution-browser.xml"),
+    )
+    expect(browserPb).toBeDefined()
+    expect(fullPb).toBeDefined()
+
+    // Both per-mode daemon component pkgs must be built.
+    expect(stdout).toContain("Interceptor-Daemon-Browser.pkg")
+    expect(stdout).toContain("Interceptor-Daemon-Full.pkg")
+
+    // Step 13 must publish both pkgs to Sparkle.
+    expect(stdout).toMatch(
+      /append appcast item \(browser-only, minSysVer 11\.0\)/,
+    )
+    expect(stdout).toMatch(/append appcast item \(full, minSysVer 14\.0\)/)
+  })
+
+  test("--browser-only and --full are mutually exclusive", () => {
+    const { status, stderr } = runReleaseDryRun(["--browser-only", "--full"])
+    expect(status).not.toBe(0)
+    expect(stderr).toContain("mutually exclusive")
+  })
+
+  test("unknown flags exit non-zero with usage hint", () => {
+    const { status, stderr } = runReleaseDryRun(["--bogus-flag"])
+    expect(status).not.toBe(0)
+    expect(stderr).toContain("Unknown flag")
+  })
+
+  test("Browser branch payload includes daemon + extension but not bridge", () => {
+    const { stdout, status } = runReleaseDryRun(["--browser-only"])
+    expect(status).toBe(0)
+
+    // The round-1 binary payload zip must include daemon + cli but not
+    // the bridge .app — a structural promise that the unsigned binary
+    // submission for browser-only is leaner than full.
+    const payloadLines = stdout
+      .split("\n")
+      .filter((l) => l.includes("DRY: ditto") && l.includes("_payload"))
+    expect(payloadLines.some((l) => l.includes("interceptor-daemon"))).toBe(
+      true,
+    )
+    expect(
+      payloadLines.some((l) => l.endsWith("_payload/interceptor")),
+    ).toBe(true)
+    expect(
+      payloadLines.some((l) => l.includes("interceptor-bridge.app")),
+    ).toBe(false)
+  })
+
+  test("Browser pkg uses postinstall-browser, Full pkg uses postinstall-full", () => {
+    const browserOut = runReleaseDryRun(["--browser-only"]).stdout
+    expect(browserOut).toContain(
+      "scripts/release/postinstall-browser /Volumes",
+    )
+    expect(browserOut).not.toContain("scripts/release/postinstall-full ")
+
+    const fullOut = runReleaseDryRun(["--full"]).stdout
+    expect(fullOut).toContain("scripts/release/postinstall-full /Volumes")
+    expect(fullOut).not.toContain("scripts/release/postinstall-browser ")
+  })
+
+  test("Sparkle appcast emits one item per built pkg with mode-tagged channel", () => {
+    const both = runReleaseDryRun([]).stdout
+    // Two distinct DRY appcast lines, one per mode, each carrying the
+    // mode label and minSysVer that distribution-browser.xml / .xml encode.
+    expect(both).toMatch(
+      /append appcast item \(browser-only, minSysVer 11\.0\)/,
+    )
+    expect(both).toMatch(/append appcast item \(full, minSysVer 14\.0\)/)
+  })
+})

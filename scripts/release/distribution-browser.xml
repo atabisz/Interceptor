@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Interceptor (Browser-Only)</title>
+    <organization>com.interceptor</organization>
+    <domains enable_localSystem="true" enable_currentUserHome="true"/>
+
+    <!--
+        customize="never"  → no UI for choosing components; install all three
+        require-scripts="true" → installer waits for postinstall before declaring success
+        rootVolumeOnly="true"  → install on the boot volume only (standard for system tools)
+    -->
+    <options
+        customize="never"
+        require-scripts="true"
+        rootVolumeOnly="true"
+        hostArchitectures="arm64,x86_64"/>
+
+    <!--
+        Browser-only mode has no Swift bridge, so the macOS 14 SDK floor that
+        the Full pkg's distribution.xml enforces does not apply here. The
+        binary floor is determined by the Bun runtime that compiled the CLI
+        and daemon (currently macOS 11+ for bun-darwin-arm64 / bun-darwin-x64).
+        We set a conservative 11.0 floor here.
+    -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="11.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <!--
+        Post-install screen, picked up by productbuild from the resources dir.
+        Shared with the Full pkg — the same conclusion HTML works because it
+        only documents the manual extension-load step (which both pkgs need).
+    -->
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.interceptor.cli.choice"/>
+            <line choice="com.interceptor.daemon.choice"/>
+            <line choice="com.interceptor.extension.choice"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default" title="Interceptor (Browser-Only)"/>
+
+    <choice id="com.interceptor.cli.choice"
+            visible="false"
+            title="Interceptor CLI"
+            description="The interceptor command-line tool (installed to /usr/local/bin)">
+        <pkg-ref id="com.interceptor.cli.pkg"/>
+    </choice>
+
+    <choice id="com.interceptor.daemon.choice"
+            visible="false"
+            title="Interceptor Daemon"
+            description="Native messaging host daemon">
+        <pkg-ref id="com.interceptor.daemon.pkg"/>
+    </choice>
+
+    <choice id="com.interceptor.extension.choice"
+            visible="false"
+            title="Interceptor Browser Extension"
+            description="Unpacked extension files for Chrome and Brave">
+        <pkg-ref id="com.interceptor.extension.pkg"/>
+    </choice>
+
+    <pkg-ref id="com.interceptor.cli.pkg">Interceptor-CLI.pkg</pkg-ref>
+    <pkg-ref id="com.interceptor.daemon.pkg">Interceptor-Daemon.pkg</pkg-ref>
+    <pkg-ref id="com.interceptor.extension.pkg">Interceptor-Extension.pkg</pkg-ref>
+</installer-gui-script>
