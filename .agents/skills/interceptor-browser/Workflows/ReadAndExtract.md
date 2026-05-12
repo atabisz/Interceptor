@@ -2,15 +2,24 @@
 
 You are extracting structured information from a webpage — a fact, a value, a list, the contents of a table. This is the workflow when the answer lives in the DOM, an XHR response, or rendered text, and you need to return it as data the user (or another tool) can use.
 
+## Command Budget
+
+This workflow should complete in **3 commands**, max **4**:
+1. `interceptor open <url>` → 1 command
+2. Narrow read — `read --text-only` for prose extraction, `read --tree-only --tree-format compact` for ref-driven action. **Pick one, not both.** → 1 command
+3. (Optional) `read <ref>` for a sub-element OR `find "<text>"` if the first read missed → 1 command
+
+If you're at command 4 and don't have the value, **commit with what's there** — answer with the closest evidence and flag the gap. Do not add a 5th read.
+
 ## Decision tree
 
-1. **Is the answer in plain page text?** → `read --text-only` first, smallest surface.
-2. **Does it need a specific element?** → `find "<text>"` or `read e<ref>` on a known ref.
-3. **Does it live in a sub-tree?** → `read e<ref>` to scope.
-4. **Is it inside an iframe?** → `read --include-frames`, use framed refs like `e2_7`.
-5. **Is it client-side state hidden from DOM?** → `inspect` (combined tree + network) or `state` for SPA state.
-6. **Does it come from an API call?** → `net log --filter <pattern>` or `inspect --net-only`.
-7. **None of the above?** → `eval --main "expression"` as the escape hatch.
+1. **Is the answer in plain page text?** → use `read --text-only` first, smallest surface.
+2. **Does it need a specific element?** → use `find "<text>"` or `read e<ref>` on a known ref.
+3. **Does it live in a sub-tree?** → use `read e<ref>` to scope.
+4. **Is it inside an iframe?** → use `read --include-frames`, refs like `e2_7`.
+5. **Is it client-side state hidden from DOM?** → use `inspect` (combined tree + network) or `state` for SPA state.
+6. **Does it come from an API call?** → use `net log --filter <pattern>` or `inspect --net-only`.
+7. **None of the above?** → use `eval --main "expression"` as the escape hatch.
 
 ## Steps
 
@@ -21,12 +30,13 @@ You are extracting structured information from a webpage — a fact, a value, a 
 
 2. **Pick the narrowest read surface.**
    ```bash
-   interceptor read --text-only                 # Just prose — cheapest
-   interceptor read --tree-only                 # Actionable refs only
-   interceptor read e12 --tree-only             # Scoped sub-tree
-   interceptor text e12                         # Text of one element
-   interceptor html e12                         # HTML of one element (last resort)
+   interceptor read --text-only                          # Just prose — cheapest
+   interceptor read --tree-only --tree-format compact    # Actionable refs only, agent-budget tree
+   interceptor read e12 --tree-only --tree-format compact # Scoped sub-tree
+   interceptor text e12                                  # Text of one element
+   interceptor html e12                                  # HTML of one element (last resort)
    ```
+   For fact extraction, use `--text-only`. For "find a button to click next", use `--tree-only --tree-format compact`. Do not run both unless you've already proven you need the second surface.
 
 3. **For specific elements, prefer `find` over scanning a full tree.**
    ```bash

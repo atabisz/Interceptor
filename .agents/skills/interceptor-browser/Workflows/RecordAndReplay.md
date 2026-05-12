@@ -5,6 +5,18 @@ You are learning a real user workflow (or replaying one) instead of rediscoverin
 - A workflow is complex enough that learning by observation beats step-by-step interaction
 - You need a replay plan to hand off to another agent or save for regression testing
 
+## Command Budget
+
+This workflow should complete in **4 commands**. The user's real-time demo is NOT a command — it consumes 0 of your budget.
+
+1. `interceptor monitor start --instruction "..."` → 1 command
+2. (User demonstrates the flow in real time. **You do nothing.** Do not issue `act` / `click` / `type` / `read` calls during recording — synthetic events injected during recording pollute the trace and you'll capture your own actions instead of the user's.)
+3. `interceptor monitor stop` → 1 command
+4. `interceptor monitor export <sid> --plan` → 1 command
+5. (Optional) 1 command to kick off a replay action (e.g. `interceptor batch '[...]'` or the first `interceptor act` of the replay) → 1 command
+
+If you're tempted to run `monitor status` or `monitor tail` mid-recording, don't — they consume command budget for no new information. Tail is for debugging an orphaned session, not for normal flows.
+
 ## Record
 
 1. **Start the session.** Optionally include an instruction so the export carries the user's intent.

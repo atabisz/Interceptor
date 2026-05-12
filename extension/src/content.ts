@@ -117,6 +117,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
         const filter = (action.filter as string) || "interactive"
         const maxChars = (action.maxChars as number) || 50000
         const includeStyle = action.includeStyle === true
+        const treeFormat: "verbose" | "compact" = action.treeFormat === "compact" ? "compact" : "verbose"
         const wantsTarget = action.index !== undefined || action.ref !== undefined
         pruneStaleRefs()
         const root = wantsTarget
@@ -126,7 +127,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
           const label = String(action.ref ?? action.index ?? "unknown")
           return { success: false, error: `stale element [${label}] — run interceptor state to refresh` }
         }
-        const treeOutput = buildA11yTree(root || document.body, 0, maxDepth, filter, includeStyle)
+        const treeOutput = buildA11yTree(root || document.body, 0, maxDepth, filter, includeStyle, treeFormat)
         const truncated = treeOutput.length > maxChars
           ? treeOutput.slice(0, maxChars) + "\n... (truncated)"
           : treeOutput

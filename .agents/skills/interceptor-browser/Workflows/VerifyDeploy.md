@@ -4,6 +4,15 @@ You are verifying that something works on a deployed page. This is the workflow 
 
 **Reproduce before fix.** If the user reported a UI bug, open the page first. Console errors and network 404s before code analysis. Never theorize from code when you can just look. This is non-negotiable.
 
+## Command Budget
+
+This workflow should complete in **3 commands**, max **4**:
+1. `interceptor open <url>` → 1 command
+2. `interceptor read --tree-only --tree-format compact` (or `--text-only` if you only need prose) → 1 command
+3. (Optional) `interceptor inspect --filter <pattern>` if network behavior is in question → 1 command
+
+If you're at command 3 and don't have the verdict, **re-read once with a narrower surface** (`read --text-only` or `text <ref>`) and commit with what's there. Do not add a 4th read.
+
 ## Steps
 
 1. **Open the page.**
@@ -15,12 +24,13 @@ You are verifying that something works on a deployed page. This is the workflow 
    interceptor open <url> --reuse
    ```
 
-2. **Read structured state.** Default to a tree+text read before screenshots.
+2. **Read structured state.** Default to a narrow read before screenshots — pick the surface that answers your question:
    ```bash
-   interceptor read --tree-only         # Actionable refs
-   interceptor read --text-only         # Just prose
-   interceptor read                     # Both
+   interceptor read --tree-only --tree-format compact   # Actionable refs, agent-budget tree
+   interceptor read --text-only                         # Just prose (cheaper than full tree)
+   interceptor read                                     # Full (use only when both are needed)
    ```
+   Prefer `--text-only` for fact verification; prefer `--tree-only --tree-format compact` for "find a button" tasks.
    If the page hides data behind XHRs:
    ```bash
    interceptor inspect                  # Tree + text + passive network

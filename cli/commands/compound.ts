@@ -88,12 +88,14 @@ export function buildReadTreeAction(opts: {
   filterMode: string
   includeStyle: boolean
   includeFrames: boolean
+  treeFormat?: "verbose" | "compact"
 }): Action {
   const base: Omit<Action, "type"> = {
     depth: 15,
     filter: opts.filterMode,
     maxChars: 50000,
-    includeStyle: opts.includeStyle
+    includeStyle: opts.includeStyle,
+    ...(opts.treeFormat === "compact" ? { treeFormat: "compact" } : {})
   }
 
   if (opts.includeFrames) {
@@ -247,6 +249,9 @@ export async function runRead(
   const includeFrames = filtered.includes("--include-frames")
   const filterIdx = filtered.indexOf("--filter")
   const filterMode = filterIdx !== -1 ? filtered[filterIdx + 1] : "interactive"
+  const treeFormatIdx = filtered.indexOf("--tree-format")
+  const treeFormat: "verbose" | "compact" =
+    treeFormatIdx !== -1 && filtered[treeFormatIdx + 1] === "compact" ? "compact" : "verbose"
 
   // Check for optional ref argument (skip flags)
   const refArg = filtered[1] && !filtered[1].startsWith("--") ? filtered[1] : undefined
@@ -261,7 +266,7 @@ export async function runRead(
   if (!textOnly) {
     if (includeFrames) {
       const framesResp = await send(
-        buildReadTreeAction({ target, filterMode, includeStyle, includeFrames }),
+        buildReadTreeAction({ target, filterMode, includeStyle, includeFrames, treeFormat }),
         globalTabId, useWs
       )
       if (framesResp.success && framesResp.data && typeof framesResp.data === "object" && Array.isArray((framesResp.data as { frames?: unknown[] }).frames)) {
@@ -286,7 +291,7 @@ export async function runRead(
       }
     } else {
       treeResult = await send(
-        buildReadTreeAction({ target, filterMode, includeStyle, includeFrames }),
+        buildReadTreeAction({ target, filterMode, includeStyle, includeFrames, treeFormat }),
         globalTabId, useWs
       )
     }

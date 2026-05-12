@@ -29,6 +29,7 @@ export async function handleFrameActions(
     const filter = (action.filter as string) || "interactive"
     const maxChars = (action.maxChars as number) || 50000
     const includeStyle = action.includeStyle === true
+    const treeFormat: "verbose" | "compact" = action.treeFormat === "compact" ? "compact" : "verbose"
     const includeText = action.includeText === true
     const targetFrameId = typeof action.frameId === "number" ? action.frameId : undefined
     const targetIndex = typeof action.index === "number" ? action.index : undefined

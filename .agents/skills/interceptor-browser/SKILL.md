@@ -1,6 +1,6 @@
 ---
 name: interceptor-browser
-description: "Drive a real signed-in Chrome / Brave session via the `interceptor` CLI — read pages, click and type, navigate, observe network, automate rich editors (Canva / Google Docs / Slides), record and replay flows. Use compound commands (open, read, act, inspect) over low-level verbs. Structured reads over screenshots. Workflows: VerifyDeploy (open URL and confirm rendering), ReadAndExtract (page + SPA state), DriveRichEditor (Canva/Docs/Slides scene workflow), OverrideXhr (request mutation), RecordAndReplay (monitor flow + export plan), ScreenshotForVlm (VLM-budgeted screenshot). USE WHEN verify deploy, check page, read DOM, click, type, fill form, drive editor, override request, record flow, replay flow, screenshot for VLM, browser automation, SPA extraction. NOT FOR native macOS apps (use interceptor-macos), OS dialogs, browser chrome, or multi-page scraping at scale (use a crawler)."
+description: "Drive a real signed-in Chrome / Brave session via the `interceptor` CLI — read pages, click and type, navigate, observe network, automate rich editors (Canva / Google Docs / Slides), record and replay flows. Use compound commands (open, read, act, inspect) over low-level verbs. Structured reads over screenshots. Workflows: VerifyDeploy (open URL and confirm rendering), ReadAndExtract (page + SPA state), DriveRichEditor (Canva/Docs/Slides scene workflow), OverrideXhr (request mutation), RecordAndReplay (monitor flow + export plan), ScreenshotForVlm (VLM-budgeted screenshot), MultiPageCompare (multi-page fact comparison). USE WHEN verify deploy, check page, read DOM, click, type, fill form, drive editor, override request, record flow, replay flow, screenshot for VLM, browser automation, SPA extraction, compare pages, multi-page comparison, designed by X vs Y, facts across N pages. NOT FOR native macOS apps (use interceptor-macos), OS dialogs, browser chrome, or multi-page scraping at scale (use a crawler)."
 metadata:
   short-description: Drive a real signed-in Chrome / Brave session via the interceptor CLI
 ---
@@ -36,6 +36,7 @@ Each workflow is a complete self-contained "you are doing X" procedure. Open the
 | [`Workflows/OverrideXhr.md`](Workflows/OverrideXhr.md) | Mutate a request before it hits the server — change params, force a status, throttle |
 | [`Workflows/RecordAndReplay.md`](Workflows/RecordAndReplay.md) | Learn a real user flow, export a replay plan, run it back |
 | [`Workflows/ScreenshotForVlm.md`](Workflows/ScreenshotForVlm.md) | Take a screenshot the model will actually understand — VLM-budgeted, WebP, on-disk |
+| [`Workflows/MultiPageCompare.md`](Workflows/MultiPageCompare.md) | Compare facts across multiple pages (e.g. "who designed Python vs JavaScript") — sequential `open --text-only` per page |
 
 ## References
 

@@ -5,6 +5,17 @@ You are mutating an HTTP request before it hits the server, or rewriting a respo
 - You need to change request parameters without rebuilding the UI
 - You need to inject test data the backend can't produce
 
+## Command Budget
+
+This workflow should complete in **5 commands**:
+1. `interceptor net log --filter <pattern>` (observe real traffic first; don't override blind) → 1 command
+2. `interceptor override "<pattern>" status=...` (install the override) → 1 command
+3. Trigger the request (`act`, `click`, `type`, or `navigate`) → 1 command
+4. `interceptor net log --filter <pattern> --since 30s` (verify the override fired — **NOT** a fresh `read`; the response data lives in the network log, not the DOM) → 1 command
+5. `interceptor override clear` (always clear; overrides persist across `open` calls and poison subsequent tasks) → 1 command
+
+If verification at step 4 shows the override didn't fire, the pattern probably missed — refine the pattern and retry steps 2-4 once. Do not reach for a fresh `read` to "check the page" before confirming the network override fired.
+
 ## Steps
 
 1. **Open the page.**

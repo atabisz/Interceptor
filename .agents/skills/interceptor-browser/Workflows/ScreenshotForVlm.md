@@ -4,6 +4,16 @@ You are taking a screenshot of a webpage for a vision-language model (VLM) to re
 
 **Screenshots are a last-resort read surface.** Structured reads cost roughly 10× fewer tokens per turn and survive DOM churn better than pixels. Try every other read first.
 
+## Command Budget
+
+**1 command.** That's it. The agent-default recipe below IS the budget:
+
+```bash
+interceptor screenshot --save --format webp --target-max-long-edge 1568 --quality 85
+```
+
+If the first screenshot doesn't answer the question, do NOT take a second exploratory screenshot — re-evaluate whether pixels are actually the answer. The "exploratory screenshot then second screenshot" pattern is the failure mode this budget exists to prevent. If you need a second capture, scope it tightly with `--selector`, `--element <ref>`, or `--region X,Y,W,H` — and that's still 1 command, not a re-take.
+
 ## The agent-default recipe
 
 ```bash

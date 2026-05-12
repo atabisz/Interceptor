@@ -90,9 +90,28 @@ export function getAccessibleName(el: Element): string {
   return (el.textContent || "").trim().slice(0, 80)
 }
 
-export function buildA11yTree(root: Element, depth: number, maxDepth: number, filter: string, includeStyle = false): string {
+// Convert `getRelevantAttrs` output like `type="submit" href="/x"` into compact
+// pipe-form clauses: `|type=submit|href=/x`. Strips the surrounding quotes from
+// each value so the compact line stays single-tokenish.
+function compactAttrClause(attrs: string): string {
+  if (!attrs) return ""
+  const matches = attrs.matchAll(/(\S+?)="([^"]*)"/g)
+  let out = ""
+  for (const m of matches) out += `|${m[1]}=${m[2]}`
+  return out
+}
+
+export function buildA11yTree(
+  root: Element,
+  depth: number,
+  maxDepth: number,
+  filter: string,
+  includeStyle = false,
+  format: "verbose" | "compact" = "verbose"
+): string {
   if (depth > maxDepth) return ""
   const lines: string[] = []
+  const compact = format === "compact"
 
   function walk(el: Element, d: number) {
     if (d > maxDepth) return
@@ -103,33 +122,50 @@ export function buildA11yTree(root: Element, depth: number, maxDepth: number, fi
     const isLandmark = LANDMARK_ROLES.has(role) || LANDMARK_TAGS.has(el.tagName)
     const isHeading = /^h[1-6]$/.test(tag) || role === "heading"
     const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES)
-    const indent = "  ".repeat(d)
+    const prefix = compact ? ">".repeat(d) : "  ".repeat(d)
 
     if (isLandmark && !isInteractiveEl) {
       const name = getAccessibleName(el)
-      const nameStr = name && name !== (el.textContent || "").trim().slice(0, 80) ? ` "${name}"` : ""
-      lines.push(`${indent}${role || tag}${nameStr}`)
+      const hasName = !!name && name !== (el.textContent || "").trim().slice(0, 80)
+      if (compact) {
+        lines.push(`${prefix}${role || tag}${hasName ? `|${name}` : ""}`)
+      } else {
+        const nameStr = hasName ? ` "${name}"` : ""
+        lines.push(`${prefix}${role || tag}${nameStr}`)
+      }
     }
 
     if (isHeading && filter === "all") {
       const name = getAccessibleName(el)
-      lines.push(`${indent}heading "${name}"`)
+      if (compact) {
+        lines.push(`${prefix}heading|${name}`)
+      } else {
+        lines.push(`${prefix}heading "${name}"`)
+      }
     }
 
     if (isInteractiveEl) {
       const refId = getOrAssignRef(el)
       const name = getAccessibleName(el)
-      const nameStr = name ? ` "${name}"` : ""
       const attrs = getRelevantAttrs(el)
-      const attrStr = attrs ? ` ${attrs}` : ""
       const styleBundle = includeStyle ? getStyleBundle(el) : ""
-      const styleStr = styleBundle ? ` style="${styleBundle}"` : ""
-      lines.push(`${indent}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}`)
+      if (compact) {
+        const nameClause = name ? `|${name}` : ""
+        const attrClause = compactAttrClause(attrs)
+        const styleClause = styleBundle ? `|style={${styleBundle}}` : ""
+        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}]`)
+      } else {
+        const nameStr = name ? ` "${name}"` : ""
+        const attrStr = attrs ? ` ${attrs}` : ""
+        const styleStr = styleBundle ? ` style="${styleBundle}"` : ""
+        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}`)
+      }
     }
 
     const shadow = getShadowRoot(el)
     if (shadow) {
-      lines.push(`${indent}  shadow-root`)
+      const shadowPrefix = compact ? ">".repeat(d + 1) : `${prefix}  `
+      lines.push(`${shadowPrefix}shadow-root`)
       for (const child of shadow.children) {
         walk(child, d + 2)
       }

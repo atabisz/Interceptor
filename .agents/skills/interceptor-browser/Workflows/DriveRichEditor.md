@@ -2,6 +2,25 @@
 
 You are driving a rich editor: Canva, Google Docs, Google Slides, Sheets, Figma, a design tool, or any canvas-rendered surface where DOM refs are not enough. Standard `act`/`click`/`type` won't reach the content because the editor renders its own canvas and intercepts events.
 
+## Command Budget
+
+This workflow should complete in **4 commands base + 1 per text write**:
+1. `interceptor open <url>` → 1 command
+2. `interceptor scene profile` → 1 command (always first; do not guess)
+3. `interceptor scene act <ref>` (or the named primitive for the task — see below) → 1 command
+4. Verify with `interceptor scene text <ref>` or `interceptor scene render` → 1 command
+
+Every additional text write (`scene insert "..."`) adds 1 command. If you're at the budget without the answer, **re-read once with `scene text <ref>` and commit** — do not keep cycling primitives.
+
+### Right-primitive-per-task (read this before any scene action)
+
+| Task | The primitive to use | Anti-pattern (do NOT do this) |
+|---|---|---|
+| Read scene speaker notes | `interceptor scene notes` | Cycling `scene list` → `scene select s2` → `scene selected` → `text e3`. The bench S7 failure was exactly this — 9 commands of scene primitive cycling before landing on the answer. The correct primitive (`scene notes`) was never tried. |
+| Read scene-resident text content | `interceptor scene text <ref>` | A full `interceptor read` — the tree is irrelevant when you already have the scene ref. |
+| Confirm a write landed | `interceptor scene text <ref>` or `scene render` | Reopening the page. The scene already changed; just re-read it. |
+| Discover scene structure | `interceptor scene profile` (once, at the start) | Running `scene profile`, then `scene profile --verbose`, then `scene list`. Profile once is enough — verbose is only when profile returned partial info. |
+
 ## First step — always
 
 ```bash

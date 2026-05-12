@@ -40,6 +40,8 @@ Compound (agent-optimized):
   interceptor read --text-only               Skip tree
   interceptor read --include-style           Inline computed styles per element
   interceptor read --include-frames          Walk all reachable frames (non-top refs are e<frameId>_<n>)
+  interceptor read --tree-format compact     Compact tree (>-depth + [ref|role|name|attr=val]); agent context economy
+  interceptor read --tree-format verbose     Indented legacy tree (default; humans prefer this)
   interceptor style inject --css "<rules>"  Inject a stylesheet; returns a handle (all frames by default)
   interceptor style inject --css "<rules>" --top-only   Inject only into the top frame
   interceptor style remove <handle>          Remove a previously injected stylesheet
