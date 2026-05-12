@@ -32,7 +32,10 @@ function textData(result: Result): string {
 
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
-  return text.slice(0, maxChars) + "\n... (truncated)"
+  // PRD-70: explicit marker so agents know to scope or widen instead of
+  // escaping to ?action=raw / view-source when rendered text is "missing".
+  return text.slice(0, maxChars) +
+    `\n... (truncated: showed ${maxChars} of ${text.length} chars. Pass --full to see all, or 'read e<ref> --text-only' to scope, or 'find "<term>"' to jump.)`
 }
 
 async function send(action: Action, tabId?: number, useWs = false): Promise<Result> {
@@ -65,7 +68,11 @@ export function aggregateReadResults(opts: {
   if (opts.textRequested) {
     if (opts.textResult?.success) {
       text = textData(opts.textResult)
-      if (!opts.full) text = truncateText(text, 2000)
+      // PRD-70: bump default text cap from 2,000 → 8,000 chars. The 2K cap
+      // forced agents to use --full constantly, which then exposed the
+      // extension-side 10K cap. New default is 8K (mid-sized page intro),
+      // --full unlocks the full 200K from the extension.
+      if (!opts.full) text = truncateText(text, 8000)
     } else if (opts.textResult?.error) {
       warnings.push(`text: ${opts.textResult.error}`)
     }

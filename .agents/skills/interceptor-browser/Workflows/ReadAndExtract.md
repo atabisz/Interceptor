@@ -45,6 +45,18 @@ If you're at command 4 and don't have the value, **commit with what's there** â€
    ```
    `find` uses semantic + text matching. Faster than reading a 5,000-line tree.
 
+## When `read` returns less than you expected
+
+If `read --text-only` came back short and your target string wasn't in it, the read **was truncated** â€” the page text is longer than the cap. `read` always appends an explicit `... (truncated: showed X of Y chars ...)` marker when it caps. Look for that marker before assuming the data isn't there.
+
+Fix in one command:
+
+- **`read e<ref> --text-only`** to scope to a known section (cheapest)
+- **`read --text-only --full`** to widen to 200,000 chars (mid-cost)
+- **`find "<target>"`** to jump straight to the element (cheapest if you know the text)
+
+**Do NOT fetch `?action=raw`, `view-source:`, or any markup-level URL.** Raw wikitext / HTML source is harder to parse than rendered text. The agent's job is to read the page, not its source.
+
 4. **For data behind XHRs**, use passive network capture before reaching for CDP.
    ```bash
    interceptor net log --filter graphql --limit 10
