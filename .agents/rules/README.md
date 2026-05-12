@@ -1,0 +1,19 @@
+# .agents/rules/
+
+Path-scoped rules for agents. Files in this directory may carry frontmatter with a `paths:` glob; Claude Code loads them only when the agent reads a file matching one of the globs. Codex and Gemini ignore this directory today — those harnesses use AGENTS.md plus per-skill SKILL.md instead.
+
+This directory is intentionally empty. Add a rule here only when there is a real per-path constraint worth scoping (e.g. "when editing `cli/help.ts`, also update `references/command-catalog.md`"). Keep each rule under 100 lines.
+
+Frontmatter format (Claude Code convention):
+
+```markdown
+---
+paths:
+  - "cli/help.ts"
+  - "cli/commands/**/*.ts"
+---
+
+When editing these files, also update the matching `references/command-catalog.md` and re-run the head-to-head bench.
+```
+
+See PRD-68 for the conventions that govern AGENTS.md, SKILL.md, Workflows/, and references/.
