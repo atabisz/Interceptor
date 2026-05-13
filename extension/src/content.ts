@@ -16,7 +16,7 @@ import { handleWait, handleWaitFor, handleWaitStable } from "./content/actions/w
 import { handleDrag } from "./content/actions/drag"
 import { handleHover } from "./content/actions/hover"
 import { handleFocus, handleBlur, handleGetFocus } from "./content/actions/focus"
-import { handleExtractText, handleExtractHtml } from "./content/data/extract"
+import { handleExtractText, handleExtractMarkdown, handleExtractHtml } from "./content/data/extract"
 import { handleQuery, handleQueryOne, handleExists, handleCount, handleTableData, handleAttrGet, handleAttrSet, handleStyleGet } from "./content/data/query"
 import { handleForms, handleLinks, handleImages, handleMeta, handlePageInfo } from "./content/data/forms"
 import { handleStorageRead, handleStorageWrite, handleStorageDelete } from "./content/data/storage"
@@ -87,6 +87,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
       case "wait":                return handleWait(action)
       case "wait_for":            return handleWaitFor(action)
       case "extract_text":        return handleExtractText(action)
+      case "extract_markdown":    return handleExtractMarkdown(action)
       case "extract_html":        return handleExtractHtml(action)
       case "focus":               return handleFocus(action)
       case "blur":                return handleBlur(action)

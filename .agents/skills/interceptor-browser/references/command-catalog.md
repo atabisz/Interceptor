@@ -12,12 +12,17 @@ interceptor open <url> --reuse                     # Navigate latest Interceptor
 
 interceptor read                                   # Current page tree + text
 interceptor read e12 [--tree-only | --text-only]   # Scoped sub-tree
+interceptor read --markdown [--text-only]          # Page text rendered as markdown (preserves headings, **bold**, lists, tables)
 interceptor read --include-style
 interceptor read --include-frames                  # Descend into iframes
 interceptor read e2_7 --include-frames --tree-only # Framed ref
+interceptor text --markdown                        # Standalone markdown dump
+interceptor text e12 --markdown                    # Element rendered as markdown
 ```
 
 `--reuse` for long automation — without it, dead tabs accumulate. Reading strategy: start with `read`/`open`, not a screenshot. Re-read after every mutating action.
+
+**When to add `--markdown`:** the task asks for the "exact text" / "exact summary" of a section, or the page has visually emphasized text near plain descriptive copy. Markdown mode preserves `<strong>` → `**bold**`, `<h1-6>` → `#`/`##`/..., lists, and tables, so the answer is visually distinguishable from decoy or instructional prose. Skip it for raw fact lookups where flat text is enough.
 
 ## Find + Act
 

@@ -8,7 +8,8 @@ export type Action =
   | { type: "wait"; ms: number }
   | { type: "go_back" }
   | { type: "go_forward" }
-  | { type: "extract_text"; index?: number; ref?: string; frameId?: number }
+  | { type: "extract_text"; index?: number; ref?: string; frameId?: number; maxChars?: number }
+  | { type: "extract_markdown"; index?: number; ref?: string; frameId?: number; maxChars?: number }
   | { type: "extract_html"; index?: number; ref?: string; frameId?: number }
   | { type: "evaluate"; code: string; world?: "MAIN" | "ISOLATED" }
   | { type: "screenshot"; format?: "png" | "jpeg" | "webp"; quality?: number; save?: boolean; clip?: { x: number; y: number; width: number; height: number }; element?: number; full?: boolean; target_max_long_edge?: number }

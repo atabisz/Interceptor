@@ -68,10 +68,13 @@ export function parseStateCommand(filtered: string[]): Action {
     }
 
     case "text": {
-      if (!filtered[1]) return { type: "extract_text" }
-      const target = parseElementTarget(filtered[1])
-      rejectIfBogusRef("text", filtered[1], target)
-      return { type: "extract_text", ...target }
+      const markdown = filtered.includes("--markdown")
+      const actionType: "extract_text" | "extract_markdown" = markdown ? "extract_markdown" : "extract_text"
+      const refArg = filtered[1] && !filtered[1].startsWith("--") ? filtered[1] : undefined
+      if (!refArg) return { type: actionType }
+      const target = parseElementTarget(refArg)
+      rejectIfBogusRef("text", refArg, target)
+      return { type: actionType, ...target }
     }
 
     case "html": {

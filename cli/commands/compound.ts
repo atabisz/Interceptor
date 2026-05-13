@@ -145,6 +145,7 @@ export async function runOpen(
 
   const treeOnly = filtered.includes("--tree-only")
   const textOnly = filtered.includes("--text-only")
+  const markdown = filtered.includes("--markdown")
   const full = filtered.includes("--full")
   const noWait = filtered.includes("--no-wait")
   const timeoutIdx = filtered.indexOf("--timeout")
@@ -195,7 +196,8 @@ export async function runOpen(
   }
 
   if (!treeOnly) {
-    textResult = await send({ type: "extract_text" }, tabId, useWs)
+    const textActionType: "extract_text" | "extract_markdown" = markdown ? "extract_markdown" : "extract_text"
+    textResult = await send({ type: textActionType }, tabId, useWs)
   }
 
   const aggregate = aggregateReadResults({
@@ -251,6 +253,7 @@ export async function runRead(
 ): Promise<void> {
   const treeOnly = filtered.includes("--tree-only")
   const textOnly = filtered.includes("--text-only")
+  const markdown = filtered.includes("--markdown")
   const full = filtered.includes("--full")
   const includeStyle = filtered.includes("--include-style")
   const includeFrames = filtered.includes("--include-frames")
@@ -305,7 +308,7 @@ export async function runRead(
   }
 
   if (!treeOnly) {
-    const textAction: Action = { type: "extract_text", ...target }
+    const textAction: Action = { type: markdown ? "extract_markdown" : "extract_text", ...target }
     textResult = await send(textAction, globalTabId, useWs)
   }
 

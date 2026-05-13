@@ -31,12 +31,14 @@ If you're at command 4 and don't have the value, **commit with what's there** �
 2. **Pick the narrowest read surface.**
    ```bash
    interceptor read --text-only                          # Just prose — cheapest
+   interceptor read --markdown --text-only               # Prose w/ structure (headings/bold/lists/tables) — for "exact text" / decoy-prone pages
    interceptor read --tree-only --tree-format compact    # Actionable refs only, agent-budget tree
    interceptor read e12 --tree-only --tree-format compact # Scoped sub-tree
    interceptor text e12                                  # Text of one element
+   interceptor text e12 --markdown                       # Element text rendered as markdown
    interceptor html e12                                  # HTML of one element (last resort)
    ```
-   For fact extraction, use `--text-only`. For "find a button to click next", use `--tree-only --tree-format compact`. Do not run both unless you've already proven you need the second surface.
+   For fact extraction, use `--text-only`. For "find a button to click next", use `--tree-only --tree-format compact`. **Add `--markdown` when the task says "report the exact X" or the page has visually emphasized text** — markdown mode preserves `<strong>` → `**bold**`, `<h1-6>` → `#`, tables, lists, so you can tell the real answer from decoy/instructional copy. Do not run both surfaces unless you've already proven you need the second.
 
 3. **For specific elements, prefer `find` over scanning a full tree.**
    ```bash
