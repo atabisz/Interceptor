@@ -74,7 +74,16 @@ let eventSource: number | null = null
 
 function getSource(): number | null {
   if (!eventSource) {
-    eventSource = Number(sym.CGEventSourceCreate(kCGEventSourceStateCombinedSessionState))
+    // kCGEventSourceStateHIDSystemState (1) marks events as originating from
+    // real HID hardware. Chrome and other apps treat HID-sourced CGEvents as
+    // `isTrusted: true` user input. The previous value
+    // kCGEventSourceStateCombinedSessionState (0) is for observing the merged
+    // session stream — events posted from that source land on the page but
+    // are not treated as trusted by Chromium, which made `--os` clicks
+    // silently fail any `event.isTrusted` gate (e.g. bench S8 Trusted Input
+    // Gate; the bench's prior S8 PASS rate came from agent hallucination,
+    // not from the click actually flipping the page state).
+    eventSource = Number(sym.CGEventSourceCreate(kCGEventSourceStateHIDSystemState))
     if (!eventSource) return null
   }
   return eventSource
