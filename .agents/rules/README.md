@@ -16,4 +16,4 @@ paths:
 When editing these files, also update the matching `references/command-catalog.md` and re-run the head-to-head bench.
 ```
 
-See PRD-68 for the conventions that govern AGENTS.md, SKILL.md, Workflows/, and references/.
+See `AGENTS.md` and `.agents/skills/*/SKILL.md` for the conventions that govern these files.

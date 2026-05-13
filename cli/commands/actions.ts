@@ -4,6 +4,7 @@
  */
 
 import { parseElementTarget } from "../parse"
+import { hasTrustedFlag, TRUSTED_FLAG_VALUES } from "./flags"
 
 type Action = { type: string; [key: string]: unknown }
 
@@ -20,7 +21,7 @@ export function parseActionsCommand(filtered: string[]): Action {
 
   switch (cmd) {
     case "click": {
-      const useOs = filtered.includes("--os")
+      const useOs = hasTrustedFlag(filtered)
       const target = parseElementTarget(filtered[1])
       const at = parseAt(filtered)
       if (useOs) {
@@ -34,9 +35,9 @@ export function parseActionsCommand(filtered: string[]): Action {
 
     case "type": {
       const append = filtered.includes("--append")
-      const useOs = filtered.includes("--os")
+      const useOs = hasTrustedFlag(filtered)
       const target = parseElementTarget(filtered[1])
-      const textArgs = filtered.slice(2).filter(a => a !== "--append" && a !== "--os")
+      const textArgs = filtered.slice(2).filter(a => a !== "--append" && !TRUSTED_FLAG_VALUES.includes(a))
       if (useOs) {
         return { type: "os_type", ...target, text: textArgs.join(" ") }
       } else if (target.semantic) {
@@ -101,7 +102,7 @@ export function parseActionsCommand(filtered: string[]): Action {
       return { type: "check", ...parseElementTarget(filtered[1]), checked: filtered[2] !== "false" }
 
     case "keys": {
-      if (filtered.includes("--os")) {
+      if (hasTrustedFlag(filtered)) {
         const parts = filtered[1].split("+")
         const key = parts[parts.length - 1]
         const modifiers = parts.slice(0, -1)

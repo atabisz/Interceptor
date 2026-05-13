@@ -170,9 +170,9 @@ export async function routeAction(
         layer_tried: "content_script",
         reason: contentResult.error,
         suggestion: action.type === "click"
-          ? "try: interceptor click --os " + (action.ref || action.index || "")
+          ? "try: interceptor click --trusted " + (action.ref || action.index || "")
           : action.type === "scene_click"
-            ? "try: interceptor scene click --os " + (action.id || "")
+            ? "try: interceptor scene click --trusted " + (action.id || "")
           : undefined
       }
     }

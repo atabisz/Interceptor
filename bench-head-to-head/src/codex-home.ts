@@ -7,7 +7,7 @@ export type CodexHomeRole = "interceptor" | "axi" | "judge"
 
 const HOMES_ROOT = join(BENCH_ROOT, ".codex-homes")
 
-// PRD-68 split the single `interceptor` skill into two surface-specific skills.
+// The single `interceptor` skill is split into two surface-specific skills.
 // The bench exercises browser workflows (SPA reads, network, scene), so the
 // browser surface skill is the primary skill to load.
 const INTERCEPTOR_SKILL_SRC = join(REPO_ROOT, ".agents", "skills", "interceptor-browser")

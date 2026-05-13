@@ -15,7 +15,7 @@ If a page returns the wrong section (table-of-contents instead of the article bo
 
 ## Why this exists
 
-**Bench P7 in baseline ran 2 commands, in PRD-68 ran 6 commands** — agent opened Python wiki, opened JavaScript wiki, opened Python wiki *again*, called `tab new`, called `navigate`, finally called `read`. Tab-state confusion. This workflow prevents that.
+**Without explicit guidance the agent thrashes on multi-page comparisons** — it opens page A, opens page B, then re-opens page A trying to "go back," sometimes mixing `tab new` and `navigate` calls. Tab-state confusion. This workflow prevents that.
 
 ## Procedure
 

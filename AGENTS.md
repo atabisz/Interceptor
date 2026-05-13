@@ -87,4 +87,4 @@ Deep mechanic notes (the `userActivation` override + `__interceptor_trust` marke
 - This file is agent-facing. Keep it rule-shaped. No PRD numbers, no command catalogs, no deep mechanic explanations.
 - Per-task procedures live in `.agents/skills/*/Workflows/`. Reference content lives in `.agents/skills/*/references/`. Not here.
 - Update this file when an agent-facing **rule** changes, not when a CLI command is added or renamed (that's a `references/command-catalog.md` change).
-- Conventions for skills, frontmatter, sizes, and names are codified in `prd/PRD-68.md` and enforced in review.
+- Conventions for skills, frontmatter, sizes, and names are codified in `.agents/rules/README.md` and enforced in review.

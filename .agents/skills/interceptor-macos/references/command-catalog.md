@@ -131,7 +131,7 @@ interceptor macos url get <url>
 interceptor macos url post <url> --body '...'
 ```
 
-## Notifications + Personal Data (PRD-66)
+## Notifications + Personal Data
 
 ```bash
 interceptor macos notifications tail | log | post | schedule-* | cancel | dismiss | pending | delivered | categories | badge
@@ -146,7 +146,7 @@ interceptor macos maps search|directions|eta|complete|reverse|mapitem-open
 interceptor macos share services|airdrop|email|message|named|text|url
 ```
 
-## Documents (PRD-66)
+## Documents
 
 ```bash
 interceptor macos pdf info|text|outline|annotations|forms|find|merge|split <path>

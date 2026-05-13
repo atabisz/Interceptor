@@ -5,6 +5,8 @@
  * Internal action types: `scene_*` (to avoid collision with existing HTML Canvas actions)
  */
 
+import { hasTrustedFlag } from "./flags"
+
 type Action = { type: string; [key: string]: unknown }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -46,7 +48,7 @@ export function parseSceneCommand(filtered: string[], jsonMode = false): Action 
     case "click": {
       const id = filtered[2]
       if (!id) { console.error("error: interceptor scene click requires an element id"); process.exit(1) }
-      const useOs = flagPresent(filtered, "--os")
+      const useOs = hasTrustedFlag(filtered)
       const a: Action = { type: "scene_click", id }
       if (useOs) a.os = true
       return withProfile(a, filtered)

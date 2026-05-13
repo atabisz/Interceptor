@@ -5,11 +5,13 @@ You are extracting structured information from a webpage — a fact, a value, a 
 ## Command Budget
 
 This workflow should complete in **3 commands**, max **4**:
-1. `interceptor open <url>` → 1 command
-2. Narrow read — `read --text-only` for prose extraction, `read --tree-only --tree-format compact` for ref-driven action. **Pick one, not both.** → 1 command
+1. `interceptor open <url>` → 1 command (preflight; returns tree + flat text by default)
+2. Narrow read **(only if step 1 output was insufficient)** — pick ONE of: `read --text-only`, `read --markdown --text-only`, or `read --tree-only --tree-format compact`. **Never run two content surfaces.** → 1 command
 3. (Optional) `read <ref>` for a sub-element OR `find "<text>"` if the first read missed → 1 command
 
 If you're at command 4 and don't have the value, **commit with what's there** — answer with the closest evidence and flag the gap. Do not add a 5th read.
+
+**Mode-swap rule:** if step 2 needs structure (exact-text task, table, decoy-prone page), use `--markdown --text-only` *instead of* plain `--text-only`. Do not run both — they read the same content with different rendering.
 
 ## Decision tree
 
@@ -28,17 +30,26 @@ If you're at command 4 and don't have the value, **commit with what's there** �
    interceptor open <url>
    ```
 
-2. **Pick the narrowest read surface.**
+2. **Pick the narrowest read surface — ONE content-read command.**
    ```bash
-   interceptor read --text-only                          # Just prose — cheapest
-   interceptor read --markdown --text-only               # Prose w/ structure (headings/bold/lists/tables) — for "exact text" / decoy-prone pages
-   interceptor read --tree-only --tree-format compact    # Actionable refs only, agent-budget tree
+   interceptor read --text-only                          # Default: flat prose (cheapest)
+   interceptor read --markdown --text-only               # SWAP for above when structure matters
+   interceptor read --tree-only --tree-format compact    # Actionable refs only (no content)
    interceptor read e12 --tree-only --tree-format compact # Scoped sub-tree
    interceptor text e12                                  # Text of one element
    interceptor text e12 --markdown                       # Element text rendered as markdown
    interceptor html e12                                  # HTML of one element (last resort)
    ```
-   For fact extraction, use `--text-only`. For "find a button to click next", use `--tree-only --tree-format compact`. **Add `--markdown` when the task says "report the exact X" or the page has visually emphasized text** — markdown mode preserves `<strong>` → `**bold**`, `<h1-6>` → `#`, tables, lists, so you can tell the real answer from decoy/instructional copy. Do not run both surfaces unless you've already proven you need the second.
+   **Strict rule: pick exactly one content surface per task.** `--text-only` and `--markdown` are mutually exclusive variants of the *same* read — running both wastes your 8-command budget. The preflight `open` already returns text + tree, so you typically need ZERO additional reads.
+
+   **Use `--markdown` INSTEAD of `--text-only` when:**
+   - The task says "report the exact X" / "the summary text" / "the exact phrasing" — visual hierarchy is the disambiguator.
+   - The page has obviously emphasized text (bold headings, callouts) adjacent to plain explanatory copy that could be mistaken for the answer.
+   - You need a clean table render (markdown pipe tables beat scraped prose).
+
+   **Do NOT use `--markdown` when:**
+   - The fact you need is a single value (date, name, number) that appears once on the page — flat text is faster and the markup adds noise.
+   - You already ran `--text-only` (or the preflight ran `open --text-only`) and got the answer. Don't re-read the same content in a different mode.
 
 3. **For specific elements, prefer `find` over scanning a full tree.**
    ```bash

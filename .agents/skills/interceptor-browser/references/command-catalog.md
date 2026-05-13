@@ -22,7 +22,7 @@ interceptor text e12 --markdown                    # Element rendered as markdow
 
 `--reuse` for long automation — without it, dead tabs accumulate. Reading strategy: start with `read`/`open`, not a screenshot. Re-read after every mutating action.
 
-**When to add `--markdown`:** the task asks for the "exact text" / "exact summary" of a section, or the page has visually emphasized text near plain descriptive copy. Markdown mode preserves `<strong>` → `**bold**`, `<h1-6>` → `#`/`##`/..., lists, and tables, so the answer is visually distinguishable from decoy or instructional prose. Skip it for raw fact lookups where flat text is enough.
+**`--markdown` is a SWAP for `--text-only`, not an extra command.** It renders the same content with structure preserved (`<strong>` → `**bold**`, `<h1-6>` → `#`/`##`/..., lists, tables). Use it *instead of* plain `--text-only` when the task asks for the "exact text" / "exact summary" of a section, or the page has visually emphasized text near plain descriptive copy — markdown lets you tell the real answer from decoy or instructional prose. **Never run both modes** — pick one and commit. Skip markdown for raw fact lookups (single date, name, number) where flat text is enough.
 
 ## Find + Act
 
@@ -33,9 +33,11 @@ interceptor find "Email" --role textbox
 interceptor act e7                                 # Click + read after
 interceptor act e9 "hello@example.com"             # Type into field
 interceptor act e11 --keys "Enter"
-interceptor act e15 --os                           # ESCALATION ONLY
+interceptor act e15 --trusted                      # HID-sourced click; page sees isTrusted: true. ESCALATION ONLY.
 interceptor act e20 --no-read
 ```
+
+**After `act --trusted` reports success, read the page once and commit.** Do not re-execute the same click via a different surface (`interceptor macos click ...`, manual coordinates, etc.) to "verify" — the page's own state is the verification, and the trusted event is the same trusted event regardless of which surface posted it. Escalating to a different surface to redo a successful browser action is the most common way to blow the command budget. `interceptor macos` remains the right surface for native-app tasks; this rule only constrains within-task redo behavior on the browser.
 
 `find` uses semantic + text matching — faster than scanning a big tree. Low-level actions when `act` is not enough:
 

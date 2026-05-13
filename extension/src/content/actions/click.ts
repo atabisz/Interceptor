@@ -13,7 +13,7 @@ export async function handleClick(action: Action): Promise<ActionResult> {
   const clickMsg = `clicked [${action.ref || action.index}]${action.x !== undefined ? ` at (${action.x},${action.y})` : ""}`
   const mutated = await waitForMutation(200)
   if (!mutated) {
-    return { success: true, data: clickMsg, warning: "no DOM change after click — if the site requires trusted events, try: interceptor click --os " + (action.ref || action.index) }
+    return { success: true, data: clickMsg, warning: "no DOM change after click — if the site requires trusted events, try: interceptor click --trusted " + (action.ref || action.index) }
   }
   return { success: true, data: clickMsg }
 }

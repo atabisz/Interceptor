@@ -8,6 +8,7 @@
 
 import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
 import { parseElementTarget } from "../parse"
+import { hasTrustedFlag } from "./flags"
 
 type Action = { type: string; [key: string]: unknown }
 type Result = { success: boolean; error?: string; data?: unknown; tabId?: number }
@@ -32,8 +33,8 @@ function textData(result: Result): string {
 
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
-  // PRD-70: explicit marker so agents know to scope or widen instead of
-  // escaping to ?action=raw / view-source when rendered text is "missing".
+  // Explicit truncation marker so agents know to scope or widen instead of
+  // escaping to ?action=raw / view-source when rendered text appears missing.
   return text.slice(0, maxChars) +
     `\n... (truncated: showed ${maxChars} of ${text.length} chars. Pass --full to see all, or 'read e<ref> --text-only' to scope, or 'find "<term>"' to jump.)`
 }
@@ -68,10 +69,9 @@ export function aggregateReadResults(opts: {
   if (opts.textRequested) {
     if (opts.textResult?.success) {
       text = textData(opts.textResult)
-      // PRD-70: bump default text cap from 2,000 → 8,000 chars. The 2K cap
-      // forced agents to use --full constantly, which then exposed the
-      // extension-side 10K cap. New default is 8K (mid-sized page intro),
-      // --full unlocks the full 200K from the extension.
+      // Default text cap is 8,000 chars — large enough to fit a mid-sized
+      // page intro without forcing --full. --full unlocks the full 200K
+      // cap from the extension side.
       if (!opts.full) text = truncateText(text, 8000)
     } else if (opts.textResult?.error) {
       warnings.push(`text: ${opts.textResult.error}`)
@@ -362,7 +362,7 @@ export async function runAct(
     process.exit(1)
   }
 
-  const useOs = filtered.includes("--os")
+  const useOs = hasTrustedFlag(filtered)
   const append = filtered.includes("--append")
   const noRead = filtered.includes("--no-read")
   const keysIdx = filtered.indexOf("--keys")
@@ -370,7 +370,7 @@ export async function runAct(
   const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 2000
 
   // Find value: everything after ref that isn't a flag
-  const flagSet = new Set(["--os", "--append", "--no-read", "--keys", "--timeout"])
+  const flagSet = new Set(["--trusted", "--os", "--append", "--no-read", "--keys", "--timeout"])
   const valueArgs: string[] = []
   let skip = false
   for (let i = 2; i < filtered.length; i++) {

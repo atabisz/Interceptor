@@ -4,12 +4,10 @@ import { renderMarkdown } from "./markdown-extract"
 type Action = { type: string; [key: string]: unknown }
 type ActionResult = { success: boolean; error?: string; warning?: string; data?: unknown }
 
-// PRD-70: bump default caps and surface explicit truncation markers.
-// Why: PRD-69 bench P9 (Nobel laureates Wikipedia page) — the agent hit the
-// silent 10,000-char text cap, didn't know the read was truncated, and
-// escaped to ?action=raw to fetch wikitext source. 11 commands, INVALID over
-// the bench's 8-cap. Root cause: silent truncation with no signal.
-// Fix: larger defaults + explicit marker telling the agent exactly what to do.
+// Truncation discipline: large caps + an explicit marker when capped.
+// A silent cap forces the agent to escape to raw-markup URLs to recover the
+// missing text. Surfacing the cap and showing how to scope or widen keeps
+// the agent on the rendered-text path it should already be on.
 const DEFAULT_TEXT_MAX_CHARS = 200_000
 const DEFAULT_HTML_MAX_CHARS = 200_000
 const ELEMENT_MAX_CHARS = 50_000
