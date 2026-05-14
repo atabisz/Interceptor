@@ -9,6 +9,65 @@ GENERATED_MANIFEST="$GENERATED_DIR/com.interceptor.host.json"
 EXTENSION_DIR="$ROOT/extension/dist"
 INSTALL_BRIDGE_SCRIPT="$ROOT/scripts/install-bridge.sh"
 
+# ── Platform detection ────────────────────────────────────────────────────────
+PLATFORM="$(uname -s)"   # Darwin | Linux
+
+# Profile root (Chromium "User Data" dir) for a browser target on this platform.
+profile_root_for() {
+  case "$PLATFORM:$1" in
+    Darwin:brave)  echo "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" ;;
+    Darwin:chrome) echo "$HOME/Library/Application Support/Google/Chrome" ;;
+    Linux:brave)   echo "$HOME/.config/BraveSoftware/Brave-Browser" ;;
+    Linux:chrome)  echo "$HOME/.config/google-chrome" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Native messaging hosts dir for a browser target on this platform.
+nm_dir_for() {
+  case "$PLATFORM:$1" in
+    Darwin:brave)  echo "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts" ;;
+    Darwin:chrome) echo "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts" ;;
+    Linux:brave)   echo "$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts" ;;
+    Linux:chrome)  echo "$HOME/.config/google-chrome/NativeMessagingHosts" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detect whether a browser is installed on this platform. Echoes 1/0.
+browser_installed() {
+  case "$PLATFORM:$1" in
+    Darwin:brave)  [[ -d "/Applications/Brave Browser.app" ]] && echo 1 || echo 0 ;;
+    Darwin:chrome) [[ -d "/Applications/Google Chrome.app" ]] && echo 1 || echo 0 ;;
+    Linux:brave)   command -v brave-browser >/dev/null 2>&1 && echo 1 || echo 0 ;;
+    Linux:chrome)  ( command -v google-chrome >/dev/null 2>&1 \
+                  || command -v google-chrome-stable >/dev/null 2>&1 \
+                  || command -v chromium >/dev/null 2>&1 ) && echo 1 || echo 0 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# Resolve the launchable executable / app reference for a browser target.
+# On macOS this is the .app bundle path (used with `open -a`).
+# On Linux this is the binary basename (used with pgrep + direct exec).
+browser_bin_for() {
+  case "$PLATFORM:$1" in
+    Darwin:brave)  echo "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" ;;
+    Darwin:chrome) echo "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ;;
+    Linux:brave)
+      if command -v brave-browser >/dev/null 2>&1; then echo brave-browser
+      else return 1; fi
+      ;;
+    Linux:chrome)
+      if command -v google-chrome >/dev/null 2>&1; then echo google-chrome
+      elif command -v google-chrome-stable >/dev/null 2>&1; then echo google-chrome-stable
+      elif command -v chromium >/dev/null 2>&1; then echo chromium
+      else return 1; fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # ── Parse flags ────────────────────────────────────────────────────────────────
 SKIP_EXTENSION=0
 BROWSER=""
@@ -69,15 +128,12 @@ done
 # ── List profiles ──────────────────────────────────────────────────────────────
 if [[ "$LIST_PROFILES" == "1" ]]; then
   if [[ -z "$BROWSER" ]]; then
-    if [[ -d "/Applications/Brave Browser.app" ]]; then BROWSER="brave"
-    elif [[ -d "/Applications/Google Chrome.app" ]]; then BROWSER="chrome"
+    if [[ "$(browser_installed brave)" == "1" ]]; then BROWSER="brave"
+    elif [[ "$(browser_installed chrome)" == "1" ]]; then BROWSER="chrome"
     fi
   fi
-  case "$BROWSER" in
-    brave)  PROFILE_ROOT="$HOME/Library/Application Support/BraveSoftware/Brave-Browser" ;;
-    chrome) PROFILE_ROOT="$HOME/Library/Application Support/Google/Chrome" ;;
-    *) echo "No supported browser found."; exit 1 ;;
-  esac
+  PROFILE_ROOT="$(profile_root_for "$BROWSER" || true)"
+  if [[ -z "$PROFILE_ROOT" ]]; then echo "No supported browser found."; exit 1; fi
 
   echo "Available profiles:"
   echo ""
@@ -86,7 +142,11 @@ if [[ "$LIST_PROFILES" == "1" ]]; then
   for dir in "$PROFILE_ROOT"/*/; do
     name=$(basename "$dir")
     if [[ -f "$dir/Preferences" ]]; then
-      display=$(plutil -extract profile.name raw -o - "$dir/Preferences" 2>/dev/null || echo "(unknown)")
+      if [[ "$PLATFORM" == "Darwin" ]] && command -v plutil >/dev/null 2>&1; then
+        display=$(plutil -extract profile.name raw -o - "$dir/Preferences" 2>/dev/null || echo "(unknown)")
+      else
+        display=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("profile",{}).get("name","(unknown)"))' "$dir/Preferences" 2>/dev/null || echo "(unknown)")
+      fi
       printf "  %-20s %s\n" "$name" "$display"
     fi
   done
@@ -146,13 +206,11 @@ fi
 # deterministic default in non-interactive contexts. Valid resolved values:
 #   "chrome" | "brave" | "both"
 if [[ -z "$BROWSER" ]]; then
-  CHROME_INSTALLED=0
-  BRAVE_INSTALLED=0
-  [[ -d "/Applications/Google Chrome.app" ]] && CHROME_INSTALLED=1
-  [[ -d "/Applications/Brave Browser.app" ]] && BRAVE_INSTALLED=1
+  CHROME_INSTALLED=$(browser_installed chrome)
+  BRAVE_INSTALLED=$(browser_installed brave)
 
   if (( CHROME_INSTALLED + BRAVE_INSTALLED == 0 )); then
-    echo "ERROR: No supported browser found in /Applications/." >&2
+    echo "ERROR: No supported browser found." >&2
     echo "       Install Google Chrome or Brave Browser, then re-run." >&2
     exit 1
   fi
@@ -207,11 +265,11 @@ fi
 echo "==> [browser] Installing native messaging symlink(s)..."
 NM_DIRS=()
 case "$BROWSER" in
-  chrome) NM_DIRS+=("$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts") ;;
-  brave)  NM_DIRS+=("$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts") ;;
+  chrome) NM_DIRS+=("$(nm_dir_for chrome)") ;;
+  brave)  NM_DIRS+=("$(nm_dir_for brave)") ;;
   both)
-    NM_DIRS+=("$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts")
-    NM_DIRS+=("$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts")
+    NM_DIRS+=("$(nm_dir_for chrome)")
+    NM_DIRS+=("$(nm_dir_for brave)")
     ;;
 esac
 
@@ -223,8 +281,8 @@ for dir in "${NM_DIRS[@]}"; do
     mkdir -p "$dir"
     ln -sfn "$GENERATED_MANIFEST" "$dir/com.interceptor.host.json"
     case "$dir" in
-      *Google/Chrome*) echo "    Chrome: $dir/com.interceptor.host.json" ;;
-      *Brave-Browser*) echo "    Brave:  $dir/com.interceptor.host.json" ;;
+      *Google/Chrome*|*google-chrome*) echo "    Chrome: $dir/com.interceptor.host.json" ;;
+      *Brave-Browser*|*BraveSoftware*) echo "    Brave:  $dir/com.interceptor.host.json" ;;
     esac
   fi
 done
@@ -232,15 +290,6 @@ done
 # ── Step 3: Load extension into browser via --load-extension ──────────────────
 # Takes one arg: "chrome" | "brave". Reads $SKIP_EXTENSION, $PROFILE, $DRY_RUN,
 # $EXTENSION_DIR from the surrounding scope.
-
-# Resolve the profile root for a given browser target.
-profile_root_for() {
-  case "$1" in
-    brave)  echo "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" ;;
-    chrome) echo "$HOME/Library/Application Support/Google/Chrome" ;;
-    *) return 1 ;;
-  esac
-}
 
 # Read extensions.ui.developer_mode from a profile's Preferences JSON.
 # Echoes "true" / "false" / "unknown" (file missing, malformed, or key absent).
@@ -307,20 +356,26 @@ load_extension() {
 
   local BROWSER_APP BROWSER_BIN BROWSER_NAME
   case "$target" in
-    brave)
-      BROWSER_APP="/Applications/Brave Browser.app"
-      BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Brave Browser"
-      BROWSER_NAME="Brave"
-      ;;
-    chrome)
-      BROWSER_APP="/Applications/Google Chrome.app"
-      BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Google Chrome"
-      BROWSER_NAME="Chrome"
-      ;;
+    brave)  BROWSER_NAME="Brave" ;;
+    chrome) BROWSER_NAME="Chrome" ;;
     *)
       echo "ERROR: load_extension called with unknown browser '$target'." >&2
       return 1 ;;
   esac
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    case "$target" in
+      brave)  BROWSER_APP="/Applications/Brave Browser.app" ;;
+      chrome) BROWSER_APP="/Applications/Google Chrome.app" ;;
+    esac
+    BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$BROWSER_NAME$([[ $target == brave ]] && echo " Browser")"
+  else
+    BROWSER_APP=""
+    BROWSER_BIN="$(browser_bin_for "$target" || true)"
+    if [[ -z "$BROWSER_BIN" ]]; then
+      echo "ERROR: $BROWSER_NAME binary not found in PATH on this platform." >&2
+      return 1
+    fi
+  fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "==> [browser] DRY: would launch $BROWSER_NAME --load-extension=$EXTENSION_DIR"
@@ -411,8 +466,12 @@ load_extension() {
     read -p "      Quit $BROWSER_NAME and relaunch with extension? [y/N] " CONFIRM
     if [[ "${CONFIRM:-n}" == "y" || "${CONFIRM:-n}" == "Y" ]]; then
       echo "    Quitting $BROWSER_NAME..."
-      osascript -e "tell application \"$BROWSER_NAME Browser\" to quit" 2>/dev/null || \
-      osascript -e "tell application \"$BROWSER_NAME\" to quit" 2>/dev/null || true
+      if [[ "$PLATFORM" == "Darwin" ]]; then
+        osascript -e "tell application \"$BROWSER_NAME Browser\" to quit" 2>/dev/null || \
+        osascript -e "tell application \"$BROWSER_NAME\" to quit" 2>/dev/null || true
+      else
+        pkill -TERM -f "$BROWSER_BIN" 2>/dev/null || true
+      fi
       sleep 2
       for j in {1..10}; do
         if ! pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; then break; fi
@@ -446,7 +505,12 @@ load_extension() {
     echo "    Profile:   $PROFILE"
   fi
 
-  open -a "$BROWSER_APP" --args "${LAUNCH_ARGS[@]}"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    open -a "$BROWSER_APP" --args "${LAUNCH_ARGS[@]}"
+  else
+    nohup "$BROWSER_BIN" "${LAUNCH_ARGS[@]}" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
 
   # ── Post-launch reachability probe ──────────────────────────────────────────
   # Wait briefly for the extension to initialize, then probe via
