@@ -87,53 +87,66 @@ const kCGMouseEventClickState = 1
 
 let eventSource: number | null = null
 
+/**
+ * Lazily creates and caches a HID-sourced CGEventSource pointer.
+ *
+ * `kCGEventSourceStateHIDSystemState` (1) marks events as originating from real
+ * HID hardware so Chromium treats them as `event.isTrusted: true`. The earlier
+ * `kCGEventSourceStateCombinedSessionState` (0) made `--os` clicks silently
+ * fail any `event.isTrusted` gate.
+ */
 function getSource(): number | null {
   if (!eventSource) {
-    // kCGEventSourceStateHIDSystemState (1) marks events as originating from
-    // real HID hardware. Chrome and other apps treat HID-sourced CGEvents as
-    // `isTrusted: true` user input. The previous value
-    // kCGEventSourceStateCombinedSessionState (0) is for observing the merged
-    // session stream — events posted from that source land on the page but
-    // are not treated as trusted by Chromium, which made `--os` clicks
-    // silently fail any `event.isTrusted` gate (e.g. bench S8 Trusted Input
-    // Gate; the bench's prior S8 PASS rate came from agent hallucination,
-    // not from the click actually flipping the page state).
     eventSource = Number(sym.CGEventSourceCreate(kCGEventSourceStateHIDSystemState))
     if (!eventSource) return null
   }
   return eventSource
 }
 
+/** CoreGraphics symbol table on macOS; an empty object on non-Darwin. */
 const sym = (cg ? cg.symbols : {}) as Record<string, (...args: any[]) => any>
 
+/** Allocate a CGEvent for a mouse action at `(x, y)`. Returns null on failure. */
 function createMouseEvent(type: number, x: number, y: number, button: number = kCGMouseButtonLeft): number | null {
   const src = getSource()
   const event = Number(sym.CGEventCreateMouseEvent(src, type, x, y, button))
   return event || null
 }
 
+/** Allocate a CGEvent for a key down/up. Returns null on failure. */
 function createKeyboardEvent(keyCode: number, keyDown: boolean): number | null {
   const src = getSource()
   const event = Number(sym.CGEventCreateKeyboardEvent(src, keyCode, keyDown))
   return event || null
 }
 
+/** Post a CGEvent into the named event tap (defaults to HID tap). */
 function postEvent(event: number, tap: number = kCGHIDEventTap) {
   sym.CGEventPost(tap, event)
 }
 
+/** Release a CGEvent allocated by createMouseEvent / createKeyboardEvent. */
 function releaseEvent(event: number) {
   sym.CFRelease(event)
 }
 
+/** Apply a modifier-flag bitfield (shift/ctrl/alt/cmd) to an event before posting. */
 function setEventFlags(event: number, flags: number) {
   sym.CGEventSetFlags(event, flags)
 }
 
+/** Promise-based setTimeout — used to space out CGEvent posts. */
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms))
 }
 
+/**
+ * Synthesize a real HID mouse click at absolute screen coordinates `(screenX, screenY)`.
+ *
+ * Posts a move-then-down-then-up sequence per click, with `clickCount` flagged
+ * via `kCGMouseEventClickState` so Chromium recognizes double/triple clicks.
+ * Returns an unsupported error on non-Darwin.
+ */
 export async function osClick(
   screenX: number,
   screenY: number,
@@ -192,6 +205,7 @@ const KEY_MAP: Record<string, number> = {
   F7: 98, F8: 100, F9: 101, F10: 109, F11: 103, F12: 111,
 }
 
+/** Convert a list of modifier names ("shift", "cmd", etc.) into a CGEventFlags bitfield. */
 function modifiersToFlags(modifiers: string[]): number {
   let flags = 0
   for (const mod of modifiers) {
@@ -204,6 +218,13 @@ function modifiersToFlags(modifiers: string[]): number {
   return flags
 }
 
+/**
+ * Synthesize a real HID keystroke for `key` with optional modifier list.
+ *
+ * Posts modifier key-downs first, then the target key down/up, then modifier
+ * key-ups so any ergonomic flag stack matches Chromium's expectation. Returns
+ * an unsupported error on non-Darwin or for keys absent from KEY_MAP.
+ */
 export async function osKey(
   key: string,
   modifiers: string[] = []
@@ -276,6 +297,13 @@ export async function osKey(
   }
 }
 
+/**
+ * Type `text` one character at a time via synthetic HID keystrokes.
+ *
+ * Falls back to `CGEventKeyboardSetUnicodeString` for characters that aren't
+ * mapped to a US-layout key code so emoji and accented input still land.
+ * Returns an unsupported error on non-Darwin.
+ */
 export async function osType(text: string): Promise<{ success: boolean; error?: string }> {
   if (!IS_DARWIN) return UNSUPPORTED
   try {
@@ -333,6 +361,13 @@ export async function osType(text: string): Promise<{ success: boolean; error?: 
   }
 }
 
+/**
+ * Move the mouse along the given path of absolute screen coordinates.
+ *
+ * Spaces successive moves so the total walk takes ~`durationMs`. Used by the
+ * caller (typically `generateBezierPath`) to mimic human-like cursor motion.
+ * Returns an unsupported error on non-Darwin.
+ */
 export async function osMove(
   points: Array<{ x: number; y: number }>,
   durationMs: number = 100
@@ -357,6 +392,10 @@ export async function osMove(
   }
 }
 
+/**
+ * Interpolate a quadratic Bezier curve between `start` and `end` with a randomized
+ * control point. Returns `steps + 1` integer-rounded points (inclusive of both ends).
+ */
 function bezierInterpolate(
   start: { x: number; y: number },
   end: { x: number; y: number },
@@ -375,6 +414,10 @@ function bezierInterpolate(
   return points
 }
 
+/**
+ * Pure helper: produce a `steps + 1`-point Bezier path from `(fromX, fromY)`
+ * to `(toX, toY)`. Platform-independent — safe to call on Linux.
+ */
 export function generateBezierPath(
   fromX: number, fromY: number,
   toX: number, toY: number,
@@ -383,6 +426,11 @@ export function generateBezierPath(
   return bezierInterpolate({ x: fromX, y: fromY }, { x: toX, y: toY }, steps)
 }
 
+/**
+ * Pure helper: translate page-relative `(pageX, pageY)` into absolute screen
+ * coordinates given the window bounds and the chrome (UI) bar height. Platform
+ * independent — safe to call on Linux.
+ */
 export function translateCoords(
   pageX: number,
   pageY: number,
