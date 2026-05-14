@@ -364,10 +364,15 @@ load_extension() {
   esac
   if [[ "$PLATFORM" == "Darwin" ]]; then
     case "$target" in
-      brave)  BROWSER_APP="/Applications/Brave Browser.app" ;;
-      chrome) BROWSER_APP="/Applications/Google Chrome.app" ;;
+      brave)
+        BROWSER_APP="/Applications/Brave Browser.app"
+        BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Brave Browser"
+        ;;
+      chrome)
+        BROWSER_APP="/Applications/Google Chrome.app"
+        BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Google Chrome"
+        ;;
     esac
-    BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$BROWSER_NAME$([[ $target == brave ]] && echo " Browser")"
   else
     BROWSER_APP=""
     BROWSER_BIN="$(browser_bin_for "$target" || true)"
