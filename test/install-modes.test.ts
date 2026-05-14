@@ -14,6 +14,30 @@ import { resolve } from "node:path"
 const REPO_ROOT = resolve(import.meta.dir, "..")
 const INSTALL_SCRIPT = resolve(REPO_ROOT, "scripts/install.sh")
 
+const IS_DARWIN = process.platform === "darwin"
+
+// Platform-specific NM-dir substrings the dry-run output should contain.
+// macOS uses ~/Library/Application Support/<vendor>/<product>/NativeMessagingHosts
+// Linux uses ~/.config/<product>/NativeMessagingHosts
+const CHROME_NM_SUBSTR = IS_DARWIN ? "Google/Chrome/NativeMessagingHosts" : "google-chrome/NativeMessagingHosts"
+const BRAVE_NM_SUBSTR = IS_DARWIN
+  ? "BraveSoftware/Brave-Browser/NativeMessagingHosts"
+  : ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
+
+// Whether a browser binary/app is detectable on this platform — mirrors the
+// browser_installed helper in scripts/install.sh. Tests that need a specific
+// browser to be auto-detected skip themselves when it's absent.
+function browserInstalled(target: "chrome" | "brave"): boolean {
+  if (IS_DARWIN) {
+    const apps = { chrome: "/Applications/Google Chrome.app", brave: "/Applications/Brave Browser.app" }
+    return spawnSync("test", ["-d", apps[target]]).status === 0
+  }
+  const candidates = target === "chrome"
+    ? ["google-chrome", "google-chrome-stable", "chromium"]
+    : ["brave-browser"]
+  return candidates.some(b => spawnSync("command", ["-v", b], { shell: true }).status === 0)
+}
+
 function runInstallDryRun(args: string[]): { stdout: string; status: number; stderr: string } {
   const proc = spawnSync("bash", [INSTALL_SCRIPT, "--dry-run", ...args], {
     cwd: REPO_ROOT,
@@ -47,7 +71,7 @@ describe("install modes — dry-run", () => {
     expect(stdout).not.toContain("[bridge]")
   })
 
-  test("--full prints both browser steps and bridge steps", () => {
+  test.skipIf(!IS_DARWIN)("--full prints both browser steps and bridge steps", () => {
     const { stdout, status } = runInstallDryRun(["--full", "--chrome"])
     expect(status).toBe(0)
     expect(stdout).toContain("Mode: full")
@@ -93,29 +117,71 @@ describe("install modes — dry-run", () => {
   })
 })
 
+describe("install platform routing — dry-run", () => {
+  test("dry-run output matches the platform's NM dir convention", () => {
+    if (!browserInstalled("chrome") && !browserInstalled("brave")) return
+    const target = browserInstalled("chrome") ? "chrome" : "brave"
+    const { stdout, status } = runInstallDryRun(["--browser-only", `--${target}`])
+    expect(status).toBe(0)
+
+    if (IS_DARWIN) {
+      // macOS: ~/Library/Application Support/<vendor>/<product>/NativeMessagingHosts
+      expect(stdout).toContain("Library/Application Support")
+      expect(stdout).not.toContain(".config/")
+    } else {
+      // Linux: ~/.config/<product>/NativeMessagingHosts
+      expect(stdout).toContain(".config/")
+      expect(stdout).not.toContain("Library/Application Support")
+    }
+  })
+
+  test.skipIf(IS_DARWIN)("--full mode is rejected on non-Darwin platforms", () => {
+    const { stderr, status } = runInstallDryRun(["--full", "--chrome"])
+    expect(status).not.toBe(0)
+    expect(stderr).toContain("--full mode is macOS only")
+  })
+})
+
 describe("install browser selection — dry-run", () => {
-  test("--chrome installs only the Chrome native-messaging path", () => {
+  test.skipIf(!browserInstalled("chrome"))("--chrome installs only the Chrome native-messaging path", () => {
     const { stdout, status } = runInstallDryRun(["--browser-only", "--chrome"])
     expect(status).toBe(0)
     expect(stdout).toContain("Browser: chrome")
-    expect(stdout).toContain("Google/Chrome/NativeMessagingHosts")
-    expect(stdout).not.toContain("BraveSoftware/Brave-Browser/NativeMessagingHosts")
+    expect(stdout).toContain(CHROME_NM_SUBSTR)
+    expect(stdout).not.toContain(BRAVE_NM_SUBSTR)
   })
 
-  test("--brave installs only the Brave native-messaging path", () => {
+  test.skipIf(!browserInstalled("brave"))("--brave installs only the Brave native-messaging path", () => {
     const { stdout, status } = runInstallDryRun(["--browser-only", "--brave"])
     expect(status).toBe(0)
     expect(stdout).toContain("Browser: brave")
-    expect(stdout).toContain("BraveSoftware/Brave-Browser/NativeMessagingHosts")
-    expect(stdout).not.toContain("Google/Chrome/NativeMessagingHosts")
+    expect(stdout).toContain(BRAVE_NM_SUBSTR)
+    expect(stdout).not.toContain(CHROME_NM_SUBSTR)
   })
 
-  test("non-interactive default (no --chrome/--brave) falls back to chrome with notice", () => {
+  test("non-interactive default (no --chrome/--brave) auto-selects an installed browser", () => {
     const { stdout, status } = runInstallDryRun(["--browser-only"])
     expect(status).toBe(0)
-    expect(stdout).toContain("defaulting to 'chrome' (non-interactive)")
-    expect(stdout).toContain("Browser: chrome")
-    expect(stdout).toContain("Google/Chrome/NativeMessagingHosts")
-    expect(stdout).not.toContain("BraveSoftware/Brave-Browser/NativeMessagingHosts")
+    // Two valid auto-select paths:
+    //   1. Both browsers installed → script prints "defaulting to 'chrome' (non-interactive)"
+    //   2. Only one installed     → script prints "Browser: <X> (only supported browser found)"
+    const hasBoth = browserInstalled("chrome") && browserInstalled("brave")
+    if (hasBoth) {
+      expect(stdout).toContain("defaulting to 'chrome' (non-interactive)")
+      expect(stdout).toContain("Browser: chrome")
+      expect(stdout).toContain(CHROME_NM_SUBSTR)
+      expect(stdout).not.toContain(BRAVE_NM_SUBSTR)
+    } else if (browserInstalled("chrome")) {
+      expect(stdout).toContain("only supported browser found")
+      expect(stdout).toContain("Browser: chrome")
+      expect(stdout).toContain(CHROME_NM_SUBSTR)
+    } else if (browserInstalled("brave")) {
+      expect(stdout).toContain("only supported browser found")
+      expect(stdout).toContain("Browser: brave")
+      expect(stdout).toContain(BRAVE_NM_SUBSTR)
+    } else {
+      // No browser installed — script aborts before NM resolution. Documented exit path.
+      expect(status).not.toBe(0)
+    }
   })
 })

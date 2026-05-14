@@ -16,6 +16,13 @@ const REPO_ROOT = resolve(import.meta.dir, "..")
 const RELEASE_SCRIPT = resolve(REPO_ROOT, "scripts/release.sh")
 const TEST_VERSION = "0.0.0-test"
 
+// scripts/release.sh exercises the macOS-only release pipeline: codesign,
+// productbuild, xcrun notarytool/stapler, /Volumes/ disk images, .pkg signing.
+// None of this is meaningful on Linux. The dry-run still emits the script
+// commands, but the assertions are written against macOS-specific paths and
+// would be misleading if they ran on Linux.
+const IS_DARWIN = process.platform === "darwin"
+
 function runReleaseDryRun(args: string[]): {
   stdout: string
   stderr: string
@@ -38,7 +45,7 @@ function runReleaseDryRun(args: string[]): {
   }
 }
 
-describe("release modes — dry-run", () => {
+describe.skipIf(!IS_DARWIN)("release modes — dry-run", () => {
   test("--browser-only emits Browser pkg and zero bridge artifacts", () => {
     const { stdout, status } = runReleaseDryRun(["--browser-only"])
     expect(status).toBe(0)
