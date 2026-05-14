@@ -2,13 +2,18 @@ import { dlopen, FFIType } from "bun:ffi"
 
 const CG_PATH = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
 
+/** True on macOS. Gates every CoreGraphics-touching code path in this module. */
 const IS_DARWIN = process.platform === "darwin"
 
-// CoreGraphics is macOS-only. Loading it on Linux throws ERR_DLOPEN_FAILED at
-// module load time and crashes the daemon before NM handshake (port 19222 stays
-// unbound, extension reports "native host disconnected"). Gate the dlopen so
-// the module imports cleanly on Linux; the exported os* functions short-circuit
-// with an unsupported error below.
+/**
+ * CoreGraphics handle, or null on non-Darwin.
+ *
+ * CoreGraphics is macOS-only. Loading it on Linux throws ERR_DLOPEN_FAILED at
+ * module load time and crashes the daemon before NM handshake (port 19222 stays
+ * unbound, extension reports "native host disconnected"). Gating the dlopen lets
+ * the module import cleanly on Linux; the exported os* functions short-circuit
+ * with an unsupported error below.
+ */
 const cg = IS_DARWIN ? dlopen(CG_PATH, {
   CGEventCreateMouseEvent: {
     args: [FFIType.ptr, FFIType.i32, FFIType.f64, FFIType.f64, FFIType.i32],
@@ -48,6 +53,7 @@ const cg = IS_DARWIN ? dlopen(CG_PATH, {
   },
 }) : null
 
+/** Standard error result returned by every os* export when called on non-Darwin. */
 const UNSUPPORTED = { success: false as const, error: "act --os not supported on this platform (macOS only)" }
 
 const kCGHIDEventTap = 0

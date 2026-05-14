@@ -14,19 +14,35 @@ import { resolve } from "node:path"
 const REPO_ROOT = resolve(import.meta.dir, "..")
 const INSTALL_SCRIPT = resolve(REPO_ROOT, "scripts/install.sh")
 
+/** True on macOS; flips test expectations from `~/Library/...` paths to `~/.config/...`. */
 const IS_DARWIN = process.platform === "darwin"
 
-// Platform-specific NM-dir substrings the dry-run output should contain.
-// macOS uses ~/Library/Application Support/<vendor>/<product>/NativeMessagingHosts
-// Linux uses ~/.config/<product>/NativeMessagingHosts
+/**
+ * Platform-specific NM-dir substring the dry-run output should contain for Chrome.
+ *
+ * macOS: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts`
+ * Linux: `~/.config/google-chrome/NativeMessagingHosts`
+ */
 const CHROME_NM_SUBSTR = IS_DARWIN ? "Google/Chrome/NativeMessagingHosts" : "google-chrome/NativeMessagingHosts"
+
+/**
+ * Platform-specific NM-dir substring the dry-run output should contain for Brave.
+ *
+ * macOS: `~/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts`
+ * Linux: `~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts`
+ */
 const BRAVE_NM_SUBSTR = IS_DARWIN
   ? "BraveSoftware/Brave-Browser/NativeMessagingHosts"
   : ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
 
-// Whether a browser binary/app is detectable on this platform — mirrors the
-// browser_installed helper in scripts/install.sh. Tests that need a specific
-// browser to be auto-detected skip themselves when it's absent.
+/**
+ * Whether a browser binary/app is detectable on this platform.
+ *
+ * Mirrors the `browser_installed` helper in scripts/install.sh — looks for the
+ * `.app` bundle on macOS and any candidate binary on `$PATH` on Linux. Tests
+ * that need a specific browser to be auto-detected skip themselves when it's
+ * absent so CI without browsers installed stays green.
+ */
 function browserInstalled(target: "chrome" | "brave"): boolean {
   if (IS_DARWIN) {
     const apps = { chrome: "/Applications/Google Chrome.app", brave: "/Applications/Brave Browser.app" }
@@ -38,6 +54,12 @@ function browserInstalled(target: "chrome" | "brave"): boolean {
   return candidates.some(b => spawnSync("command", ["-v", b], { shell: true }).status === 0)
 }
 
+/**
+ * Run scripts/install.sh in dry-run mode and capture stdout/stderr/exit status.
+ *
+ * Sets both `--dry-run` and `INSTALL_DRY_RUN=1` so the script never mutates
+ * the filesystem or installs native-messaging manifests during tests.
+ */
 function runInstallDryRun(args: string[]): { stdout: string; status: number; stderr: string } {
   const proc = spawnSync("bash", [INSTALL_SCRIPT, "--dry-run", ...args], {
     cwd: REPO_ROOT,
