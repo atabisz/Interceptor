@@ -123,6 +123,8 @@ describe("formatStatus (#49 + #52)", () => {
       bridgePid: null,
       bridgeSocket: null,
       launchAgentInstalled: false,
+      launchAgentPath: null,
+      launchAgentLoaded: false,
       ...over,
     }
   }
