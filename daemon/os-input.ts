@@ -301,8 +301,10 @@ export async function osKey(
  * Type `text` one character at a time via synthetic HID keystrokes.
  *
  * Falls back to `CGEventKeyboardSetUnicodeString` for characters that aren't
- * mapped to a US-layout key code so emoji and accented input still land.
- * Returns an unsupported error on non-Darwin.
+ * mapped to a US-layout key code. Encodes the full UTF-16 code-unit sequence
+ * of each iterated code point so accented BMP characters and astral-plane
+ * emoji (surrogate pairs) both land intact. Returns an unsupported error on
+ * non-Darwin.
  */
 export async function osType(text: string): Promise<{ success: boolean; error?: string }> {
   if (!IS_DARWIN) return UNSUPPORTED
@@ -337,8 +339,8 @@ export async function osType(text: string): Promise<{ success: boolean; error?: 
       } else {
         const down = createKeyboardEvent(0, true)
         if (!down) continue
-        const encoded = new Uint16Array([char.charCodeAt(0)])
-        sym.CGEventKeyboardSetUnicodeString(down, 1, encoded)
+        const encoded = Uint16Array.from({ length: char.length }, (_, i) => char.charCodeAt(i))
+        sym.CGEventKeyboardSetUnicodeString(down, encoded.length, encoded)
         postEvent(down)
         releaseEvent(down)
 
@@ -346,7 +348,7 @@ export async function osType(text: string): Promise<{ success: boolean; error?: 
 
         const up = createKeyboardEvent(0, false)
         if (up) {
-          sym.CGEventKeyboardSetUnicodeString(up, 1, encoded)
+          sym.CGEventKeyboardSetUnicodeString(up, encoded.length, encoded)
           postEvent(up)
           releaseEvent(up)
         }
@@ -378,12 +380,12 @@ export async function osMove(
 
     const stepDelay = points.length > 1 ? durationMs / (points.length - 1) : 0
 
-    for (const point of points) {
+    for (const [index, point] of points.entries()) {
       const moveEvent = createMouseEvent(kCGEventMouseMoved, point.x, point.y)
       if (!moveEvent) continue
       postEvent(moveEvent)
       releaseEvent(moveEvent)
-      if (stepDelay > 0) await sleep(stepDelay)
+      if (stepDelay > 0 && index < points.length - 1) await sleep(stepDelay)
     }
 
     return { success: true }

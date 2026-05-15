@@ -41,8 +41,7 @@ browser_installed() {
     Darwin:chrome) [[ -d "/Applications/Google Chrome.app" ]] && echo 1 || echo 0 ;;
     Linux:brave)   command -v brave-browser >/dev/null 2>&1 && echo 1 || echo 0 ;;
     Linux:chrome)  ( command -v google-chrome >/dev/null 2>&1 \
-                  || command -v google-chrome-stable >/dev/null 2>&1 \
-                  || command -v chromium >/dev/null 2>&1 ) && echo 1 || echo 0 ;;
+                  || command -v google-chrome-stable >/dev/null 2>&1 ) && echo 1 || echo 0 ;;
     *) echo 0 ;;
   esac
 }
@@ -61,7 +60,6 @@ browser_bin_for() {
     Linux:chrome)
       if command -v google-chrome >/dev/null 2>&1; then echo google-chrome
       elif command -v google-chrome-stable >/dev/null 2>&1; then echo google-chrome-stable
-      elif command -v chromium >/dev/null 2>&1; then echo chromium
       else return 1; fi
       ;;
     *) return 1 ;;
