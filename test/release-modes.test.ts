@@ -143,11 +143,11 @@ describe.skipIf(!IS_DARWIN)("release modes — dry-run", () => {
     expect(stdout).toContain("Interceptor-Daemon-Browser.pkg")
     expect(stdout).toContain("Interceptor-Daemon-Full.pkg")
 
-    // Step 13 must publish both pkgs to Sparkle.
-    expect(stdout).toMatch(
-      /append appcast item \(browser-only, minSysVer 11\.0\)/,
-    )
-    expect(stdout).toMatch(/append appcast item \(full, minSysVer 14\.0\)/)
+    // Step 13 must defer to the standalone publish script and surface the
+    // command in the operator-facing output. release.sh stops at notarization
+    // + stapling so the maintainer can test the .pkg before pushing to Sparkle.
+    expect(stdout).toContain("Sparkle publish — SKIPPED")
+    expect(stdout).toContain("bash scripts/publish-sparkle.sh")
   })
 
   test("--browser-only and --full are mutually exclusive", () => {
@@ -195,14 +195,14 @@ describe.skipIf(!IS_DARWIN)("release modes — dry-run", () => {
     expect(fullOut).not.toContain("scripts/release/postinstall-browser ")
   })
 
-  test("Sparkle appcast emits one item per built pkg with mode-tagged channel", () => {
+  test("Sparkle publish is decoupled — release.sh skips Step 13 and points at the standalone script", () => {
     const both = runReleaseDryRun([]).stdout
-    // Two distinct DRY appcast lines, one per mode, each carrying the
-    // mode label and minSysVer that distribution-browser.xml / .xml encode.
-    expect(both).toMatch(
-      /append appcast item \(browser-only, minSysVer 11\.0\)/,
-    )
-    expect(both).toMatch(/append appcast item \(full, minSysVer 14\.0\)/)
+    // release.sh no longer auto-publishes to Sparkle; that step lives in
+    // scripts/publish-sparkle.sh so the maintainer can test the .pkg
+    // locally before broadcasting an auto-update.
+    expect(both).toContain("Sparkle publish — SKIPPED")
+    expect(both).toContain("bash scripts/publish-sparkle.sh")
+    expect(both).not.toMatch(/append appcast item/)
   })
 
   test("Browser pkg stages the browser-surface skills only", () => {
