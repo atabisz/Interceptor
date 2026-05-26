@@ -1002,6 +1002,12 @@ try {
 
         if (request.type === "keepalive") {
           log("ws keepalive")
+          try {
+            ws.send(JSON.stringify({ type: "keepalive_ack", timestamp: Date.now() }))
+            log("ws keepalive_ack sent")
+          } catch (err) {
+            log(`ws keepalive_ack send failed: ${(err as Error).message}`)
+          }
           return
         }
 

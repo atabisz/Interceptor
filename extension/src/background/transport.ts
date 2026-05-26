@@ -11,14 +11,19 @@ let isConnecting = false
 let reconnectDelay = 1000
 
 let wsChannel: WebSocket | null = null
+let wsConnecting: WebSocket | null = null
 let wsReady = false
 let wsKeepAliveTimer: ReturnType<typeof setInterval> | null = null
 let keepalivePongTimer: ReturnType<typeof setTimeout> | null = null
 let pendingHandshakePort: chrome.runtime.Port | null = null
 let lastNativeActivityAt = 0
+let lastWsInboundAt = 0
+let wsKeepalivesSentSinceAck = 0
+let wsAckSupported = false
 const WS_URL = "ws://localhost:19222"
 export const NATIVE_KEEPALIVE_PONG_TIMEOUT_MS = 15_000
 export const RECENT_NATIVE_ACTIVITY_GRACE_MS = 10_000
+export const WS_KEEPALIVE_MISS_LIMIT = 2
 const OUTBOUND_RECOVERY_QUEUE_CAP = 50
 const outboundRecoveryQueue: unknown[] = []
 
@@ -189,12 +194,32 @@ export function connectToHost(): void {
 function startWsKeepAlive(): void {
   if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer)
   wsKeepAliveTimer = setInterval(() => {
-    if (!wsChannel || wsChannel.readyState !== WebSocket.OPEN) {
+    const channel = wsChannel
+    if (!channel || channel.readyState !== WebSocket.OPEN) {
       if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer)
       wsKeepAliveTimer = null
       return
     }
-    try { wsChannel.send(JSON.stringify({ type: "keepalive", timestamp: Date.now() })) } catch {}
+    // Detect half-open ws inline. The outbound setInterval is the one thing
+    // reliably running while ws.onmessage is wedged. Once we've seen a
+    // keepalive_ack at least once (wsAckSupported), any window of
+    // WS_KEEPALIVE_MISS_LIMIT consecutive sent-without-ack keepalives means
+    // the OS socket is wedged in a way ws.onmessage won't recover from.
+    // Force-close so onclose can trigger a fresh reconnect.
+    if (wsAckSupported && wsKeepalivesSentSinceAck >= WS_KEEPALIVE_MISS_LIMIT) {
+      console.error(`ws inbound stale (${wsKeepalivesSentSinceAck} unacked) — forcing reconnect`)
+      try { channel.close() } catch {}
+      stopWsKeepAlive()
+      wsReady = false
+      wsChannel = null
+      if (activeTransport === "websocket") activeTransport = "none"
+      setTimeout(() => connectWsChannel(), 500)
+      return
+    }
+    try {
+      channel.send(JSON.stringify({ type: "keepalive", timestamp: Date.now() }))
+      wsKeepalivesSentSinceAck += 1
+    } catch {}
   }, 20_000)
 }
 
@@ -205,11 +230,19 @@ function stopWsKeepAlive(): void {
 
 export function connectWsChannel(): void {
   if (wsChannel && (wsChannel.readyState === WebSocket.OPEN || wsChannel.readyState === WebSocket.CONNECTING)) return
+  // Guard the gap between `new WebSocket()` and `ws.onopen` setting wsChannel.
+  // Without this, concurrent calls (top-level + onInstalled + alarm) each
+  // spawn a fresh WebSocket and the daemon ends up with a connection storm.
+  if (wsConnecting) return
   try {
     const ws = new WebSocket(WS_URL)
+    wsConnecting = ws
     ws.onopen = () => {
+      wsConnecting = null
       wsChannel = ws
       wsReady = true
+      lastWsInboundAt = Date.now()
+      wsKeepalivesSentSinceAck = 0
       ws.send(JSON.stringify({ type: "extension" }))
       startWsKeepAlive()
       console.log("ws channel connected")
@@ -223,8 +256,14 @@ export function connectWsChannel(): void {
       drainOutboundRecoveryQueue()
     }
     ws.onmessage = (event) => {
+      lastWsInboundAt = Date.now()
+      wsKeepalivesSentSinceAck = 0
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "")
+        if (msg.type === "keepalive_ack") {
+          wsAckSupported = true
+          return
+        }
         console.log("ws onmessage:", JSON.stringify(msg).slice(0, 200))
         if (msg.id && msg.action) {
           msg._viaWs = true
@@ -235,12 +274,14 @@ export function connectWsChannel(): void {
       }
     }
     ws.onclose = () => {
+      if (wsConnecting === ws) wsConnecting = null
       stopWsKeepAlive()
       wsReady = false
       wsChannel = null
       if (activeTransport === "websocket") activeTransport = "none"
     }
     ws.onerror = () => {
+      if (wsConnecting === ws) wsConnecting = null
       stopWsKeepAlive()
       wsReady = false
       wsChannel = null
@@ -270,6 +311,14 @@ export function registerAlarmListener(): void {
   chrome.alarms.create("keepalive", { periodInMinutes: 0.5 })
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== "keepalive") return
+
+    // Self-heal stuck transport: ws is open but activeTransport never advanced.
+    if (activeTransport === "none" && isWsOpen()) {
+      console.log("self-heal: ws open but activeTransport=none, promoting to websocket")
+      activeTransport = "websocket"
+      drainMessageQueue()
+    }
+
     if (!nativePort) connectToHost()
     if (!wsChannel || wsChannel.readyState === WebSocket.CLOSED) connectWsChannel()
     if (activeTransport === "native" && nativePort) {
