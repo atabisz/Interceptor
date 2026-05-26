@@ -18,15 +18,59 @@ export async function ensureInterceptorGroup(): Promise<number> {
 }
 
 export async function addTabToInterceptorGroup(tabId: number): Promise<number> {
-  let groupId = await ensureInterceptorGroup()
-  if (groupId === -1) {
-    groupId = await chrome.tabs.group({ tabIds: tabId })
-    await chrome.tabGroups.update(groupId, { title: "interceptor", color: "cyan" })
-    interceptorGroupId = groupId
-  } else {
-    await chrome.tabs.group({ tabIds: tabId, groupId })
+  // Tab groups are window-scoped in Chrome — chrome.tabs.group rejects with
+  // "Tabs can only be moved to and from normal windows" when the new tab and
+  // the cached interceptor group live in different windows (e.g. the cached
+  // group is in a non-normal window, or the tab was opened in a different
+  // window than the group's). Resolve a per-window interceptor group: if a
+  // group with title "interceptor" exists in this window, reuse it; otherwise
+  // create one. The module-level interceptorGroupId tracks the most recently
+  // used group for fast-path checks (isTabInInterceptorGroup).
+  let tab: chrome.tabs.Tab
+  try {
+    tab = await chrome.tabs.get(tabId)
+  } catch (err) {
+    console.error(`addTabToInterceptorGroup: chrome.tabs.get(${tabId}) failed:`, err)
+    return -1
   }
-  return groupId
+  let windowType: string | undefined
+  try {
+    if (tab.windowId !== undefined) {
+      const win = await chrome.windows.get(tab.windowId)
+      windowType = win.type
+      console.log(`addTabToInterceptorGroup: tab ${tabId} is in window ${tab.windowId} (type=${windowType})`)
+    }
+  } catch (err) {
+    console.warn(`addTabToInterceptorGroup: chrome.windows.get(${tab.windowId}) failed:`, err)
+  }
+  // Tab groups only work in normal windows. If Chrome put the tab in a
+  // popup/devtools/app window (or our windowType lookup failed), skip
+  // grouping rather than throw — the tab is still functional.
+  if (windowType !== "normal") {
+    console.warn(`addTabToInterceptorGroup: skipping group (window type=${windowType ?? "unknown"})`)
+    return -1
+  }
+  const windowId = tab.windowId
+  const groupsInWindow = windowId !== undefined
+    ? await chrome.tabGroups.query({ title: "interceptor", windowId })
+    : await chrome.tabGroups.query({ title: "interceptor" })
+  try {
+    if (groupsInWindow.length > 0) {
+      const groupId = groupsInWindow[0].id
+      console.log(`addTabToInterceptorGroup: reusing group ${groupId} in window ${windowId}`)
+      await chrome.tabs.group({ tabIds: tabId, groupId })
+      interceptorGroupId = groupId
+      return groupId
+    }
+    console.log(`addTabToInterceptorGroup: creating new group in window ${windowId}`)
+    const newGroupId = await chrome.tabs.group({ tabIds: tabId })
+    await chrome.tabGroups.update(newGroupId, { title: "interceptor", color: "cyan" })
+    interceptorGroupId = newGroupId
+    return newGroupId
+  } catch (err) {
+    console.error(`addTabToInterceptorGroup: chrome.tabs.group failed (tab=${tabId} windowId=${windowId} windowType=${windowType}):`, err)
+    return -1
+  }
 }
 
 export async function isTabInInterceptorGroup(tabId: number): Promise<boolean> {

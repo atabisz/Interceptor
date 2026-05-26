@@ -62,7 +62,24 @@ export async function handleTabActions(
       // --activate` is the explicit opt-in). Callers pass `action.active:
       // true` only when the new tab is genuinely meant to be foregrounded.
       const shouldActivate = (action.active as boolean | undefined) === true
-      const newTab = await chrome.tabs.create({ url: targetUrl, active: shouldActivate })
+      // Pin tab creation to a normal window. Without a windowId, chrome.tabs.create
+      // opens in whatever window had focus, which may be a popup, devtools, or app
+      // window — and chrome.tabs.group rejects with "Tabs can only be moved to and
+      // from normal windows" when the new tab lands in a non-normal window. Resolve
+      // a normal window up front (creating one if none exist) so grouping always
+      // succeeds.
+      const normalWindows = await chrome.windows.getAll({ windowTypes: ["normal"] })
+      let targetWindowId: number | undefined = normalWindows.find(w => w.focused)?.id
+        ?? normalWindows[0]?.id
+      if (!targetWindowId) {
+        const created = await chrome.windows.create({ focused: shouldActivate })
+        targetWindowId = created?.id
+      }
+      const newTab = await chrome.tabs.create({
+        url: targetUrl,
+        active: shouldActivate,
+        ...(targetWindowId ? { windowId: targetWindowId } : {})
+      })
       if (newTab.id) {
         const groupId = await addTabToInterceptorGroup(newTab.id)
         // Pin the newly-created tab as the auto-target for subsequent commands
