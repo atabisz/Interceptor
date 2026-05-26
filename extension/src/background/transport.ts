@@ -258,6 +258,18 @@ export function connectWsChannel(): void {
     ws.onmessage = (event) => {
       lastWsInboundAt = Date.now()
       wsKeepalivesSentSinceAck = 0
+      // Self-heal synchronously on every inbound ws message: if ws is open
+      // and delivering messages, activeTransport must be 'websocket'. The
+      // 30s alarm-driven self-heal is too slow for action messages — the
+      // CLI's 15s timeout fires first and the action sits queued. This
+      // closes the gap by promoting the moment a real message arrives.
+      if (activeTransport !== "native" && wsReady && wsChannel === ws) {
+        if (activeTransport !== "websocket") {
+          console.log("ws onmessage self-heal: promoting activeTransport to websocket")
+          activeTransport = "websocket"
+          drainMessageQueue()
+        }
+      }
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "")
         if (msg.type === "keepalive_ack") {
