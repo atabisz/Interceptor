@@ -182,6 +182,39 @@ describe("formatStatus (#49 + #52)", () => {
     expect(out).toContain("no tabs in interceptor group")
   })
 
+  test("omits socket line when transport is TCP (Windows)", () => {
+    // On Windows the daemon listens over TCP, not a Unix socket. The socket
+    // field is structurally null and a "socket: not found" line next to
+    // "daemon: running" misleads agents parsing this output.
+    const out = formatStatus(
+      fakeSnapshot({
+        daemon: true,
+        pid: 27476,
+        socket: null,
+        transport: "tcp:127.0.0.1:19221",
+      }),
+      { verbose: false },
+    )
+    expect(out).toContain("daemon: running")
+    expect(out).toContain("transport: tcp:127.0.0.1:19221")
+    expect(out).not.toContain("socket:")
+    expect(out).not.toContain("not found")
+  })
+
+  test("omits socket line on TCP transport even in verbose mode", () => {
+    const out = formatStatus(
+      fakeSnapshot({
+        daemon: true,
+        pid: 27476,
+        socket: null,
+        transport: "tcp:127.0.0.1:19221",
+      }),
+      { verbose: true },
+    )
+    expect(out).toContain("transport (how the CLI reaches the daemon): tcp:127.0.0.1:19221")
+    expect(out).not.toContain("(Unix socket the CLI uses to reach the daemon)")
+  })
+
   test("bridge block only renders when mode != browser-only", () => {
     const browserOnly = formatStatus(fakeSnapshot({ mode: "browser-only" }), { verbose: false })
     expect(browserOnly).not.toContain("bridge:")

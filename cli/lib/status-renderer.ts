@@ -244,11 +244,22 @@ export function formatStatus(snap: StatusSnapshot, opts: { verbose?: boolean }):
     lines.push(`daemon: ${snap.daemon ? "running" : "not running"}`)
   }
   if (snap.pid) lines.push(`pid: ${snap.pid}`)
+  // Only render the socket line on platforms that actually use a Unix socket.
+  // On Windows the daemon is reached over TCP (transport: tcp:127.0.0.1:...),
+  // so a "socket: not found" line next to "daemon: running" reads as a
+  // contradiction to anything (or anyone) parsing this output. The transport
+  // line below already reports the real connection path.
+  const usesUnixSocket = snap.transport.startsWith("unix:")
+  if (usesUnixSocket) {
+    if (v) {
+      lines.push(`socket (Unix socket the CLI uses to reach the daemon): ${snap.socket ?? "not found"}`)
+    } else {
+      lines.push(`socket: ${snap.socket ?? "not found"}`)
+    }
+  }
   if (v) {
-    lines.push(`socket (Unix socket the CLI uses to reach the daemon): ${snap.socket ?? "not found"}`)
     lines.push(`transport (how the CLI reaches the daemon): ${snap.transport}`)
   } else {
-    lines.push(`socket: ${snap.socket ?? "not found"}`)
     lines.push(`transport: ${snap.transport}`)
   }
 
