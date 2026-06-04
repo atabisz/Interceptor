@@ -1065,7 +1065,10 @@ export function parseMacosCommand(filtered: string[]): Action | null {
           if (!name) { console.error("error: interceptor macos vm start requires a name"); process.exit(1) }
           base.name = name
           if (boolArg("--headless")) base.headless = true
-          if (boolArg("--wait-for-vsock")) base.waitForVsock = true
+          if (boolArg("--wait-for-agent") || boolArg("--wait-for-vsock")) {
+            base.waitForAgent = true
+            base.waitForVsock = true
+          }
           if (boolArg("--detach")) base.detach = true
           return base
         }
@@ -1097,6 +1100,13 @@ export function parseMacosCommand(filtered: string[]): Action | null {
           const name = filtered[3]
           if (!name) { console.error("error: interceptor macos vm trust requires a name"); process.exit(1) }
           base.name = name
+          const noPrompt = boolArg("--no-prompt")
+          base.noPrompt = noPrompt
+          base.prompt = !noPrompt && (boolArg("--prompt") || boolArg("--walkthrough"))
+          base.walkthrough = !noPrompt && boolArg("--walkthrough")
+          base.accessibilityPrompt = !noPrompt && boolArg("--accessibility-prompt")
+          base.screenPrompt = !noPrompt && boolArg("--screen-prompt")
+          base.resetDenied = !noPrompt && boolArg("--reset-denied")
           if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
           return base
         }
@@ -1166,6 +1176,9 @@ export function parseMacosCommand(filtered: string[]): Action | null {
           const tag = filtered[4]
           if (!name || !tag) { console.error("error: interceptor macos vm restore requires <name> <tag>"); process.exit(1) }
           base.name = name; base.tag = tag
+          if (boolArg("--disk-only")) base.diskOnly = true
+          if (boolArg("--paused-state")) base.pausedStateOnly = true
+          if (boolArg("--headless")) base.headless = true
           return base
         }
         case "cp": {
@@ -1277,6 +1290,11 @@ export function parseMacosCommand(filtered: string[]): Action | null {
               base.hostPort = Number(parts[1])
               base.guestPort = Number(parts[2])
             }
+          }
+          if (vmSub === "console") {
+            if (strArg("--write")) base.write = strArg("--write")
+            if (intArg("--max-bytes") !== undefined) base.maxBytes = intArg("--max-bytes")
+            if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
           }
           return base
         }
