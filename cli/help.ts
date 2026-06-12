@@ -254,6 +254,8 @@ Meta:
   interceptor status                         Check daemon status (local — no connection needed)
   interceptor status --verbose               Daemon + bridge + extension probe with per-component diagnostics
   interceptor status --explain               Alias for --verbose with extra rationale per component
+  interceptor diagnose                       Agent debugging snapshot: daemon, extension, active tab, elements, monitor
+  interceptor diagnose --json                Same snapshot as JSON
   interceptor help                           This help text
 
 Native (macOS Bridge — full install only):
