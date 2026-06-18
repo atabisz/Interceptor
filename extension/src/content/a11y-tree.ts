@@ -118,18 +118,24 @@ export function buildA11yTree(
 
     // Visibility disposition. `display:none` / `visibility:hidden` hide the
     // whole subtree, so we stop. But an element that's invisible only because
-    // it's an out-of-flow wrapper with a zero-area box — e.g. a portal / popper
-    // container (Radix, Floating UI) before it has been positioned — must still
-    // be descended into: its positioned descendants render elsewhere and are
-    // visibility-checked individually. In-flow invisible elements (collapsed or
-    // empty) are pruned as before. The element itself is only emitted when it is
-    // actually visible.
-    const selfVisible = el.tagName === "BODY" || isVisible(el)
+    // it is an out-of-flow box with a zero-area rect — a shrink-to-fit portal /
+    // popper wrapper that has collapsed to 0×0 while its descendants render
+    // elsewhere — must still be descended into: those descendants are
+    // visibility-checked individually. Only genuinely out-of-flow positions
+    // (CSS "removed from normal flow" = `absolute` / `fixed`) qualify; in-flow
+    // boxes (`static` / `relative` / `sticky` — sticky is in-flow per CSS) are
+    // pruned as before, so collapsed/empty in-flow content doesn't leak in. The
+    // element itself is only emitted when it is actually visible.
+    //
+    // One computed-style read per element, shared between the visibility test
+    // and the disposition below: isVisible() reads computed style too, so we
+    // pass it in to avoid a second forced style resolution on this hot path.
+    const style = el.tagName === "BODY" ? null : getComputedStyle(el)
+    const selfVisible = el.tagName === "BODY" || isVisible(el, style!)
     if (!selfVisible) {
-      const style = getComputedStyle(el)
-      if (style.display === "none" || style.visibility === "hidden") return
-      const pos = style.position
-      if (pos !== "fixed" && pos !== "absolute" && pos !== "sticky") return
+      if (style!.display === "none" || style!.visibility === "hidden") return
+      const pos = style!.position
+      if (pos !== "fixed" && pos !== "absolute") return
     }
 
     const role = getEffectiveRole(el)
