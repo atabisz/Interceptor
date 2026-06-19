@@ -217,6 +217,19 @@ else
   exit 1
 fi
 
+# Ad-hoc sign macOS binaries. Apple Silicon SIGKILLs unsigned Mach-O executables
+# (symptom: `interceptor` exits 137 / "Killed: 9" with empty output, daemon never
+# stays up). `bun build --compile` output can land unsigned or with a malformed
+# signature slot, so remove any existing signature then re-sign ad-hoc.
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+  for b in dist/interceptor daemon/interceptor-daemon dist/interceptor-bridge; do
+    if [[ -f "$b" ]]; then
+      codesign --remove-signature "$b" 2>/dev/null || true
+      codesign --force --sign - "$b" && echo "  signed (adhoc): $b"
+    fi
+  done
+fi
+
 echo "Build complete."
 echo "  Extension: extension/dist/"
 echo "  Electron extension: extension/dist-mv2/"
