@@ -84,6 +84,21 @@ describe("helpForCommand (#51)", () => {
     expect(help).toContain("--trusted")
   })
 
+  test("returns the curated full-contract block for `save`", () => {
+    const help = helpForCommand("save")
+    expect(help).toBeDefined()
+    expect(help).toContain("interceptor save")
+    // flags an agent needs to form a correct invocation
+    expect(help).toContain("--out")
+    expect(help).toContain("--isolated")
+    expect(help).toContain("--chunk-size")
+    expect(help).toContain("--json")
+    // accepted inputs, response shape, and a runnable example
+    expect(help).toContain("ArrayBuffer")
+    expect(help).toContain("sha256")
+    expect(help).toContain('interceptor save --json')
+  })
+
   test("returns null for an unknown command", () => {
     expect(helpForCommand("not-a-real-command-xyz")).toBeNull()
   })

@@ -1,7 +1,45 @@
-// Per-command help — extracted from the HELP string below by matching lines
-// that begin with "  interceptor <cmd> ". User types `interceptor <cmd> --help`
-// (or `-h`) and gets exactly the slice for that command.
+// Curated, full-contract help for commands whose flags/semantics don't fit the
+// one-line auto-extraction below. The primary consumer here is an AI agent that
+// runs `interceptor <cmd> --help` mid-task — often without the skill reference
+// loaded — so this block carries everything needed to form a correct invocation
+// in one shot (flags, accepted inputs, response shape, an example).
+const COMMAND_HELP: Record<string, string> = {
+  save: [
+    "interceptor save — write page-produced bytes to disk (no downloads shelf, Save dialog, clipboard, or CDP)",
+    "",
+    "  interceptor save --out <abs-path> <expr>     evaluate <expr> in the page, stream its bytes to <abs-path>",
+    "",
+    '<expr> may return: Blob | File | ArrayBuffer | typed array | "blob:..." URL string | { url | blobUrl | href }',
+    "",
+    "Flags:",
+    "  --out <path>      required; absolute path (writes anywhere the daemon user can write)",
+    "  --isolated        evaluate <expr> in the ISOLATED world (default: MAIN)",
+    "  --chunk-size <n>  stream chunk size in bytes (default: 1048576)",
+    "  --json            structured result: { success, path, bytes, chunks, sha256 }",
+    "  --context <id>    target browser context when multiple are connected",
+    "  --tab <id>        target a specific tab",
+    "",
+    "Notes:",
+    "  - `save` must be the first token so the CLI routes over the WebSocket sink.",
+    "  - Other flags may appear in any position; they are kept out of <expr>.",
+    "  - Integrity-checked: a byte-count mismatch discards the file and fails.",
+    "  - Works on strict-CSP / Trusted-Types pages (same bypass as `eval`).",
+    "",
+    "Example:",
+    '  interceptor save --json --context main --tab 123 --out /tmp/clip.webm "window.__out.video"',
+  ].join("\n"),
+}
+
+// Per-command help — a curated COMMAND_HELP block when present, otherwise
+// extracted from the HELP string below by matching lines that begin with
+// "  interceptor <cmd> ". User types `interceptor <cmd> --help` (or `-h`) and
+// gets exactly the slice for that command.
 export function helpForCommand(cmd: string): string | null {
+  const footer = `Run 'interceptor help' for the full command list, or 'interceptor ${cmd} -h' is an alias for --help.`
+  const curated = COMMAND_HELP[cmd]
+  if (curated) {
+    return [curated, "", footer].join("\n")
+  }
   const lines = HELP.split("\n")
   const matched: string[] = []
   for (const line of lines) {
@@ -16,7 +54,7 @@ export function helpForCommand(cmd: string): string | null {
     "",
     ...matched,
     "",
-    `Run 'interceptor help' for the full command list, or 'interceptor ${cmd} -h' is an alias for --help.`,
+    footer,
   ].join("\n")
 }
 
@@ -130,7 +168,7 @@ Capture:
   interceptor ocr --element N                OCR an element by ref
   interceptor eval <code>                    Run JS in isolated world
   interceptor eval <code> --main             Run JS in page context
-  interceptor save --out <path> <expr>       Save Blob/ArrayBuffer/blob: URL expression bytes without downloads or CDP
+  interceptor save --out <path> <expr>       Stream page bytes (Blob/ArrayBuffer/blob: URL) to disk; no downloads/CDP — see 'save --help'
 
 Cookies:
   interceptor cookies <domain>               List cookies
