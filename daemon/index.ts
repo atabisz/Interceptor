@@ -1,5 +1,11 @@
-import { unlinkSync, existsSync, appendFileSync, statSync, readFileSync, writeFileSync } from "node:fs"
+import {
+  unlinkSync, existsSync, appendFileSync, statSync, readFileSync, writeFileSync,
+  mkdirSync, openSync, writeSync, closeSync, renameSync,
+} from "node:fs"
 import { spawn, spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
+import { dirname } from "node:path"
+import { validateBinarySinkPath, binarySinkIntegrityError } from "./binary-sink"
 import { osClick, osKey, osType, osMove, generateBezierPath, translateCoords } from "./os-input-loader"
 import { IS_WIN, SOCKET_PATH, IPC_PORT, PID_PATH, LOG_PATH, EVENTS_PATH, WS_PORT, EVENTS_MAX_SIZE, transportLabel } from "../shared/platform"
 import {
@@ -13,7 +19,7 @@ import {
 } from "../shared/monitor-artifacts"
 import { chooseOutboundTransport, validateContextRouting } from "./outbound-routing"
 import { formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
-import { clearDaemonRuntimeFiles, decideDaemonStartupRole, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon } from "./lifecycle"
+import { clearDaemonRuntimeFiles, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon } from "./lifecycle"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
 import { CDP_CONTEXT_PREFIX } from "../shared/cdp-app"
 import {
@@ -537,7 +543,23 @@ async function bootstrapDaemonRole(): Promise<void> {
 
 await bootstrapDaemonRole()
 
-try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+// Singleton election (atomic): the WebSocket port is the one OS-exclusive token that both
+// the CLI socket and the extension channel must agree on. Bind it BEFORE claiming the CLI
+// socket, so two daemons can never split-brain (one owning the socket, another the WS port).
+// Losing this race is fatal: exit instead of becoming a second, extension-less singleton.
+let wsServer: ReturnType<typeof Bun.serve> | null = null
+let wsBindError: Error | null = null
+try {
+  wsServer = startWsServer()
+} catch (err) {
+  wsBindError = err as Error
+}
+const singletonGate = decideSingletonGate({ wsPortAcquired: wsServer !== null, standalone: STANDALONE })
+if (singletonGate.action === "exit") {
+  log(`ws port ${WS_PORT} already held by another daemon — ${singletonGate.reason}${wsBindError ? ` (${wsBindError.message})` : ""}`)
+  process.exit(singletonGate.exitCode)
+}
+log(`ws server listening on port ${WS_PORT}`)
 
 const pendingRequests = new Map<string, {
   resolve: (v: string) => void
@@ -898,6 +920,200 @@ if (!STANDALONE) {
 }
 
 const REQUEST_TIMEOUT_MS = 180_000
+const LONG_REQUEST_TIMEOUT_MS = 600_000
+const BINARY_SINK_MAGIC = Buffer.from("IBS1")
+const BINARY_SINK_MAX_HEADER_BYTES = 64 * 1024
+
+type BinarySinkState = {
+  fd: number
+  finalPath: string
+  tempPath: string
+  expectedBytes?: number
+  mime?: string
+  sourceUrl?: string
+  bytes: number
+  chunks: number
+  lastSeq: number
+  hash: ReturnType<typeof createHash>
+  startedAt: number
+}
+
+const binarySinks = new Map<string, BinarySinkState>()
+
+function requestTimeoutForAction(actionType: string): number {
+  return actionType === "binary_sink_save" ? LONG_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+}
+
+function sendWsResult(ws: { send: (data: string) => unknown }, id: unknown, result: Record<string, unknown>) {
+  if (typeof id !== "string" || id.length === 0) return
+  try { ws.send(JSON.stringify({ id, result })) } catch {}
+}
+
+// validateBinarySinkPath + binarySinkIntegrityError live in ./binary-sink so the
+// path policy and the close-time integrity rule are unit-testable.
+
+function handleBinarySinkOpen(
+  ws: { send: (data: string) => unknown },
+  request: { id?: string; sinkId?: unknown; path?: unknown; expectedBytes?: unknown; mime?: unknown; sourceUrl?: unknown }
+): boolean {
+  const id = request.id
+  const sinkId = typeof request.sinkId === "string" && request.sinkId.length > 0
+    ? request.sinkId
+    : crypto.randomUUID()
+  const validated = validateBinarySinkPath(request.path)
+  if (!validated.path) {
+    sendWsResult(ws, id, { success: false, error: validated.error || "invalid path" })
+    return true
+  }
+
+  if (binarySinks.has(sinkId)) {
+    sendWsResult(ws, id, { success: false, error: `binary_sink_open: duplicate sinkId ${sinkId}` })
+    return true
+  }
+
+  const tempPath = `${validated.path}.interceptor-${sinkId}.tmp`
+  try {
+    mkdirSync(dirname(validated.path), { recursive: true, mode: 0o700 })
+    const fd = openSync(tempPath, "w", 0o600)
+    binarySinks.set(sinkId, {
+      fd,
+      finalPath: validated.path,
+      tempPath,
+      expectedBytes: typeof request.expectedBytes === "number" ? request.expectedBytes : undefined,
+      mime: typeof request.mime === "string" ? request.mime : undefined,
+      sourceUrl: typeof request.sourceUrl === "string" ? request.sourceUrl : undefined,
+      bytes: 0,
+      chunks: 0,
+      lastSeq: -1,
+      hash: createHash("sha256"),
+      startedAt: Date.now(),
+    })
+    sendWsResult(ws, id, { success: true, data: { sinkId, path: validated.path, tempPath } })
+  } catch (err) {
+    sendWsResult(ws, id, { success: false, error: `binary_sink_open failed: ${(err as Error).message}` })
+  }
+  return true
+}
+
+function closeBinarySink(sinkId: string): { success: boolean; error?: string; data?: Record<string, unknown> } {
+  const sink = binarySinks.get(sinkId)
+  if (!sink) return { success: false, error: `binary sink not found: ${sinkId}` }
+  binarySinks.delete(sinkId)
+
+  try {
+    closeSync(sink.fd)
+    // Integrity gate: never promote a short / truncated temp file to the final
+    // path. When the source size is known (expectedBytes), require an exact byte
+    // match before the atomic rename; otherwise discard the partial file and
+    // fail. This closes the silent-truncation hole where a mid-stream write
+    // error — whose error frame the streamer cannot ack — would still rename a
+    // partial file as a successful save.
+    const integrityError = binarySinkIntegrityError(sink.expectedBytes, sink.bytes)
+    if (integrityError) {
+      try { if (existsSync(sink.tempPath)) unlinkSync(sink.tempPath) } catch {}
+      return { success: false, error: integrityError }
+    }
+    renameSync(sink.tempPath, sink.finalPath)
+    const sha256 = sink.hash.digest("hex")
+    return {
+      success: true,
+      data: {
+        sinkId,
+        path: sink.finalPath,
+        bytes: sink.bytes,
+        chunks: sink.chunks,
+        sha256,
+        mime: sink.mime,
+        expectedBytes: sink.expectedBytes,
+        durationMs: Date.now() - sink.startedAt,
+      }
+    }
+  } catch (err) {
+    try { closeSync(sink.fd) } catch {}
+    try { if (existsSync(sink.tempPath)) unlinkSync(sink.tempPath) } catch {}
+    return { success: false, error: `binary_sink_close failed: ${(err as Error).message}` }
+  }
+}
+
+function abortBinarySink(sinkId: string): { success: boolean; error?: string } {
+  const sink = binarySinks.get(sinkId)
+  if (!sink) return { success: true }
+  binarySinks.delete(sinkId)
+  try { closeSync(sink.fd) } catch {}
+  try { if (existsSync(sink.tempPath)) unlinkSync(sink.tempPath) } catch {}
+  return { success: true }
+}
+
+function handleBinarySinkControl(
+  ws: { send: (data: string) => unknown },
+  request: { id?: string; type?: string; sinkId?: unknown; [key: string]: unknown }
+): boolean {
+  if (request.type === "binary_sink_open") {
+    return handleBinarySinkOpen(ws, request)
+  }
+  if (request.type === "binary_sink_close") {
+    const sinkId = typeof request.sinkId === "string" ? request.sinkId : ""
+    sendWsResult(ws, request.id, closeBinarySink(sinkId))
+    return true
+  }
+  if (request.type === "binary_sink_abort") {
+    const sinkId = typeof request.sinkId === "string" ? request.sinkId : ""
+    sendWsResult(ws, request.id, abortBinarySink(sinkId))
+    return true
+  }
+  return false
+}
+
+function handleBinarySinkFrame(ws: { send: (data: string) => unknown }, raw: Buffer): boolean {
+  if (raw.byteLength < 8) return false
+  if (!raw.subarray(0, 4).equals(BINARY_SINK_MAGIC)) return false
+
+  const headerLen = raw.readUInt32LE(4)
+  if (headerLen <= 0 || headerLen > BINARY_SINK_MAX_HEADER_BYTES || raw.byteLength < 8 + headerLen) {
+    try { ws.send(JSON.stringify({ result: { success: false, error: "invalid binary sink frame header" } })) } catch {}
+    return true
+  }
+
+  let header: { sinkId?: unknown; seq?: unknown; id?: unknown }
+  try {
+    header = JSON.parse(raw.subarray(8, 8 + headerLen).toString("utf-8"))
+  } catch {
+    try { ws.send(JSON.stringify({ result: { success: false, error: "invalid binary sink frame JSON" } })) } catch {}
+    return true
+  }
+
+  const sinkId = typeof header.sinkId === "string" ? header.sinkId : ""
+  const sink = binarySinks.get(sinkId)
+  if (!sink) {
+    sendWsResult(ws, header.id, { success: false, error: `binary sink not found: ${sinkId}` })
+    return true
+  }
+
+  const seq = typeof header.seq === "number" ? header.seq : sink.lastSeq + 1
+  if (seq !== sink.lastSeq + 1) {
+    sendWsResult(ws, header.id, { success: false, error: `binary sink sequence mismatch: expected ${sink.lastSeq + 1}, got ${seq}` })
+    return true
+  }
+
+  const payload = raw.subarray(8 + headerLen)
+  try {
+    writeSync(sink.fd, payload)
+    sink.hash.update(payload)
+    sink.bytes += payload.byteLength
+    sink.chunks += 1
+    sink.lastSeq = seq
+  } catch (err) {
+    // A write failure aborts the whole sink: close the fd, discard the temp
+    // file, and drop it from the registry so a later close() cannot promote a
+    // truncated file (and so the fd / temp file are not leaked). The subsequent
+    // close() will report "binary sink not found", surfacing the failure.
+    binarySinks.delete(sinkId)
+    try { closeSync(sink.fd) } catch {}
+    try { if (existsSync(sink.tempPath)) unlinkSync(sink.tempPath) } catch {}
+    sendWsResult(ws, header.id, { success: false, error: `binary sink write failed: ${(err as Error).message}` })
+  }
+  return true
+}
 
 async function handleOsAction(
   id: string,
@@ -1089,7 +1305,7 @@ try {
             log(`request timeout: ${id}`)
             emitEvent("request_timeout", { requestId: id, action: actionType })
             socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: "timeout" } }))
-          }, REQUEST_TIMEOUT_MS)
+          }, requestTimeoutForAction(actionType))
           pendingRequests.set(id, {
             resolve: (response: string) => {
               clearTimeout(timer)
@@ -1125,20 +1341,22 @@ try {
   if (IS_WIN) {
     socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
   } else {
+    // We hold the WS port (the singleton token), so any leftover socket file is ours to clear.
+    try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
     socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
   }
   log(`socket listening on ${transportLabel()}`)
 } catch (err) {
   log(`socket listen failed: ${(err as Error).message}`)
+  if (wsServer) wsServer.stop(true)
   process.exit(1)
 }
 
 Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
 log(`pid file written: ${process.pid}`)
 
-let wsServer: ReturnType<typeof Bun.serve> | null = null
-try {
-  wsServer = Bun.serve<undefined>({
+function startWsServer(): ReturnType<typeof Bun.serve> {
+  return Bun.serve<undefined>({
     port: WS_PORT,
     fetch(req, server) {
       if (server.upgrade(req, {})) return
@@ -1149,6 +1367,9 @@ try {
         log(`ws client connected`)
       },
       message(ws, raw) {
+        if (typeof raw !== "string" && handleBinarySinkFrame(ws, Buffer.from(raw))) {
+          return
+        }
         const rawStr = typeof raw === "string" ? raw : Buffer.from(raw).toString("utf-8")
         log(`ws recv: ${rawStr.slice(0, 300)}`)
         let request: { id?: string; action?: unknown; tabId?: number; contextId?: string; type?: string; result?: unknown }
@@ -1156,6 +1377,10 @@ try {
           request = JSON.parse(rawStr)
         } catch {
           ws.send(JSON.stringify({ error: "invalid JSON" }))
+          return
+        }
+
+        if (handleBinarySinkControl(ws, request as any)) {
           return
         }
 
@@ -1266,7 +1491,7 @@ try {
           setTimeout(() => timedOutRequests.delete(id), 60_000)
           log(`ws request timeout: ${id}`)
           ws.send(JSON.stringify({ id, result: { success: false, error: "timeout" } }))
-        }, REQUEST_TIMEOUT_MS)
+        }, requestTimeoutForAction(actionType))
 
         pendingRequests.set(id, {
           resolve: (response: string) => {
@@ -1294,9 +1519,6 @@ try {
       }
     }
   })
-  log(`ws server listening on port ${WS_PORT}`)
-} catch (err) {
-  log(`ws server failed (port ${WS_PORT} in use?) — continuing without WebSocket: ${(err as Error).message}`)
 }
 
 function gracefulShutdown(signal: string) {

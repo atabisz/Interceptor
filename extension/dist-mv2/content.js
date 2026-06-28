@@ -271,15 +271,22 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
   function walk(el, d) {
     if (d > maxDepth)
       return;
-    if (!isVisible(el) && el.tagName !== "BODY")
-      return;
+    const style = el.tagName === "BODY" ? null : getComputedStyle(el);
+    const selfVisible = el.tagName === "BODY" || isVisible(el, style);
+    if (!selfVisible) {
+      if (style.display === "none" || style.visibility === "hidden")
+        return;
+      const pos = style.position;
+      if (pos !== "fixed" && pos !== "absolute")
+        return;
+    }
     const role = getEffectiveRole(el);
     const tag = el.tagName.toLowerCase();
     const isLandmark = LANDMARK_ROLES.has(role) || LANDMARK_TAGS.has(el.tagName);
     const isHeading = /^h[1-6]$/.test(tag) || role === "heading";
     const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES);
     const prefix = compact ? ">".repeat(d) : "  ".repeat(d);
-    if (isLandmark && !isInteractiveEl) {
+    if (selfVisible && isLandmark && !isInteractiveEl) {
       const name = getAccessibleName(el);
       const hasName = !!name && name !== (el.textContent || "").trim().slice(0, 80);
       if (compact) {
@@ -289,7 +296,7 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
         lines.push(`${prefix}${role || tag}${nameStr}`);
       }
     }
-    if (isHeading && filter === "all") {
+    if (selfVisible && isHeading && filter === "all") {
       const name = getAccessibleName(el);
       if (compact) {
         lines.push(`${prefix}heading|${name}`);
@@ -297,7 +304,7 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
         lines.push(`${prefix}heading "${name}"`);
       }
     }
-    if (isInteractiveEl) {
+    if (selfVisible && isInteractiveEl) {
       const refId = getOrAssignRef(el);
       const name = getAccessibleName(el);
       const attrs = getRelevantAttrs(el);
@@ -318,12 +325,12 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
     if (shadow) {
       const shadowPrefix = compact ? ">".repeat(d + 1) : `${prefix}  `;
       lines.push(`${shadowPrefix}shadow-root`);
-      for (const child of shadow.children) {
+      for (const child of Array.from(shadow.children)) {
         walk(child, d + 2);
       }
     }
-    for (const child of el.children) {
-      walk(child, isLandmark ? d + 1 : d);
+    for (const child of Array.from(el.children)) {
+      walk(child, isLandmark && selfVisible ? d + 1 : d);
     }
   }
   walk(root, depth);
@@ -362,8 +369,7 @@ function walkWithShadow(root, callback) {
     node = walker.nextNode();
   }
 }
-function isVisible(el) {
-  const style = getComputedStyle(el);
+function isVisible(el, style = getComputedStyle(el)) {
   if (style.visibility === "hidden" || style.display === "none")
     return false;
   const pos = style.position;
@@ -639,6 +645,18 @@ function dispatchClickSequence(el, atX, atY) {
   const rect = el.getBoundingClientRect();
   const x = atX !== undefined ? rect.left + atX : rect.left + rect.width / 2;
   const y = atY !== undefined ? rect.top + atY : rect.top + rect.height / 2;
+  let acked = false;
+  const onAck = () => {
+    acked = true;
+  };
+  el.addEventListener("__interceptor_click_ack", onAck, true);
+  try {
+    el.dispatchEvent(new CustomEvent("__interceptor_click", { bubbles: true, detail: { x, y } }));
+  } finally {
+    el.removeEventListener("__interceptor_click_ack", onAck, true);
+  }
+  if (acked)
+    return;
   const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 };
   el.dispatchEvent(new PointerEvent("pointerover", opts));
   el.dispatchEvent(new MouseEvent("mouseover", opts));
@@ -4096,8 +4114,156 @@ async function handleCanvasAction(action) {
 
 // extension/src/content/dom-screenshot.ts
 init_input_simulation();
-function getLibrary() {
-  return globalThis.__interceptor_h2i ?? null;
+var TRANSPARENT_1PX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==";
+var SKIP_TAGS2 = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "object", "embed"]);
+function extractUrls(cssValue) {
+  const out = [];
+  const re = /url\((['"]?)([^'")]+)\1\)/g;
+  let m;
+  while ((m = re.exec(cssValue)) !== null) {
+    const u = (m[2] || "").trim();
+    if (u && u.indexOf("data:") !== 0)
+      out.push(u);
+  }
+  return out;
+}
+async function fetchResourceAsDataUrl(url) {
+  try {
+    const res = await fetch(url, { mode: "cors", cache: "force-cache" });
+    if (!res.ok)
+      return TRANSPARENT_1PX;
+    const blob = await res.blob();
+    return await new Promise((resolve) => {
+      const reader = new FileReader;
+      reader.onloadend = () => resolve(typeof reader.result === "string" ? reader.result : TRANSPARENT_1PX);
+      reader.onerror = () => resolve(TRANSPARENT_1PX);
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    return TRANSPARENT_1PX;
+  }
+}
+function loadSvgImage(svgDataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image;
+    img.onload = () => {
+      img.decode().then(() => resolve(img)).catch(() => resolve(img));
+    };
+    img.onerror = () => reject(new Error("foreignObject SVG failed to rasterize"));
+    img.src = svgDataUrl;
+  });
+}
+function inlineComputedStyle(srcEl, cloneEl, collect) {
+  const cs = window.getComputedStyle(srcEl);
+  let cssText = "";
+  for (let i = 0;i < cs.length; i++) {
+    const name = cs[i];
+    let value = cs.getPropertyValue(name);
+    if (name === "font-size" && value.endsWith("px")) {
+      const n = parseFloat(value);
+      if (n > 0)
+        value = `${n - 0.1}px`;
+    }
+    cssText += `${name}:${value};`;
+  }
+  try {
+    cloneEl.style.cssText = cssText;
+  } catch {}
+  const bg = cs.getPropertyValue("background-image");
+  if (bg && bg.indexOf("url(") !== -1) {
+    collect.bgJobs.push({ el: cloneEl, value: bg });
+    for (const u of extractUrls(bg))
+      collect.urls.add(u);
+  }
+}
+function buildStyledClone(src, collect) {
+  if (src.nodeType === Node.TEXT_NODE)
+    return src.cloneNode(false);
+  if (src.nodeType !== Node.ELEMENT_NODE)
+    return null;
+  const el = src;
+  const tag = (el.tagName || "").toLowerCase();
+  if (SKIP_TAGS2.has(tag))
+    return null;
+  if (tag === "canvas") {
+    try {
+      const dataUrl = el.toDataURL();
+      const img = document.createElement("img");
+      img.setAttribute("src", dataUrl);
+      inlineComputedStyle(el, img, collect);
+      return img;
+    } catch {}
+  }
+  if (tag === "svg") {
+    const c2 = el.cloneNode(true);
+    try {
+      inlineComputedStyle(el, c2, collect);
+    } catch {}
+    return c2;
+  }
+  const c = el.cloneNode(false);
+  if (c.style)
+    inlineComputedStyle(el, c, collect);
+  if (tag === "img") {
+    const im = el;
+    const url = im.currentSrc || im.src;
+    if (url && url.indexOf("data:") !== 0) {
+      c.removeAttribute("srcset");
+      collect.imgJobs.push({ el: c, url });
+      collect.urls.add(url);
+    }
+  }
+  const kids = el.childNodes;
+  for (let i = 0;i < kids.length; i++) {
+    const cc = buildStyledClone(kids[i], collect);
+    if (cc)
+      c.appendChild(cc);
+  }
+  return c;
+}
+async function nativeRenderToDataUrl(node, o) {
+  const collect = { imgJobs: [], bgJobs: [], urls: new Set };
+  const clone = buildStyledClone(node, collect);
+  if (!clone)
+    throw new Error("nothing to render");
+  const urlList = Array.from(collect.urls);
+  const dataUrlMap = new Map;
+  await Promise.all(urlList.map(async (u) => {
+    dataUrlMap.set(u, await fetchResourceAsDataUrl(u));
+  }));
+  for (const job of collect.imgJobs) {
+    job.el.setAttribute("src", dataUrlMap.get(job.url) || TRANSPARENT_1PX);
+  }
+  for (const job of collect.bgJobs) {
+    let v = job.value;
+    for (const u of extractUrls(job.value)) {
+      const d = dataUrlMap.get(u);
+      if (d)
+        v = v.split(u).join(d);
+    }
+    try {
+      job.el.style.backgroundImage = v;
+    } catch {}
+  }
+  if (o.isFull) {
+    clone.style.width = `${o.width}px`;
+    clone.style.height = `${o.height}px`;
+  } else {
+    clone.style.margin = "0";
+  }
+  clone.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+  const xml = new XMLSerializer().serializeToString(clone);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${o.width}" height="${o.height}">` + `<foreignObject x="0" y="0" width="100%" height="100%">${xml}</foreignObject></svg>`;
+  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  const img = await loadSvgImage(svgUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(o.width * o.pixelRatio));
+  canvas.height = Math.max(1, Math.round(o.height * o.pixelRatio));
+  const ctx = canvas.getContext("2d");
+  if (!ctx)
+    throw new Error("2d canvas context unavailable");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return o.format === "jpeg" ? canvas.toDataURL("image/jpeg", o.quality) : canvas.toDataURL("image/png");
 }
 async function cropDataUrl(dataUrl, x, y, w, h, format, quality) {
   return new Promise((resolve) => {
@@ -4160,101 +4326,55 @@ function resolveTarget(action) {
   }
 }
 async function handleDomScreenshot(action) {
-  const lib = getLibrary();
-  if (!lib) {
-    return {
-      success: false,
-      error: "html-to-image library not loaded into this frame — SW must inject screenshot-runner.js before dispatching dom_screenshot"
-    };
-  }
   const { node, error } = resolveTarget(action);
   if (!node)
     return { success: false, error: error || "no target resolved" };
   const format = action.format === "jpeg" ? "jpeg" : "png";
   const qualityPct = typeof action.quality === "number" ? Math.max(1, Math.min(100, action.quality)) : 92;
   const basePixelRatio = typeof action.scale === "number" && action.scale > 0 ? action.scale : window.devicePixelRatio || 1;
+  const mode = action.mode || "full";
+  const isFull = mode === "full" || mode === "region";
+  let width;
+  let height;
+  if (isFull) {
+    width = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0);
+    height = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+  } else {
+    const rect = node.getBoundingClientRect();
+    width = Math.max(1, Math.ceil(rect.width));
+    height = Math.max(1, Math.ceil(rect.height));
+  }
   let pixelRatio = basePixelRatio;
   const target = typeof action.target_max_long_edge === "number" && action.target_max_long_edge > 0 ? action.target_max_long_edge : undefined;
   if (target !== undefined) {
-    const mode = action.mode || "full";
-    let longEdgeCss;
-    if (mode === "full" || mode === "region") {
-      const docW = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0);
-      const docH = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
-      longEdgeCss = Math.max(docW, docH);
-    } else {
-      const rect = node.getBoundingClientRect();
-      longEdgeCss = Math.max(rect.width, rect.height);
-    }
+    const longEdgeCss = Math.max(width, height);
     if (longEdgeCss > 0 && longEdgeCss * pixelRatio > target) {
       pixelRatio = Math.max(0.05, target / longEdgeCss);
     }
   }
-  const TRANSPARENT_1PX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==";
-  const opts = {
-    cacheBust: true,
-    pixelRatio,
-    quality: qualityPct / 100,
-    skipFonts: true,
-    imagePlaceholder: TRANSPARENT_1PX,
-    fetchRequestInit: { mode: "cors", cache: "no-cache" }
-  };
-  const renderWithOpts = async (effectiveOpts) => {
-    return format === "jpeg" ? await lib.toJpeg(node, effectiveOpts) : await lib.toPng(node, effectiveOpts);
-  };
-  const isFull = (action.mode || "full") === "full" || action.mode === "region";
-  if (isFull) {
-    opts.width = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0);
-    opts.height = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
-    opts.canvasWidth = opts.width * pixelRatio;
-    opts.canvasHeight = opts.height * pixelRatio;
-  }
   try {
-    let dataUrl;
-    try {
-      dataUrl = await renderWithOpts(opts);
-    } catch (err) {
-      const msg = err.message || String(err);
-      const isTaint = /taint|cross-origin|may not be exported/i.test(msg);
-      if (!isTaint)
-        throw err;
-      const filteredOpts = {
-        ...opts,
-        filter: (n) => {
-          if (!(n instanceof Element))
-            return true;
-          const tag = n.tagName?.toLowerCase();
-          return tag !== "img" && tag !== "picture" && tag !== "video" && tag !== "canvas";
-        }
-      };
-      dataUrl = await renderWithOpts(filteredOpts);
-    }
-    const rect = node.getBoundingClientRect();
-    let outWidth = Math.round((isFull ? opts.width : rect.width) * pixelRatio);
-    let outHeight = Math.round((isFull ? opts.height : rect.height) * pixelRatio);
-    if (action.mode === "region" && action.region) {
+    let dataUrl = await nativeRenderToDataUrl(node, {
+      width,
+      height,
+      pixelRatio,
+      format,
+      quality: qualityPct / 100,
+      isFull
+    });
+    let outWidth = Math.round(width * pixelRatio);
+    let outHeight = Math.round(height * pixelRatio);
+    if (mode === "region" && action.region) {
       const region = action.region;
-      const cropX = Math.round(region.x * pixelRatio);
-      const cropY = Math.round(region.y * pixelRatio);
-      const cropW = Math.round(region.width * pixelRatio);
-      const cropH = Math.round(region.height * pixelRatio);
-      const cropped = await cropDataUrl(dataUrl, cropX, cropY, cropW, cropH, format, qualityPct / 100);
+      const cropped = await cropDataUrl(dataUrl, Math.round(region.x * pixelRatio), Math.round(region.y * pixelRatio), Math.round(region.width * pixelRatio), Math.round(region.height * pixelRatio), format, qualityPct / 100);
       if (cropped) {
         dataUrl = cropped;
-        outWidth = cropW;
-        outHeight = cropH;
+        outWidth = Math.round(region.width * pixelRatio);
+        outHeight = Math.round(region.height * pixelRatio);
       }
     }
     return {
       success: true,
-      data: {
-        dataUrl,
-        format,
-        width: outWidth,
-        height: outHeight,
-        pixelRatio,
-        mode: action.mode || "full"
-      }
+      data: { dataUrl, format, width: outWidth, height: outHeight, pixelRatio, mode }
     };
   } catch (err) {
     return { success: false, error: `dom render failed: ${err.message}` };
@@ -4262,20 +4382,24 @@ async function handleDomScreenshot(action) {
 }
 
 // extension/src/content.ts
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "execute_action") {
-    handleAction(msg.action).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-  if (msg.type === "get_state") {
-    try {
-      sendResponse(getPageState(msg.full));
-    } catch (err) {
-      sendResponse({ success: false, error: err.message });
+var __interceptorContentGlobal = globalThis;
+var __interceptorContentAlreadyLoaded = __interceptorContentGlobal.__interceptorContentLoaded === true;
+__interceptorContentGlobal.__interceptorContentLoaded = true;
+if (!__interceptorContentAlreadyLoaded)
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === "execute_action") {
+      handleAction(msg.action).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
+      return true;
     }
-    return true;
-  }
-});
+    if (msg.type === "get_state") {
+      try {
+        sendResponse(getPageState(msg.full));
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+      return true;
+    }
+  });
 async function handleAction(action) {
   const warnDirty = getDomDirty();
   clearStaleWarning();
@@ -4502,13 +4626,14 @@ async function executeAction(action) {
   }
 }
 var _swKeepaliveLeader = true;
-setInterval(() => {
-  if (!_swKeepaliveLeader)
-    return;
-  try {
-    chrome.runtime.sendMessage({ type: "sw_keepalive" }).then((resp) => {
-      if (resp && resp.leader === false)
-        _swKeepaliveLeader = false;
-    }).catch(() => {});
-  } catch {}
-}, 25000);
+if (!__interceptorContentAlreadyLoaded)
+  setInterval(() => {
+    if (!_swKeepaliveLeader)
+      return;
+    try {
+      chrome.runtime.sendMessage({ type: "sw_keepalive" }).then((resp) => {
+        if (resp && resp.leader === false)
+          _swKeepaliveLeader = false;
+      }).catch(() => {});
+    } catch {}
+  }, 25000);

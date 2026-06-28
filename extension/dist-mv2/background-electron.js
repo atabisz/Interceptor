@@ -1,3 +1,45 @@
+// extension/src/background/brand-tab-group.ts
+var VALID_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+var DEFAULT_TAB_GROUP_TITLE = "interceptor";
+var DEFAULT_TAB_GROUP_COLOR = "cyan";
+var SESSION_PREV_TITLE_KEY = "brandTabGroupPrevTitle";
+var cachedTitle = DEFAULT_TAB_GROUP_TITLE;
+var cachedColor = DEFAULT_TAB_GROUP_COLOR;
+function normalizeColor(color) {
+  return typeof color === "string" && VALID_COLORS.includes(color) ? color : DEFAULT_TAB_GROUP_COLOR;
+}
+function getTabGroupTitle() {
+  return cachedTitle;
+}
+function getTabGroupColor() {
+  return normalizeColor(cachedColor);
+}
+function sessionArea() {
+  const storage = chrome.storage;
+  return storage.session;
+}
+async function getPreviousTitle() {
+  try {
+    const area = sessionArea();
+    if (!area)
+      return;
+    const stored = await area.get(SESSION_PREV_TITLE_KEY);
+    const v = stored?.[SESSION_PREV_TITLE_KEY];
+    return typeof v === "string" ? v : undefined;
+  } catch {
+    return;
+  }
+}
+async function getCandidateTitles() {
+  const titles = new Set;
+  titles.add(cachedTitle);
+  const prev = await getPreviousTitle();
+  if (prev)
+    titles.add(prev);
+  titles.add(DEFAULT_TAB_GROUP_TITLE);
+  return [...titles];
+}
+
 // extension/src/background/tab-group.ts
 var interceptorGroupId = null;
 function hasTabGroupApi() {
@@ -14,9 +56,11 @@ async function ensureInterceptorGroup() {
       interceptorGroupId = null;
     }
   }
-  const groups = await chrome.tabGroups.query({ title: "interceptor" });
-  if (groups.length > 0) {
-    interceptorGroupId = groups[0].id;
+  const candidates = await getCandidateTitles();
+  const groups = await chrome.tabGroups.query({});
+  const match = groups.find((g) => typeof g.title === "string" && candidates.includes(g.title));
+  if (match) {
+    interceptorGroupId = match.id;
     return interceptorGroupId;
   }
   return -1;
@@ -27,7 +71,10 @@ async function addTabToInterceptorGroup(tabId) {
     return -1;
   if (groupId === -1) {
     groupId = await chrome.tabs.group({ tabIds: tabId });
-    await chrome.tabGroups.update(groupId, { title: "interceptor", color: "cyan" });
+    await chrome.tabGroups.update(groupId, {
+      title: getTabGroupTitle(),
+      color: getTabGroupColor()
+    });
     interceptorGroupId = groupId;
   } else {
     await chrome.tabs.group({ tabIds: tabId, groupId });
@@ -446,6 +493,7 @@ async function uninstallScreenshotCorsRule(tabId) {
 
 // extension/src/background/capabilities/screenshot.ts
 var CAPTURE_TIMEOUT_MS = 5000;
+var DOM_RENDER_TIMEOUT_MS = 30000;
 var VISIBILITY_HINT = "Chrome/Brave window may not be visible — bring it to the front and retry, or pass --tab <id> of a tab in a visible window.";
 
 class CaptureTimeoutError extends Error {
@@ -539,18 +587,6 @@ function resolveDomMode(action) {
     return "region";
   return "full";
 }
-async function injectScreenshotRunner(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED",
-      files: ["screenshot-runner.js"]
-    });
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: `failed to inject screenshot-runner.js: ${err.message}` };
-  }
-}
 async function reencodeAsWebP(dataUrl, qualityPct) {
   const res = await fetch(dataUrl);
   const blob = await res.blob();
@@ -596,9 +632,6 @@ async function handleDomRenderScreenshot(action, tabId) {
   }
   await installScreenshotCorsRule(tabId);
   try {
-    const inject = await injectScreenshotRunner(tabId);
-    if (!inject.success)
-      return { success: false, error: inject.error || "runner injection failed" };
     const dsAction = { type: "dom_screenshot", mode, format: renderFormat, quality };
     if (action.ref !== undefined)
       dsAction.ref = action.ref;
@@ -612,7 +645,19 @@ async function handleDomRenderScreenshot(action, tabId) {
       dsAction.scale = scale;
     if (targetMaxLongEdge !== undefined)
       dsAction.target_max_long_edge = targetMaxLongEdge;
-    const renderResult = await sendToContentScript(tabId, dsAction);
+    let renderResult;
+    try {
+      renderResult = await withCaptureTimeout("dom-render", sendToContentScript(tabId, dsAction), DOM_RENDER_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) {
+        return {
+          success: false,
+          error: `DOM-render timed out after ${DOM_RENDER_TIMEOUT_MS}ms — the content script did not return image data. The render stalled (e.g. a resource never settled); retry, or use --pixel for a compositor capture.`,
+          data: { layer: "dom-render-timeout" }
+        };
+      }
+      throw err;
+    }
     if (!renderResult || !renderResult.success || !renderResult.data) {
       return { success: false, error: renderResult?.error || "dom render returned no data" };
     }
@@ -860,10 +905,38 @@ async function transformPixelDataUrl(dataUrl, requestedFormat, quality, targetMa
     return { success: false, error: `transform failed: ${err.message}` };
   }
 }
+async function handleOcr(action, tabId) {
+  const shot = { type: "screenshot", format: "png", save: false };
+  for (const k of ["selector", "element", "ref", "region", "clip", "scale", "target_max_long_edge"]) {
+    if (action[k] !== undefined)
+      shot[k] = action[k];
+  }
+  const rendered = await handleDomRenderScreenshot(shot, tabId);
+  if (!rendered.success)
+    return rendered;
+  const dataUrl = rendered.data?.dataUrl;
+  if (!dataUrl)
+    return { success: false, error: "capture for OCR produced no image" };
+  const ocr = await sendToOffscreen({ type: "ocr", dataUrl });
+  if (!ocr.success)
+    return { success: false, error: ocr.error || "OCR failed" };
+  return {
+    success: true,
+    data: {
+      text: (ocr.data?.text || "").trim(),
+      source: ocr.data?.source || "tesseract",
+      confidence: ocr.data?.confidence ?? null,
+      width: rendered.data?.width,
+      height: rendered.data?.height
+    }
+  };
+}
 async function handleScreenshotActions(action, tabId) {
   switch (action.type) {
     case "screenshot_background":
       return handleScreenshotBackground(action, tabId);
+    case "ocr":
+      return handleOcr(action, tabId);
     case "page_capture": {
       const mhtml = await chrome.pageCapture.saveAsMHTML({ tabId });
       const text = await mhtml.text();
@@ -1048,6 +1121,50 @@ function hostCanvasSignals(limit = 20) {
       }
     },
     globals: candidateGlobalDetails
+  };
+}
+function canvasAccessibleText(canvasIndex) {
+  const canvases = Array.from(document.querySelectorAll("canvas"));
+  const c = canvases[canvasIndex];
+  if (!c)
+    return { found: false, error: "canvas index out of range", canvasCount: canvases.length };
+  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const byIds = (ids) => !ids ? "" : ids.split(/\s+/).map((id) => norm(document.getElementById(id)?.textContent)).filter(Boolean).join(" ");
+  const sources = {};
+  const ariaLabel = norm(c.getAttribute("aria-label"));
+  if (ariaLabel)
+    sources.ariaLabel = ariaLabel;
+  const ariaLabelledby = byIds(c.getAttribute("aria-labelledby"));
+  if (ariaLabelledby)
+    sources.ariaLabelledby = ariaLabelledby;
+  const fallback = norm(c.textContent);
+  if (fallback)
+    sources.fallback = fallback;
+  const fig = c.closest("figure");
+  const figcaption = fig ? norm(fig.querySelector("figcaption")?.textContent) : "";
+  if (figcaption)
+    sources.figcaption = figcaption;
+  const ariaDescribedby = byIds(c.getAttribute("aria-describedby"));
+  if (ariaDescribedby)
+    sources.ariaDescribedby = ariaDescribedby;
+  const title = norm(c.getAttribute("title"));
+  if (title)
+    sources.title = title;
+  const text = [
+    sources.ariaLabel,
+    sources.ariaLabelledby,
+    sources.fallback,
+    sources.figcaption,
+    sources.ariaDescribedby,
+    sources.title
+  ].filter(Boolean).join(`
+`);
+  return {
+    found: !!text,
+    text,
+    role: c.getAttribute("role") || "",
+    sources,
+    canvasCount: canvases.length
   };
 }
 function canvasObserverSummary(limit = 100, kinds, canvasIndex) {
@@ -1303,39 +1420,47 @@ async function handleCanvasActions(action, tabId) {
       };
     }
     case "canvas_ocr": {
-      const readResult = await handleCanvasActions({
-        type: "canvas_read",
-        canvasIndex: action.canvasIndex,
-        region: action.region,
-        format: "png"
-      }, tabId);
-      if (!readResult.success)
-        return readResult;
-      const dataUrl = readResult.data.dataUrl;
-      if (!dataUrl)
-        return { success: false, error: "canvas OCR requires a readable canvas image" };
-      const ocrResult = await sendToOffscreen({
-        type: "ocr",
-        dataUrl
-      });
-      if (!ocrResult.success)
-        return { success: false, error: ocrResult.error || "canvas OCR failed" };
+      const a11y = await executeInMainWorld(tabId, canvasAccessibleText, [action.canvasIndex]);
+      if (a11y && a11y.error) {
+        return { success: false, error: a11y.error };
+      }
       const hostSignals = await executeInMainWorld(tabId, hostCanvasSignals, [10]);
       const semanticText = hostSignals?.docs?.textbox?.exists ? hostSignals.docs.textbox.textSample || "" : "";
-      const ocrText = ocrResult.data?.text || "";
-      const normalizedOcr = ocrText.replace(/\s+/g, " ").trim();
-      const normalizedSemantic = semanticText.replace(/\s+/g, " ").trim();
-      const matchedSemantic = normalizedOcr && normalizedSemantic ? normalizedSemantic.includes(normalizedOcr) || normalizedOcr.includes(normalizedSemantic) : false;
+      const a11yText = a11y && a11y.found ? a11y.text || "" : "";
+      let text = a11yText || semanticText;
+      let source = a11yText ? "accessibility" : semanticText ? "semantic-textbox" : "none";
+      let confidence = null;
+      let ocrFallbackUsed = false;
+      if (!text) {
+        const readResult = await handleCanvasActions({
+          type: "canvas_read",
+          canvasIndex: action.canvasIndex,
+          region: action.region,
+          format: "png"
+        }, tabId);
+        const dataUrl = readResult.success ? readResult.data.dataUrl : undefined;
+        if (dataUrl) {
+          const ocr = await sendToOffscreen({ type: "ocr", dataUrl });
+          if (ocr.success && (ocr.data?.text || "").trim()) {
+            text = ocr.data.text.trim();
+            source = "tesseract";
+            confidence = ocr.data?.confidence ?? null;
+            ocrFallbackUsed = true;
+          }
+        }
+      }
       return {
         success: true,
         data: {
-          text: ocrText,
-          source: ocrResult.data?.source || "ocr",
-          confidence: ocrResult.data?.confidence ?? null,
+          text,
+          source,
+          confidence,
           diagnostics: {
-            pixelSource: "canvas_read",
-            strongerSourceAvailable: !!semanticText,
-            strongerSourceMatched: matchedSemantic
+            accessibilityText: !!a11yText,
+            accessibilitySources: a11y?.sources || null,
+            semanticTextboxAvailable: !!semanticText,
+            ocrFallbackUsed,
+            hint: text ? undefined : "No accessible/semantic text and pixel OCR found nothing. For a canvas-rendered editor use `interceptor scene text`."
           }
         }
       };
@@ -1996,28 +2121,13 @@ async function reloadTabForCspRetry(tabId) {
   await chrome.tabs.reload(tabId, { bypassCache: true });
   await waitForTabLoad(tabId, 15000);
 }
-async function handleEvaluateActions(action, tabId) {
-  if (action.type !== "evaluate") {
-    return { success: false, error: `unknown evaluate action: ${action.type}` };
-  }
-  const code = action.code;
-  const world = action.world === "ISOLATED" ? "ISOLATED" : "MAIN";
-  const initialUserScriptWorld = world === "MAIN" ? "MAIN" : "USER_SCRIPT";
-  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code);
-  if (userScriptAttempt.available) {
-    if (!userScriptAttempt.result?.success && world === "MAIN" && isCspEvalError(userScriptAttempt.result?.error)) {
-      const fallback = await executeWithUserScripts(tabId, "USER_SCRIPT", code);
-      if (fallback.available)
-        return fallback.result ?? { success: false, error: "no result" };
-    }
-    return userScriptAttempt.result ?? { success: false, error: "no result" };
-  }
-  const first = await executeEval(tabId, world, code);
+async function runWithCspStripBypass(tabId, world, run) {
+  const first = await run(tabId, world);
   if (first.success || world !== "MAIN") {
     return first;
   }
   if (isTrustedTypesError(first.error) && !isCspUnsafeEvalError(first.error)) {
-    const isolated = await executeEval(tabId, "ISOLATED", code);
+    const isolated = await run(tabId, "ISOLATED");
     if (isolated.success) {
       return {
         ...isolated,
@@ -2028,16 +2138,8 @@ async function handleEvaluateActions(action, tabId) {
         }
       };
     }
-    return {
-      success: false,
-      error: isolated.error || first.error,
-      data: {
-        originalError: first.error,
-        trustedTypesFallbackAttempted: true
-      }
-    };
   }
-  if (!isCspUnsafeEvalError(first.error)) {
+  if (!isCspUnsafeEvalError(first.error) && !isTrustedTypesError(first.error)) {
     return first;
   }
   try {
@@ -2050,7 +2152,7 @@ async function handleEvaluateActions(action, tabId) {
       data: { originalError: first.error, cspBypassAttempted: false }
     };
   }
-  const retried = await executeEval(tabId, "MAIN", code);
+  const retried = await run(tabId, "MAIN");
   if (retried.success) {
     return {
       ...retried,
@@ -2069,6 +2171,369 @@ async function handleEvaluateActions(action, tabId) {
       cspBypassApplied: true
     }
   };
+}
+async function handleEvaluateActions(action, tabId) {
+  if (action.type !== "evaluate") {
+    return { success: false, error: `unknown evaluate action: ${action.type}` };
+  }
+  const code = action.code;
+  const world = action.world === "ISOLATED" ? "ISOLATED" : "MAIN";
+  const initialUserScriptWorld = world === "MAIN" ? "MAIN" : "USER_SCRIPT";
+  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code);
+  if (userScriptAttempt.available) {
+    if (!userScriptAttempt.result?.success && world === "MAIN" && isCspEvalError(userScriptAttempt.result?.error)) {
+      const fallback = await executeWithUserScripts(tabId, "USER_SCRIPT", code);
+      if (fallback.available && (fallback.result?.success || !isCspEvalError(fallback.result?.error))) {
+        return fallback.result ?? { success: false, error: "no result" };
+      }
+    } else {
+      return userScriptAttempt.result ?? { success: false, error: "no result" };
+    }
+  }
+  return runWithCspStripBypass(tabId, world, (t, w) => executeEval(t, w, code));
+}
+
+// extension/src/background/capabilities/binary-sink.ts
+var DEFAULT_CHUNK_SIZE = 1024 * 1024;
+async function executeNormalize(tabId, world, code) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world,
+    args: [code],
+    func: async (sourceCode) => {
+      async function normalize(value) {
+        if (value && typeof value.then === "function") {
+          value = await value;
+        }
+        if (value instanceof Blob) {
+          return {
+            url: URL.createObjectURL(value),
+            size: value.size,
+            mime: value.type || "application/octet-stream",
+            kind: value instanceof File ? "file" : "blob",
+            created: true
+          };
+        }
+        if (value instanceof ArrayBuffer) {
+          const blob = new Blob([value], { type: "application/octet-stream" });
+          return {
+            url: URL.createObjectURL(blob),
+            size: blob.size,
+            mime: blob.type,
+            kind: "arraybuffer",
+            created: true
+          };
+        }
+        if (ArrayBuffer.isView(value)) {
+          const source = value;
+          const bytes = new Uint8Array(source.byteLength);
+          bytes.set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+          const blob = new Blob([bytes.buffer], { type: "application/octet-stream" });
+          return {
+            url: URL.createObjectURL(blob),
+            size: blob.size,
+            mime: blob.type,
+            kind: "arraybuffer-view",
+            created: true
+          };
+        }
+        if (typeof value === "string") {
+          if (value.startsWith("blob:")) {
+            return {
+              url: value,
+              size: -1,
+              mime: "application/octet-stream",
+              kind: "blob-url",
+              created: false
+            };
+          }
+          const blob = new Blob([value], { type: "text/plain;charset=utf-8" });
+          return {
+            url: URL.createObjectURL(blob),
+            size: blob.size,
+            mime: blob.type,
+            kind: "text",
+            created: true
+          };
+        }
+        if (value && typeof value === "object") {
+          const record = value;
+          const candidate = record.url ?? record.blobUrl ?? record.href;
+          if (typeof candidate === "string" && candidate.startsWith("blob:")) {
+            return {
+              url: candidate,
+              size: typeof record.size === "number" ? record.size : -1,
+              mime: typeof record.type === "string" ? record.type : "application/octet-stream",
+              kind: "blob-url-object",
+              created: false
+            };
+          }
+        }
+        throw new Error("expression must return Blob, File, ArrayBuffer, typed array, string, or blob: URL");
+      }
+      try {
+        const w = window;
+        let evalSource = sourceCode;
+        if (w.trustedTypes) {
+          if (!w.__interceptor_sink_tt_policy) {
+            w.__interceptor_sink_tt_policy = w.trustedTypes.createPolicy("interceptor-binary-sink", {
+              createScript: (s) => s
+            });
+          }
+          evalSource = w.__interceptor_sink_tt_policy.createScript(sourceCode);
+        }
+        const value = (0, eval)(evalSource);
+        return { success: true, data: await normalize(value) };
+      } catch (err) {
+        return { success: false, error: err.message || String(err) };
+      }
+    }
+  });
+  return results[0]?.result ?? { success: false, error: "no result" };
+}
+async function prepareByteSource(tabId, code, world) {
+  const evalResult = await runWithCspStripBypass(tabId, world, (t, w) => executeNormalize(t, w, code));
+  if (!evalResult.success)
+    return evalResult;
+  let descriptor = evalResult.data;
+  if (descriptor && typeof descriptor === "object" && !("url" in descriptor) && "value" in descriptor) {
+    descriptor = descriptor.value;
+  }
+  if (!descriptor || typeof descriptor !== "object" || typeof descriptor.url !== "string") {
+    return { success: false, error: "byte source normalization returned no blob URL" };
+  }
+  return { success: true, data: descriptor };
+}
+async function cleanupByteSource(tabId, source, world) {
+  if (!source.created)
+    return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world,
+      args: [source.url],
+      func: (url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      }
+    });
+  } catch {}
+}
+async function stageByteSource(tabId, source) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    args: [source.url],
+    func: async (url) => {
+      const response = await fetch(url);
+      if (!response.ok && !url.startsWith("blob:")) {
+        throw new Error(`source fetch failed: ${response.status} ${response.statusText}`);
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const key = "__interceptor_binary_sink_" + crypto.randomUUID().replace(/-/g, "");
+      globalThis[key] = bytes;
+      return { key, bytes: bytes.byteLength };
+    }
+  });
+  const result = results[0]?.result;
+  if (!result?.key || typeof result.bytes !== "number") {
+    throw new Error("failed to stage byte source");
+  }
+  return result;
+}
+async function cleanupStagedByteSource(tabId, staged) {
+  if (!staged)
+    return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      args: [staged.key],
+      func: (key) => {
+        try {
+          delete globalThis[key];
+        } catch {}
+      }
+    });
+  } catch {}
+}
+async function readStagedChunk(tabId, key, offset, length) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    args: [key, offset, length],
+    func: (sourceKey, start, count) => {
+      const bytes2 = globalThis[sourceKey];
+      if (!bytes2)
+        throw new Error("staged bytes not found");
+      const end = Math.min(start + count, bytes2.byteLength);
+      const slice = bytes2.subarray(start, end);
+      let binary2 = "";
+      const block = 32768;
+      for (let i = 0;i < slice.byteLength; i += block) {
+        binary2 += String.fromCharCode(...slice.subarray(i, Math.min(i + block, slice.byteLength)));
+      }
+      return btoa(binary2);
+    }
+  });
+  const b64 = results[0]?.result;
+  if (typeof b64 !== "string")
+    throw new Error("failed to read staged chunk");
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0;i < binary.length; i++)
+    bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function connectSinkSocket() {
+  const WS_URL = "ws://localhost:19222";
+  const MAGIC = new Uint8Array([73, 66, 83, 49]);
+  const encoder = new TextEncoder;
+  const sinkId = crypto.randomUUID();
+  const pending = new Map;
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    const timer = setTimeout(() => reject(new Error("binary sink websocket open timeout")), 1e4);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      const request = (payload) => {
+        const id = crypto.randomUUID();
+        payload.id = id;
+        return new Promise((reqResolve, reqReject) => {
+          pending.set(id, { resolve: reqResolve, reject: reqReject });
+          ws.send(JSON.stringify(payload));
+        });
+      };
+      const waitForBackpressure = async () => {
+        while (ws.bufferedAmount > 16 * 1024 * 1024)
+          await wait(5);
+      };
+      const sendChunk = async (seq, bytes) => {
+        const header = encoder.encode(JSON.stringify({ sinkId, seq }));
+        const frame = new Uint8Array(8 + header.byteLength + bytes.byteLength);
+        frame.set(MAGIC, 0);
+        new DataView(frame.buffer).setUint32(4, header.byteLength, true);
+        frame.set(header, 8);
+        frame.set(bytes, 8 + header.byteLength);
+        ws.send(frame);
+        await waitForBackpressure();
+      };
+      resolve({
+        ws,
+        sinkId,
+        request,
+        sendChunk,
+        close: () => ws.close()
+      });
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("binary sink websocket failed"));
+    };
+    ws.onmessage = (event) => {
+      if (typeof event.data !== "string")
+        return;
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!message.id || !pending.has(message.id))
+        return;
+      const callbacks = pending.get(message.id);
+      pending.delete(message.id);
+      callbacks.resolve(message);
+    };
+    ws.onclose = () => {
+      for (const callbacks of pending.values()) {
+        callbacks.reject(new Error("binary sink websocket closed"));
+      }
+      pending.clear();
+    };
+  });
+}
+async function streamByteSource(tabId, source, out, chunkSize) {
+  let staged = null;
+  let socket = null;
+  let seq = 0;
+  let streamed = 0;
+  try {
+    staged = await stageByteSource(tabId, source);
+    socket = await connectSinkSocket();
+    const open = await socket.request({
+      type: "binary_sink_open",
+      sinkId: socket.sinkId,
+      path: out,
+      expectedBytes: staged.bytes,
+      mime: source.mime,
+      sourceUrl: source.url
+    });
+    if (!open.result?.success)
+      throw new Error(open.result?.error || "binary sink open failed");
+    for (let offset = 0;offset < staged.bytes; offset += chunkSize) {
+      const bytes = await readStagedChunk(tabId, staged.key, offset, chunkSize);
+      if (bytes.byteLength === 0)
+        continue;
+      await socket.sendChunk(seq++, bytes);
+      streamed += bytes.byteLength;
+    }
+    while (socket.ws.bufferedAmount > 0)
+      await wait(5);
+    const close = await socket.request({ type: "binary_sink_close", sinkId: socket.sinkId });
+    if (!close.result?.success)
+      throw new Error(close.result?.error || "binary sink close failed");
+    return {
+      success: true,
+      data: {
+        ...close.result.data || {},
+        sourceKind: source.kind,
+        sourceMime: source.mime,
+        sourceBytes: source.size,
+        stagedBytes: staged.bytes,
+        streamedBytes: streamed,
+        chunks: seq
+      }
+    };
+  } catch (err) {
+    if (socket) {
+      try {
+        await socket.request({ type: "binary_sink_abort", sinkId: socket.sinkId, reason: err.message || String(err) });
+      } catch {}
+    }
+    return { success: false, error: err.message || String(err) };
+  } finally {
+    if (socket)
+      socket.close();
+    await cleanupStagedByteSource(tabId, staged);
+  }
+}
+async function handleBinarySinkActions(action, tabId) {
+  if (action.type !== "binary_sink_save") {
+    return { success: false, error: `unknown binary-sink action: ${action.type}` };
+  }
+  const code = action.code;
+  const out = action.out;
+  const world = action.world === "ISOLATED" ? "ISOLATED" : "MAIN";
+  const chunkSize = typeof action.chunkSize === "number" && action.chunkSize > 0 ? Math.floor(action.chunkSize) : DEFAULT_CHUNK_SIZE;
+  if (!out)
+    return { success: false, error: "missing output path" };
+  if (!code)
+    return { success: false, error: "missing expression" };
+  const prepared = await prepareByteSource(tabId, code, world);
+  if (!prepared.success)
+    return prepared;
+  const source = prepared.data;
+  try {
+    return await streamByteSource(tabId, source, out, chunkSize);
+  } finally {
+    await cleanupByteSource(tabId, source, world);
+  }
 }
 
 // extension/src/background/capabilities/style.ts
@@ -2313,6 +2778,14 @@ async function handleMetaActions(action, tabId) {
       }).join(`
 `);
       return { success: true, data: formatted || "empty tree" };
+    }
+    case "brand_set_tab_group": {
+      const title = typeof action.title === "string" ? action.title.trim() : "";
+      if (!title)
+        return { success: false, error: "brand_set_tab_group requires a non-empty title" };
+      const color = typeof action.color === "string" ? action.color : "cyan";
+      await chrome.storage.local.set({ brandTabGroup: { title, color } });
+      return { success: true, data: { brandTabGroup: { title, color } } };
     }
   }
   return { success: false, error: `unknown meta action: ${action.type}` };
@@ -3310,7 +3783,7 @@ async function handleMonitorActions(action, tabId) {
 registerMonitorListeners();
 restorePageCommCaptureConfig();
 var OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move"]);
-var SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture"]);
+var SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture", "ocr"]);
 var CAPTURE_STREAM_ACTIONS = new Set(["capture_start", "capture_frame", "capture_stop", "canvas_diff"]);
 var CANVAS_ACTIONS = new Set([
   "canvas_list",
@@ -3374,9 +3847,10 @@ var NOTIFICATION_ACTIONS = new Set(["notification_create", "notification_clear"]
 var BROWSING_DATA_ACTIONS = new Set(["browsing_data_remove"]);
 var HEADER_ACTIONS = new Set(["headers_modify"]);
 var EVALUATE_ACTIONS = new Set(["evaluate"]);
+var BINARY_SINK_ACTIONS = new Set(["binary_sink_save"]);
 var STYLE_ACTIONS = new Set(["style_inject", "style_remove"]);
 var FRAME_ACTIONS = new Set(["frames_list", "frames_read_tree"]);
-var META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree"]);
+var META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group"]);
 var PASSIVE_NET_ACTIONS = new Set([
   "net_log",
   "net_clear",
@@ -3448,6 +3922,8 @@ async function routeAction(action, tabId) {
     return handleHeaderActions(action, tabId);
   if (EVALUATE_ACTIONS.has(action.type))
     return handleEvaluateActions(action, tabId);
+  if (BINARY_SINK_ACTIONS.has(action.type))
+    return handleBinarySinkActions(action, tabId);
   if (STYLE_ACTIONS.has(action.type))
     return handleStyleActions(action, tabId);
   if (FRAME_ACTIONS.has(action.type))
@@ -3515,6 +3991,7 @@ async function routeAction(action, tabId) {
 var MESSAGE_QUEUE_CAP = 50;
 var messageQueue = [];
 var EXT_REQUEST_TIMEOUT_MS = 180000;
+var EXT_LONG_REQUEST_TIMEOUT_MS = 600000;
 var pendingRequests = new Map;
 async function getActiveTabId() {
   const storage = chrome.storage;
@@ -3558,7 +4035,8 @@ function needsTab(type) {
     "monitor_start",
     "monitor_pause",
     "monitor_resume",
-    "monitor_stop"
+    "monitor_stop",
+    "brand_set_tab_group"
   ]);
   return !noTabActions.has(type);
 }
@@ -3585,11 +4063,12 @@ async function handleDaemonMessage(msg) {
     sendToHost({ id: msg.id, result: { success: false, error: "duplicate request ID" } }, respondViaWsEarly);
     return;
   }
+  const requestTimeoutMs = msg.action.type === "binary_sink_save" ? EXT_LONG_REQUEST_TIMEOUT_MS : EXT_REQUEST_TIMEOUT_MS;
   const requestTimer = setTimeout(() => {
     const req = pendingRequests.get(msg.id);
     pendingRequests.delete(msg.id);
     sendToHost({ id: msg.id, result: { success: false, error: "extension timeout" } }, req?.viaWs);
-  }, EXT_REQUEST_TIMEOUT_MS);
+  }, requestTimeoutMs);
   const startTime = Date.now();
   const shortId = msg.id.slice(0, 8);
   const respondViaWs = !!msg._viaWs;
