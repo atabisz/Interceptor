@@ -228,20 +228,40 @@ export function detectMacOSDefaultBrowser():
   }
 }
 
+// One source of truth for per-user NMH manifest locations on macOS — the same
+// browser set scripts/install.sh can configure. Used by `status` (presence)
+// and `diagnose` (manifest-path vs running-binary mismatch detection).
+const NMH_MANIFEST_FILE = "com.interceptor.host.json"
+const NMH_BROWSER_DIRS: Record<string, string> = {
+  "chrome":             "Google/Chrome",
+  "brave":              "BraveSoftware/Brave-Browser",
+  "chrome-beta":        "Google/Chrome Beta",
+  "chrome-canary":      "Google/Chrome Canary",
+  "chrome-dev":         "Google/Chrome Dev",
+  "chrome-for-testing": "Google/ChromeForTesting",
+  "edge":               "Microsoft Edge",
+  "vivaldi":            "Vivaldi",
+}
+
+/** Every installed Interceptor NMH manifest: browser slug + manifest file path. */
+export function installedNmhManifests(): Array<{ browser: string; manifestFile: string }> {
+  const home = process.env.HOME || ""
+  const out: Array<{ browser: string; manifestFile: string }> = []
+  for (const [browser, dir] of Object.entries(NMH_BROWSER_DIRS)) {
+    const manifestFile = `${home}/Library/Application Support/${dir}/NativeMessagingHosts/${NMH_MANIFEST_FILE}`
+    if (existsSync(manifestFile)) out.push({ browser, manifestFile })
+  }
+  return out
+}
+
 /**
  * Detect which browsers have an Interceptor native messaging host manifest
  * installed in their per-user dir.
  */
 export function detectConfiguredBrowsers(): ("chrome" | "brave")[] {
-  const home = process.env.HOME || ""
-  const out: ("chrome" | "brave")[] = []
-  if (existsSync(`${home}/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.interceptor.host.json`)) {
-    out.push("chrome")
-  }
-  if (existsSync(`${home}/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.interceptor.host.json`)) {
-    out.push("brave")
-  }
-  return out
+  return installedNmhManifests()
+    .map(m => m.browser)
+    .filter((b): b is "chrome" | "brave" => b === "chrome" || b === "brave")
 }
 
 /**

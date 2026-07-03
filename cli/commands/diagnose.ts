@@ -20,19 +20,14 @@
  * when Chrome appears open and the extension appears loaded.
  */
 
-import { existsSync, readFileSync } from "node:fs"
-import { readStatusSnapshot } from "../lib/status-renderer"
+import { readFileSync } from "node:fs"
+import { readStatusSnapshot, installedNmhManifests } from "../lib/status-renderer"
 import { sendCommand } from "../transport"
 import { listSessions } from "./monitor"
 import { readLockFile, type LockFileData } from "../../daemon/lifecycle"
 import { LOCK_PATH } from "../../shared/platform"
 import { IOS_CONTEXT_PREFIX } from "../../shared/ios-device"
 import { CDP_CONTEXT_PREFIX } from "../../shared/cdp-app"
-
-const NMH_PATHS: Record<string, string> = {
-  chrome: `${process.env.HOME}/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.interceptor.host.json`,
-  brave:  `${process.env.HOME}/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.interceptor.host.json`,
-}
 
 type BinaryMismatch = {
   browser: string
@@ -96,8 +91,7 @@ function readNmhManifestPath(manifestFile: string): string | null {
 function detectBinaryMismatches(lock: LockFileData | null): BinaryMismatch[] {
   if (!lock?.execPath) return []
   const mismatches: BinaryMismatch[] = []
-  for (const [browser, manifestFile] of Object.entries(NMH_PATHS)) {
-    if (!existsSync(manifestFile)) continue
+  for (const { browser, manifestFile } of installedNmhManifests()) {
     const manifestPath = readNmhManifestPath(manifestFile)
     if (manifestPath && manifestPath !== lock.execPath) {
       mismatches.push({ browser, manifestPath, runningPath: lock.execPath })
