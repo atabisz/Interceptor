@@ -88,7 +88,7 @@ function readNmhManifestPath(manifestFile: string): string | null {
   }
 }
 
-function detectBinaryMismatches(lock: LockFileData | null): BinaryMismatch[] {
+export function detectBinaryMismatches(lock: LockFileData | null): BinaryMismatch[] {
   if (!lock?.execPath) return []
   const mismatches: BinaryMismatch[] = []
   for (const { browser, manifestFile } of installedNmhManifests()) {

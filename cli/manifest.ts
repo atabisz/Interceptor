@@ -171,6 +171,12 @@ export const COMMAND_SPECS: CommandSpec[] = [
     returns: "JSON: {name, version, surfaces, commands[{name,usage,summary,returns,flags}], skills}.",
   },
   { name: "status", surface: "local", usage: "interceptor status [--verbose]", summary: "Daemon/bridge/extension health + skills adoption", returns: "Status report." },
+  {
+    name: "diagnose", surface: "local",
+    usage: "interceptor diagnose [--context <id>] [--json]",
+    summary: "Post-failure snapshot: daemon binary, per-context connection state, NMH binary-mismatch detection",
+    returns: "Text report or JSON {daemon, binaryMismatches, contexts[], monitor}. Never auto-spawns the daemon; use after a command fails ('status' is the pre-flight check).",
+  },
   { name: "init", surface: "local", usage: "interceptor init [--verbose]", summary: "Bootstrap the daemon and report status", returns: "Status report." },
   { name: "research", surface: "local", usage: "interceptor research [init|log|status|…]", summary: "Deep-research methodology + on-disk source ledger", returns: "Playbook guidance / ledger state." },
   { name: "upgrade", surface: "local", usage: "interceptor upgrade --full", summary: "Promote browser-only install to full computer-use mode (macOS)", returns: "Installer output." },
