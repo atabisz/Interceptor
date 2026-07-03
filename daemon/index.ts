@@ -20,7 +20,7 @@ import {
 import { chooseOutboundTransport, validateContextRouting } from "./outbound-routing"
 import { claimContextId, type ContextSocket } from "./context-registration"
 import { formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
-import { clearDaemonRuntimeFiles, checkLockFileDuplicate, clearLockFile, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
+import { clearDaemonRuntimeFiles, clearLockFile, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
 import { VERSION } from "../cli/version"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
 import { CDP_CONTEXT_PREFIX } from "../shared/cdp-app"
@@ -529,18 +529,6 @@ function lifecycleDeps() {
 
 async function bootstrapDaemonRole(): Promise<void> {
   const deps = lifecycleDeps()
-
-  // Check lock file for a live duplicate before checking PID state.
-  // Two --standalone daemons will both have valid PID files pointing to
-  // themselves; only the lock file reveals that another real instance exists.
-  const duplicate = checkLockFileDuplicate(LOCK_PATH, process.pid, process.kill.bind(process))
-  if (duplicate) {
-    const msg = `duplicate daemon already running (pid ${duplicate.pid}, started ${duplicate.startedAt}). Run \`interceptor kill\` to clean up.`
-    log(msg)
-    process.stderr.write(`interceptor-daemon: ${msg}\n`)
-    process.exit(1)
-  }
-
   const state = readPidState(deps)
   const decision = decideDaemonStartupRole(STANDALONE, state)
 
@@ -586,7 +574,12 @@ if (singletonGate.action === "exit") {
 }
 log(`ws server listening on port ${WS_PORT}`)
 
-// Write lock file — authoritative record of this running instance.
+// Write lock file — metadata record of this instance, read by `interceptor
+// diagnose` for binary-mismatch detection. Written only after winning the
+// singleton gate so a losing duplicate can never clobber the winner's record.
+// Duplicate *prevention* is the WS-port gate above, not this file.
+// A non-standalone process only reaches here via the spawn-failure fallback,
+// where it serves as the daemon in-process — hence "native-singleton".
 writeLockFile(LOCK_PATH, {
   pid: process.pid,
   version: VERSION,
@@ -594,7 +587,7 @@ writeLockFile(LOCK_PATH, {
   startedAt: new Date().toISOString(),
   socketPath: SOCKET_PATH,
   wsPort: WS_PORT,
-  mode: STANDALONE ? "standalone" : "relay",
+  mode: STANDALONE ? "standalone" : "native-singleton",
 })
 // Lock cleanup rides the existing shutdown paths (gracefulShutdown + the
 // process "exit" listener below) — a separate signal handler here would

@@ -15,8 +15,10 @@ export type StartupDecision =
   | { action: "spawn" }
   | { action: "clear-and-continue"; reason: string }
   | { action: "clear-and-spawn"; reason: string }
-  | { action: "error-duplicate"; pid: number; startedAt: string }
 
+// Metadata record of the running singleton, read by `interceptor diagnose`
+// for binary-mismatch detection. NOT a duplicate-prevention mechanism — the
+// WS-port bind is the authoritative singleton token (see decideSingletonGate).
 export type LockFileData = {
   pid: number
   version: string
@@ -24,7 +26,9 @@ export type LockFileData = {
   startedAt: string
   socketPath: string
   wsPort: number
-  mode: "standalone" | "relay"
+  // "native-singleton": a non-standalone process that fell back to serving
+  // in-process after failing to spawn a detached standalone daemon.
+  mode: "standalone" | "native-singleton"
 }
 
 export function readLockFile(lockPath: string): LockFileData | null {
@@ -117,22 +121,6 @@ export function clearDaemonRuntimeFiles(deps: Pick<LifecycleDeps, "unlinkSync" |
   }
   try { deps.unlinkSync(deps.pidPath) } catch {}
   try { deps.unlinkSync(deps.lockPath) } catch {}
-}
-
-export function checkLockFileDuplicate(
-  lockPath: string,
-  currentPid: number,
-  kill: (pid: number, signal: 0) => void,
-): { action: "error-duplicate"; pid: number; startedAt: string } | null {
-  const lock = readLockFile(lockPath)
-  if (!lock || lock.pid === currentPid) return null
-  try {
-    kill(lock.pid, 0)
-    // process is alive and is not us — duplicate
-    return { action: "error-duplicate", pid: lock.pid, startedAt: lock.startedAt }
-  } catch {
-    return null
-  }
 }
 
 export function decideDaemonStartupRole(standalone: boolean, state: PidState): StartupDecision {
