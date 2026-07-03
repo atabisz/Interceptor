@@ -596,9 +596,10 @@ writeLockFile(LOCK_PATH, {
   wsPort: WS_PORT,
   mode: STANDALONE ? "standalone" : "relay",
 })
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.on(sig, () => { clearLockFile(LOCK_PATH); process.exit(0) })
-}
+// Lock cleanup rides the existing shutdown paths (gracefulShutdown + the
+// process "exit" listener below) — a separate signal handler here would
+// register first and its process.exit(0) would stop gracefulShutdown from
+// ever running, skipping the CDP/iOS manager teardown.
 
 const pendingRequests = new Map<string, {
   resolve: (v: string) => void
@@ -1646,6 +1647,7 @@ function gracefulShutdown(signal: string) {
   if (wsServer) wsServer.stop(true)
   try { unlinkSync(SOCKET_PATH) } catch {}
   try { unlinkSync(PID_PATH) } catch {}
+  try { clearLockFile(LOCK_PATH) } catch {}
   log("shutdown complete")
   process.exit(0)
 }
@@ -1654,9 +1656,11 @@ process.on("exit", (code) => {
   log(`exiting with code ${code}`)
   try { unlinkSync(SOCKET_PATH) } catch {}
   try { unlinkSync(PID_PATH) } catch {}
+  try { clearLockFile(LOCK_PATH) } catch {}
 })
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
 process.on("SIGINT", () => gracefulShutdown("SIGINT"))
+process.on("SIGHUP", () => gracefulShutdown("SIGHUP"))
 process.on("uncaughtException", (err) => {
   log(`uncaught exception: ${err.message}\n${err.stack}`)
 })
