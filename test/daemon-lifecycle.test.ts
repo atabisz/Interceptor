@@ -39,6 +39,7 @@ function makeDeps(overrides: Partial<LifecycleDeps> = {}): LifecycleDeps {
     execPath: "/Applications/Interceptor/interceptor-daemon",
     argv: ["/Applications/Interceptor/interceptor-daemon"],
     pidPath: "/tmp/interceptor.pid",
+    lockPath: "/tmp/interceptor.lock",
     socketPath: "/tmp/interceptor.sock",
     isWin: false,
     log() {},
@@ -69,7 +70,7 @@ describe("daemon lifecycle helpers", () => {
 
     clearDaemonRuntimeFiles(deps, "stale pid 222")
 
-    expect(deps.unlinked).toEqual([deps.socketPath, deps.pidPath])
+    expect(deps.unlinked).toEqual([deps.socketPath, deps.pidPath, deps.lockPath])
     expect(deps.files.has(deps.pidPath)).toBe(false)
     expect(deps.files.has(deps.socketPath)).toBe(false)
   })

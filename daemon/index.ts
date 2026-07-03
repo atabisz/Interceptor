@@ -7,7 +7,7 @@ import { createHash } from "node:crypto"
 import { dirname } from "node:path"
 import { validateBinarySinkPath, binarySinkIntegrityError } from "./binary-sink"
 import { osClick, osKey, osType, osMove, generateBezierPath, translateCoords } from "./os-input-loader"
-import { IS_WIN, SOCKET_PATH, IPC_PORT, PID_PATH, LOG_PATH, EVENTS_PATH, WS_PORT, EVENTS_MAX_SIZE, transportLabel } from "../shared/platform"
+import { IS_WIN, SOCKET_PATH, IPC_PORT, PID_PATH, LOCK_PATH, LOG_PATH, EVENTS_PATH, WS_PORT, EVENTS_MAX_SIZE, transportLabel } from "../shared/platform"
 import {
   MONITOR_EVENT_NAMES,
   appendSessionEvent,
@@ -20,7 +20,8 @@ import {
 import { chooseOutboundTransport, validateContextRouting } from "./outbound-routing"
 import { claimContextId, type ContextSocket } from "./context-registration"
 import { formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
-import { clearDaemonRuntimeFiles, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon } from "./lifecycle"
+import { clearDaemonRuntimeFiles, clearLockFile, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
+import { VERSION } from "../cli/version"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
 import { CDP_CONTEXT_PREFIX } from "../shared/cdp-app"
 import { IosManager } from "./ios/manager"
@@ -521,7 +522,7 @@ async function startNativeRelay(existingPid: number): Promise<never> {
 
 function lifecycleDeps() {
   return {
-    ...defaultLifecycleDeps({ pidPath: PID_PATH, socketPath: SOCKET_PATH, isWin: IS_WIN }),
+    ...defaultLifecycleDeps({ pidPath: PID_PATH, lockPath: LOCK_PATH, socketPath: SOCKET_PATH, isWin: IS_WIN }),
     log,
   }
 }
@@ -572,6 +573,26 @@ if (singletonGate.action === "exit") {
   process.exit(singletonGate.exitCode)
 }
 log(`ws server listening on port ${WS_PORT}`)
+
+// Write lock file — metadata record of this instance, read by `interceptor
+// diagnose` for binary-mismatch detection. Written only after winning the
+// singleton gate so a losing duplicate can never clobber the winner's record.
+// Duplicate *prevention* is the WS-port gate above, not this file.
+// A non-standalone process only reaches here via the spawn-failure fallback,
+// where it serves as the daemon in-process — hence "native-singleton".
+writeLockFile(LOCK_PATH, {
+  pid: process.pid,
+  version: VERSION,
+  execPath: process.execPath,
+  startedAt: new Date().toISOString(),
+  socketPath: SOCKET_PATH,
+  wsPort: WS_PORT,
+  mode: STANDALONE ? "standalone" : "native-singleton",
+})
+// Lock cleanup rides the existing shutdown paths (gracefulShutdown + the
+// process "exit" listener below) — a separate signal handler here would
+// register first and its process.exit(0) would stop gracefulShutdown from
+// ever running, skipping the CDP/iOS manager teardown.
 
 const pendingRequests = new Map<string, {
   resolve: (v: string) => void
@@ -1619,6 +1640,7 @@ function gracefulShutdown(signal: string) {
   if (wsServer) wsServer.stop(true)
   try { unlinkSync(SOCKET_PATH) } catch {}
   try { unlinkSync(PID_PATH) } catch {}
+  try { clearLockFile(LOCK_PATH) } catch {}
   log("shutdown complete")
   process.exit(0)
 }
@@ -1627,9 +1649,11 @@ process.on("exit", (code) => {
   log(`exiting with code ${code}`)
   try { unlinkSync(SOCKET_PATH) } catch {}
   try { unlinkSync(PID_PATH) } catch {}
+  try { clearLockFile(LOCK_PATH) } catch {}
 })
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
 process.on("SIGINT", () => gracefulShutdown("SIGINT"))
+process.on("SIGHUP", () => gracefulShutdown("SIGHUP"))
 process.on("uncaughtException", (err) => {
   log(`uncaught exception: ${err.message}\n${err.stack}`)
 })
