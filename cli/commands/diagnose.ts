@@ -100,7 +100,7 @@ export function detectBinaryMismatches(lock: LockFileData | null): BinaryMismatc
   return mismatches
 }
 
-async function probeContext(contextId: string | undefined): Promise<ContextProbe> {
+export async function probeContext(contextId: string | undefined): Promise<ContextProbe> {
   const label = contextId ?? "default"
   const kind = contextKind(contextId)
 
