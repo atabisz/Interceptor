@@ -596,7 +596,24 @@ export async function handleScreenshotActions(
       if (action.pixel === true) {
         return handlePixelScreenshot(action, tabId)
       }
-      return handleDomRenderScreenshot(action, tabId)
+      const domResult = await handleDomRenderScreenshot(action, tabId)
+      if (domResult.success) return domResult
+      // Auto-fallback: html-to-image fails outright on some heavy real pages
+      // (the serialized-and-embedded SVG won't decode → an image-load error).
+      // Rather than surface a dead end, transparently retry via the pixel
+      // (captureVisibleTab) path so the default command still produces an image.
+      // The fallback carries the DOM-render error so the reason isn't lost.
+      // region/selector modes are DOM-render-only concepts, so only fall back
+      // for whole-page / element captures the pixel path can actually satisfy.
+      if (action.region || action.clip || action.selector) return domResult
+      const pixelResult = await handlePixelScreenshot({ ...action, pixel: true }, tabId)
+      if (pixelResult.success && pixelResult.data) {
+        (pixelResult.data as Record<string, unknown>).fallback = `dom-render (${domResult.error}) → pixel`
+        return pixelResult
+      }
+      // Pixel also failed — return the original DOM-render error (the primary
+      // path the caller asked for), noting the pixel fallback was tried.
+      return { success: false, error: `${domResult.error} (pixel fallback also failed: ${pixelResult.error})` }
     }
   }
   return { success: false, error: `unknown screenshot action: ${action.type}` }
