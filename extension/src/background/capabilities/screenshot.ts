@@ -193,6 +193,15 @@ async function handleDomRenderScreenshot(
 
   await installScreenshotCorsRule(tabId)
   try {
+    // Single wall-clock budget for the WHOLE DOM-render operation (render +
+    // any post-render webp re-encode), not a per-stage cap. The SW must return
+    // — success or actionable error — before the CLI's screenshot ceiling
+    // (35s) so a stuck stage never surfaces the generic transport timeout.
+    // Each heavy await is charged the REMAINING budget, so no combination of
+    // slow-render + slow-reencode can overrun DOM_RENDER_TIMEOUT_MS total.
+    const deadlineAt = Date.now() + DOM_RENDER_TIMEOUT_MS
+    const remainingMs = () => Math.max(1, deadlineAt - Date.now())
+
     const inject = await injectScreenshotRunner(tabId)
     if (!inject.success) return { success: false, error: inject.error || "runner injection failed" }
 
@@ -204,7 +213,7 @@ async function handleDomRenderScreenshot(
     if (scale !== undefined) dsAction.scale = scale
     if (targetMaxLongEdge !== undefined) dsAction.target_max_long_edge = targetMaxLongEdge
 
-    // Guard the content-script render with the declared timeout. The DOM-render
+    // Guard the content-script render with the shared budget. The DOM-render
     // pipeline (html-to-image) can hang if a page's render never settles; without
     // this wrap the SW would await forever and the CLI would surface only a
     // generic transport timeout. withCaptureTimeout rejects with an actionable
@@ -213,7 +222,7 @@ async function handleDomRenderScreenshot(
     const renderResult = await withCaptureTimeout(
       "dom_screenshot",
       sendToContentScript(tabId, dsAction) as Promise<RenderResult>,
-      DOM_RENDER_TIMEOUT_MS
+      remainingMs()
     ).catch((err): RenderResult => {
       if (err instanceof CaptureTimeoutError) {
         return { success: false, error: `dom render timed out after ${err.timeoutMs}ms — the page's render did not settle` }
@@ -232,9 +241,14 @@ async function handleDomRenderScreenshot(
 
     if (requestedFormat === "webp") {
       try {
-        dataUrl = await reencodeAsWebP(dataUrl, webpQuality)
+        // Charge the re-encode the time left in the shared budget so a slow
+        // render + slow re-encode can't together overrun the CLI ceiling.
+        dataUrl = await withCaptureTimeout("webp_reencode", reencodeAsWebP(dataUrl, webpQuality), remainingMs())
         outputFormat = "webp"
       } catch (err) {
+        if (err instanceof CaptureTimeoutError) {
+          return { success: false, error: `webp re-encode timed out after ${err.timeoutMs}ms — the rendered page was too large to re-encode in time` }
+        }
         return { success: false, error: `webp re-encode failed: ${(err as Error).message}` }
       }
     }

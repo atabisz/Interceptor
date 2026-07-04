@@ -26,7 +26,9 @@ function installLib(lib: Lib) {
 
 const PNG = "data:image/png;base64,AAAA"
 
-let handleDomScreenshot: (action: Record<string, unknown>) => Promise<{ success: boolean; error?: string; data?: unknown }>
+// Inferred from the real module so the test's call signature can't drift from
+// handleDomScreenshot's actual parameter type (DomScreenshotAction).
+let handleDomScreenshot: typeof import("../extension/src/content/dom-screenshot").handleDomScreenshot
 
 beforeEach(async () => {
   // Fresh import per test so module state (the withRafShim refcount) can't leak
