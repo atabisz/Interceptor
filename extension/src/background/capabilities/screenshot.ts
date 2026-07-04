@@ -204,7 +204,22 @@ async function handleDomRenderScreenshot(
     if (scale !== undefined) dsAction.scale = scale
     if (targetMaxLongEdge !== undefined) dsAction.target_max_long_edge = targetMaxLongEdge
 
-    const renderResult = await sendToContentScript(tabId, dsAction) as { success: boolean; error?: string; data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string } }
+    // Guard the content-script render with the declared timeout. The DOM-render
+    // pipeline (html-to-image) can hang if a page's render never settles; without
+    // this wrap the SW would await forever and the CLI would surface only a
+    // generic transport timeout. withCaptureTimeout rejects with an actionable
+    // CaptureTimeoutError, and the finally below still releases the CORS rule.
+    type RenderResult = { success: boolean; error?: string; data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string } }
+    const renderResult = await withCaptureTimeout(
+      "dom_screenshot",
+      sendToContentScript(tabId, dsAction) as Promise<RenderResult>,
+      DOM_RENDER_TIMEOUT_MS
+    ).catch((err): RenderResult => {
+      if (err instanceof CaptureTimeoutError) {
+        return { success: false, error: `dom render timed out after ${err.timeoutMs}ms — the page's render did not settle` }
+      }
+      throw err
+    })
 
     if (!renderResult || !renderResult.success || !renderResult.data) {
       return { success: false, error: renderResult?.error || "dom render returned no data" }

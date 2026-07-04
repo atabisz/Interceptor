@@ -35,6 +35,47 @@ type H2iLib = {
   toJpeg: (node: HTMLElement, options?: Record<string, unknown>) => Promise<string>
 }
 
+// html-to-image's createImage resolves the rasterized SVG inside a
+// requestAnimationFrame callback (html-to-image/es/util.js). On a BACKGROUNDED
+// tab Chromium freezes the rAF queue — the callback never fires, so
+// toPng/toJpeg never settle and the whole screenshot hangs indefinitely (the
+// SW awaits it with no result). The tab paints fine; it's the rAF gate that's
+// frozen. Interceptor is background-first by contract, so this path MUST work
+// without foregrounding the tab.
+//
+// Fix: while a render is in flight, shim requestAnimationFrame onto setTimeout
+// — which is NOT frozen on hidden tabs — so the library's "wait one frame"
+// resolves promptly regardless of visibility. Verified empirically: a bare rAF
+// never fires on a hidden tab (>4.2s); the setTimeout shim fires in <1ms.
+//
+// Reentrancy-safe: a refcount lets overlapping renders share one shim and
+// restores the TRUE native rAF only when the last render finishes (a naive
+// save/restore would let a second render capture the shim as "native" and
+// leave it installed permanently). performance.now() supplies the
+// DOMHighResTimeStamp rAF passes its callback; setTimeout would pass nothing.
+const withRafShim = (() => {
+  const g = globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }
+  let depth = 0
+  let nativeRaf: ((cb: FrameRequestCallback) => number) | null = null
+  return {
+    acquire() {
+      if (depth === 0) {
+        nativeRaf = g.requestAnimationFrame
+        g.requestAnimationFrame = ((cb: FrameRequestCallback): number =>
+          (setTimeout(() => cb(performance.now()), 0) as unknown as number))
+      }
+      depth++
+    },
+    release() {
+      depth = Math.max(0, depth - 1)
+      if (depth === 0 && nativeRaf) {
+        g.requestAnimationFrame = nativeRaf
+        nativeRaf = null
+      }
+    }
+  }
+})()
+
 function getLibrary(): H2iLib | null {
   return (globalThis as unknown as { __interceptor_h2i?: H2iLib }).__interceptor_h2i ?? null
 }
@@ -170,10 +211,30 @@ export async function handleDomScreenshot(action: DomScreenshotAction): Promise<
   // and drawing those onto a canvas taints it. If we hit a tainted-canvas
   // error, retry with a filter that excludes <img> and <picture> elements
   // so the structural render still succeeds (without images).
+  // html-to-image's createImage resolves the rasterized SVG inside a
+  // requestAnimationFrame callback (see html-to-image/es/util.js). On a
+  // BACKGROUNDED tab Chromium freezes the rAF queue — the callback never
+  // fires, so toPng/toJpeg never settle and the whole screenshot hangs
+  // indefinitely (the SW awaits it with no result). This is the root cause
+  // of the "screenshot hangs on background tabs" bug; the tab does paint fine,
+  // it's the rAF gate that's frozen. Interceptor is background-first by
+  // contract, so this path MUST work without foregrounding the tab.
+  //
+  // Fix: for the duration of the render, shim requestAnimationFrame onto
+  // setTimeout — which is NOT frozen on hidden tabs — so the library's
+  // "wait one frame" resolves promptly regardless of visibility. Restored in
+  // finally so we never leave the page's rAF patched. Verified empirically:
+  // a bare rAF never fires on a hidden tab (>4.2s), the setTimeout shim fires
+  // in <1ms.
   const renderWithOpts = async (effectiveOpts: Record<string, unknown>): Promise<string> => {
-    return format === "jpeg"
-      ? await lib.toJpeg(node, effectiveOpts)
-      : await lib.toPng(node, effectiveOpts)
+    withRafShim.acquire()
+    try {
+      return format === "jpeg"
+        ? await lib.toJpeg(node, effectiveOpts)
+        : await lib.toPng(node, effectiveOpts)
+    } finally {
+      withRafShim.release()
+    }
   }
 
   // For "full" mode, force the node's effective dimensions to the document's

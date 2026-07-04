@@ -13,6 +13,12 @@ export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT |
 const ACTION_TIMEOUT_OVERRIDES_MS: Record<string, number> = {
   macos_listen: 60_000,
   macos_vad: 60_000,
+  // The DOM-render screenshot path guards its content-script render with a 30s
+  // timeout in the service worker (DOM_RENDER_TIMEOUT_MS). Give the CLI a longer
+  // ceiling (35s) so that actionable SW-side timeout error reaches the user
+  // instead of the generic 15s transport timeout firing first. Still well under
+  // the daemon's 180s request timeout.
+  screenshot: 35_000,
 }
 
 function pickTimeoutForAction(actionType: string): number {
