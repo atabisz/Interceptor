@@ -21,8 +21,19 @@ const ACTION_TIMEOUT_OVERRIDES_MS: Record<string, number> = {
   screenshot: 35_000,
 }
 
-function pickTimeoutForAction(actionType: string): number {
-  return ACTION_TIMEOUT_OVERRIDES_MS[actionType] ?? INTERCEPTOR_TIMEOUT_MS
+// The --pixel screenshot path (esp. --pixel --full) scrolls + captures +
+// stitches strip-by-strip (~1.25s/strip, Chrome-rate-limited) with NO 30s SW
+// guard — its only real bound is the daemon's REQUEST_TIMEOUT_MS (180s). The
+// 35s DOM-render ceiling would wrongly cut a legitimately-slow tall-page pixel
+// capture while the SW keeps working, so the pixel path gets a ceiling aligned
+// with the daemon's request timeout instead.
+const PIXEL_SCREENSHOT_TIMEOUT_MS = 175_000
+
+export function pickTimeoutForAction(action: Action): number {
+  if (action.type === "screenshot" && action.pixel === true) {
+    return PIXEL_SCREENSHOT_TIMEOUT_MS
+  }
+  return ACTION_TIMEOUT_OVERRIDES_MS[action.type] ?? INTERCEPTOR_TIMEOUT_MS
 }
 
 // PRD-63 Spec 5: branch the timeout hint on `macos_*` so bridge commands
@@ -51,7 +62,7 @@ export function sendCommand(action: Action, tabId?: number): Promise<DaemonRespo
     let resolved = false
     let socketRef: Bun.Socket<undefined> | null = null
 
-    const timeoutMs = pickTimeoutForAction(action.type)
+    const timeoutMs = pickTimeoutForAction(action)
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true
@@ -117,7 +128,7 @@ export function sendCommandWs(action: Action, tabId?: number): Promise<DaemonRes
     const shortId = id.slice(0, 8)
     process.stderr.write(`[${shortId}] →ws ${action.type}\n`)
 
-    const timeoutMs = pickTimeoutForAction(action.type)
+    const timeoutMs = pickTimeoutForAction(action)
     const timer = setTimeout(() => {
       reject(new Error(`timeout: no response for '${action.type}' after ${timeoutMs / 1000}s via WebSocket.`))
     }, timeoutMs)
