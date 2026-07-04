@@ -319,7 +319,13 @@ export function describeRenderError(err: unknown): string {
     // An <img> onerror on the SVG data URL is the signature heavy-page failure.
     return `image load failed (${err.type}${target?.tagName ? ` on <${target.tagName.toLowerCase()}>` : ""}) — the rendered SVG could not be decoded, likely too large or a resource blocked`
   }
-  if (typeof err === "string" && err) return err
-  const s = String(err)
-  return s === "[object Object]" || s === "undefined" ? "unknown render error (non-Error thrown)" : s
+  // Coerce anything else (thrown string, bare primitive, opaque object) and
+  // sanitize AFTER coercion so a thrown literal "undefined"/"null" or an
+  // "[object Object]" can never leak the meaningless value this function
+  // exists to eliminate.
+  const s = typeof err === "string" ? err : String(err)
+  if (!s || s === "undefined" || s === "null" || s === "[object Object]") {
+    return "unknown render error (non-Error thrown)"
+  }
+  return s
 }

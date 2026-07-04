@@ -13,25 +13,24 @@ export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT |
 const ACTION_TIMEOUT_OVERRIDES_MS: Record<string, number> = {
   macos_listen: 60_000,
   macos_vad: 60_000,
-  // The DOM-render screenshot path guards its content-script render with a 30s
-  // timeout in the service worker (DOM_RENDER_TIMEOUT_MS). Give the CLI a longer
-  // ceiling (35s) so that actionable SW-side timeout error reaches the user
-  // instead of the generic 15s transport timeout firing first. Still well under
-  // the daemon's 180s request timeout.
-  screenshot: 35_000,
 }
 
-// The --pixel screenshot path (esp. --pixel --full) scrolls + captures +
-// stitches strip-by-strip (~1.25s/strip, Chrome-rate-limited) with NO 30s SW
-// guard — its only real bound is the daemon's REQUEST_TIMEOUT_MS (180s). The
-// 35s DOM-render ceiling would wrongly cut a legitimately-slow tall-page pixel
-// capture while the SW keeps working, so the pixel path gets a ceiling aligned
-// with the daemon's request timeout instead.
-const PIXEL_SCREENSHOT_TIMEOUT_MS = 175_000
+// Every screenshot gets a ceiling aligned with the daemon's REQUEST_TIMEOUT_MS
+// (180s), not the 15s default. The service worker bounds its own stages (the
+// DOM-render path has a 30s budget; the pixel path has per-strip guards), so
+// the CLI only needs to out-wait the SW's worst case without racing it:
+//  - `--pixel`/`--pixel --full` scrolls + captures + stitches strip-by-strip
+//    (~1.25s/strip, Chrome-rate-limited) with no single 30s cap.
+//  - the DEFAULT (DOM-render) path can auto-fall-back to the pixel path when
+//    html-to-image fails on a heavy page, so a plain `screenshot` can also run
+//    DOM-render (≤30s) THEN a full pixel capture. A 35s ceiling would race that
+//    combined path and surface the generic transport timeout it was meant to
+//    prevent, so all screenshots share the long ceiling.
+const SCREENSHOT_TIMEOUT_MS = 175_000
 
 export function pickTimeoutForAction(action: Action): number {
-  if (action.type === "screenshot" && action.pixel === true) {
-    return PIXEL_SCREENSHOT_TIMEOUT_MS
+  if (action.type === "screenshot") {
+    return SCREENSHOT_TIMEOUT_MS
   }
   return ACTION_TIMEOUT_OVERRIDES_MS[action.type] ?? INTERCEPTOR_TIMEOUT_MS
 }

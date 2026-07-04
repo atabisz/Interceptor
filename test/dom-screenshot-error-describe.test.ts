@@ -42,4 +42,20 @@ describe("describeRenderError", () => {
     expect(describeRenderError({})).toBe("unknown render error (non-Error thrown)")
     expect(describeRenderError(undefined)).toBe("unknown render error (non-Error thrown)")
   })
+
+  test("a thrown literal 'undefined'/'null' string is sanitized, not leaked", () => {
+    // Guard order regression: the string branch used to return before the
+    // sanitize check, leaking the exact value this function exists to remove.
+    expect(describeRenderError("undefined")).toBe("unknown render error (non-Error thrown)")
+    expect(describeRenderError("null")).toBe("unknown render error (non-Error thrown)")
+    expect(describeRenderError("")).toBe("unknown render error (non-Error thrown)")
+  })
+
+  test("bare primitives never leak 'null'/'0'", () => {
+    expect(describeRenderError(null)).toBe("unknown render error (non-Error thrown)")
+  })
+
+  test("a meaningful thrown string is still returned as-is", () => {
+    expect(describeRenderError("canvas is 0x0")).toBe("canvas is 0x0")
+  })
 })
