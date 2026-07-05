@@ -611,14 +611,34 @@ function buildScreenshotCorsRule(tabId) {
     }
   };
 }
+var corsRuleRefcount = new Map;
 async function installScreenshotCorsRule(tabId) {
-  const rule = buildScreenshotCorsRule(tabId);
-  await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [rule.id],
-    addRules: [rule]
-  });
+  const prev = corsRuleRefcount.get(tabId) ?? 0;
+  corsRuleRefcount.set(tabId, prev + 1);
+  if (prev === 0) {
+    const rule = buildScreenshotCorsRule(tabId);
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [rule.id],
+        addRules: [rule]
+      });
+    } catch (err) {
+      const cur = corsRuleRefcount.get(tabId) ?? 0;
+      if (cur <= 1)
+        corsRuleRefcount.delete(tabId);
+      else
+        corsRuleRefcount.set(tabId, cur - 1);
+      throw err;
+    }
+  }
 }
 async function uninstallScreenshotCorsRule(tabId) {
+  const prev = corsRuleRefcount.get(tabId) ?? 0;
+  if (prev > 1) {
+    corsRuleRefcount.set(tabId, prev - 1);
+    return;
+  }
+  corsRuleRefcount.delete(tabId);
   const ruleId = SCREENSHOT_CORS_RULE_ID_BASE + tabId;
   try {
     await chrome.declarativeNetRequest.updateSessionRules({
@@ -803,9 +823,12 @@ async function handleDomRenderScreenshot(action, tabId) {
     let outputFormat = renderResult.data.format;
     if (requestedFormat === "webp") {
       try {
-        dataUrl = await reencodeAsWebP(dataUrl, webpQuality);
+        dataUrl = await withCaptureTimeout("webp-reencode", reencodeAsWebP(dataUrl, webpQuality), DOM_RENDER_TIMEOUT_MS);
         outputFormat = "webp";
       } catch (err) {
+        if (err instanceof CaptureTimeoutError) {
+          return { success: false, error: `webp re-encode timed out after ${DOM_RENDER_TIMEOUT_MS}ms — the rendered page was too large to re-encode in time` };
+        }
         return { success: false, error: `webp re-encode failed: ${err.message}` };
       }
     }

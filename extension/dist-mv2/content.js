@@ -4257,37 +4257,26 @@ async function nativeRenderToDataUrl(node, o) {
   const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   const img = await loadSvgImage(svgUrl);
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(o.width * o.pixelRatio));
-  canvas.height = Math.max(1, Math.round(o.height * o.pixelRatio));
+  const fullW = Math.max(1, Math.round(o.width * o.pixelRatio));
+  const fullH = Math.max(1, Math.round(o.height * o.pixelRatio));
+  canvas.width = o.crop ? Math.max(1, Math.round(o.crop.width * o.pixelRatio)) : fullW;
+  canvas.height = o.crop ? Math.max(1, Math.round(o.crop.height * o.pixelRatio)) : fullH;
   const ctx = canvas.getContext("2d");
   if (!ctx)
     throw new Error("2d canvas context unavailable");
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  return o.format === "jpeg" ? canvas.toDataURL("image/jpeg", o.quality) : canvas.toDataURL("image/png");
+  if (o.crop) {
+    ctx.drawImage(img, -Math.round(o.crop.x * o.pixelRatio), -Math.round(o.crop.y * o.pixelRatio), fullW, fullH);
+  } else {
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  }
+  const out = o.format === "jpeg" ? canvas.toDataURL("image/jpeg", o.quality) : canvas.toDataURL("image/png");
+  return checkRasterizeOutput(out, canvas.width, canvas.height);
 }
-async function cropDataUrl(dataUrl, x, y, w, h, format, quality) {
-  return new Promise((resolve) => {
-    const img = new Image;
-    img.onload = () => {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          resolve(null);
-          return;
-        }
-        ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
-        const out = format === "jpeg" ? canvas.toDataURL("image/jpeg", quality) : canvas.toDataURL("image/png");
-        resolve(out);
-      } catch {
-        resolve(null);
-      }
-    };
-    img.onerror = () => resolve(null);
-    img.src = dataUrl;
-  });
+function checkRasterizeOutput(dataUrl, width, height) {
+  const payloadStart = dataUrl.indexOf(",") + 1;
+  if (payloadStart > 0 && dataUrl.length - payloadStart >= 24)
+    return dataUrl;
+  throw new Error(`rendered canvas ${width}x${height}px exceeds the browser's canvas size limit and produced no image data — ` + `capture a smaller area with --region, or reduce output size with --target-max-long-edge or a smaller --scale`);
 }
 function resolveTarget(action) {
   const mode = action.mode || "full";
@@ -4353,32 +4342,38 @@ async function handleDomScreenshot(action) {
     }
   }
   try {
-    let dataUrl = await nativeRenderToDataUrl(node, {
+    const crop = mode === "region" && action.region ? action.region : undefined;
+    const dataUrl = await nativeRenderToDataUrl(node, {
       width,
       height,
       pixelRatio,
       format,
       quality: qualityPct / 100,
-      isFull
+      isFull,
+      crop
     });
-    let outWidth = Math.round(width * pixelRatio);
-    let outHeight = Math.round(height * pixelRatio);
-    if (mode === "region" && action.region) {
-      const region = action.region;
-      const cropped = await cropDataUrl(dataUrl, Math.round(region.x * pixelRatio), Math.round(region.y * pixelRatio), Math.round(region.width * pixelRatio), Math.round(region.height * pixelRatio), format, qualityPct / 100);
-      if (cropped) {
-        dataUrl = cropped;
-        outWidth = Math.round(region.width * pixelRatio);
-        outHeight = Math.round(region.height * pixelRatio);
-      }
-    }
+    const outWidth = Math.round((crop ? crop.width : width) * pixelRatio);
+    const outHeight = Math.round((crop ? crop.height : height) * pixelRatio);
     return {
       success: true,
       data: { dataUrl, format, width: outWidth, height: outHeight, pixelRatio, mode }
     };
   } catch (err) {
-    return { success: false, error: `dom render failed: ${err.message}` };
+    return { success: false, error: `dom render failed: ${describeRenderError(err)}` };
   }
+}
+function describeRenderError(err) {
+  if (err instanceof Error && err.message)
+    return err.message;
+  if (typeof Event !== "undefined" && err instanceof Event) {
+    const target = err.target;
+    return `image load failed (${err.type}${target?.tagName ? ` on <${target.tagName.toLowerCase()}>` : ""}) — the rendered SVG could not be decoded, likely too large or a resource blocked`;
+  }
+  const s = typeof err === "string" ? err : String(err);
+  if (!s || s === "undefined" || s === "null" || s === "[object Object]") {
+    return "unknown render error (non-Error thrown)";
+  }
+  return s;
 }
 
 // extension/src/content.ts
