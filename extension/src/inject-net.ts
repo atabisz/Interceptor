@@ -95,6 +95,48 @@ if ((window as any).__interceptor_net_installed) {
     } catch {}
   }) as EventListener, true)
 
+  // File-drop trust bridge. The content script (ISOLATED) can build a File and
+  // fire a drop, but that drop is isTrusted:false — some dropzones reject it.
+  // Here in MAIN we re-build the File from the blob: URL it handed us and fire
+  // the drag sequence *inside our own realm*, tagged trusted, so the page's own
+  // drop listener sees isTrusted:true (the tag only works in the realm that owns
+  // the isTrusted getter override above). Ack back with {id, ok} so the content
+  // side knows whether to fall back to its own isolated dispatch.
+  document.addEventListener("__interceptor_file_drop", ((e: CustomEvent) => {
+    const target = e.target as (Element & { dispatchEvent: (ev: Event) => boolean }) | null
+    const d = (e.detail || {}) as { id?: string; blobUrl?: string; name?: string; type?: string; x?: number; y?: number }
+    if (!target || !d.id || !d.blobUrl) return
+    const ack = (ok: boolean) => {
+      try {
+        target.dispatchEvent(new CustomEvent("__interceptor_file_drop_ack", { bubbles: true, detail: { id: d.id, ok } }))
+      } catch {}
+    }
+    ;(async () => {
+      try {
+        const resp = await fetch(d.blobUrl as string)
+        const blob = await resp.blob()
+        const file = new File([blob], d.name || "file", { type: d.type || blob.type || "application/octet-stream" })
+        const dt = new DataTransfer()
+        dt.items.add(file)
+        const base = {
+          bubbles: true, cancelable: true, composed: true,
+          clientX: d.x ?? 0, clientY: d.y ?? 0,
+        }
+        const fire = (type: string) => {
+          const ev = new DragEvent(type, { ...base, dataTransfer: dt }) as DragEvent & { __interceptor_trust?: boolean }
+          ev.__interceptor_trust = true
+          target.dispatchEvent(ev)
+        }
+        fire("dragenter")
+        fire("dragover")
+        fire("drop")
+        ack(true)
+      } catch {
+        ack(false)
+      }
+    })()
+  }) as EventListener, true)
+
   function applyOverrides(rawUrl: string): string {
     if (!overrideRules.length) return rawUrl
     for (const rule of overrideRules) {

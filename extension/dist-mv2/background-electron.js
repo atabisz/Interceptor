@@ -4068,6 +4068,38 @@ async function handleMonitorActions(action, tabId) {
   return { success: false, error: `unknown monitor action: ${action.type}` };
 }
 
+// extension/src/background/keepawake.ts
+var KEEPAWAKE_STORAGE_KEY = "interceptor_keepawake";
+var IDLE_DETECTION_SECONDS = 60;
+async function setKeepAwake(on, level = "system") {
+  if (on) {
+    chrome.power.requestKeepAwake(level);
+    await chrome.storage.local.set({ [KEEPAWAKE_STORAGE_KEY]: { on: true, level } });
+    return { on: true, level };
+  }
+  chrome.power.releaseKeepAwake();
+  await chrome.storage.local.set({ [KEEPAWAKE_STORAGE_KEY]: { on: false } });
+  return { on: false };
+}
+function queryIdleState(detectionInterval = IDLE_DETECTION_SECONDS) {
+  return new Promise((resolve) => {
+    chrome.idle.queryState(detectionInterval, (state) => resolve(state));
+  });
+}
+async function handlePowerIdleActions(action) {
+  if (action.type === "keepawake") {
+    const level = action.level === "display" ? "display" : "system";
+    const result = await setKeepAwake(action.on === true, level);
+    return { success: true, data: result };
+  }
+  if (action.type === "idle_state") {
+    const interval = typeof action.detectionInterval === "number" && action.detectionInterval > 0 ? action.detectionInterval : undefined;
+    const state = await queryIdleState(interval);
+    return { success: true, data: { state } };
+  }
+  return { success: false, error: `unknown power/idle action: ${action.type}` };
+}
+
 // extension/src/background/router.ts
 registerMonitorListeners();
 restorePageCommCaptureConfig();
@@ -4159,6 +4191,7 @@ var PASSIVE_NET_ACTIONS = new Set([
 ]);
 var CDP_NETWORK_ACTIONS = new Set(["network_intercept", "network_log", "network_override"]);
 var MONITOR_ACTIONS = new Set(["monitor_start", "monitor_stop", "monitor_status", "monitor_pause", "monitor_resume"]);
+var POWER_IDLE_ACTIONS = new Set(["keepawake", "idle_state"]);
 var SCENE_ACTIONS = new Set([
   "scene_list",
   "scene_click",
@@ -4227,6 +4260,8 @@ async function routeAction(action, tabId) {
     return handleCdpNetworkActions(action, tabId);
   if (MONITOR_ACTIONS.has(action.type))
     return handleMonitorActions(action, tabId);
+  if (POWER_IDLE_ACTIONS.has(action.type))
+    return handlePowerIdleActions(action);
   const contentResult = await sendToContentScript(tabId, action, action.frameId);
   const shouldSceneEscalate = action.type === "scene_click" && contentResult.success && (action.os === true || contentResult.warning?.includes("no DOM change")) && activeTransport !== "none";
   const shouldClickEscalate = action.type === "click" && contentResult.success && contentResult.warning?.includes("no DOM change") && activeTransport !== "none";
@@ -4309,7 +4344,9 @@ var NO_TAB_ACTIONS = new Set([
   "monitor_stop",
   "brand_set_tab_group",
   "group_list",
-  "group_close"
+  "group_close",
+  "keepawake",
+  "idle_state"
 ]);
 function needsTab(type) {
   return !NO_TAB_ACTIONS.has(type);

@@ -2031,6 +2031,106 @@ async function handleDrag(action) {
   return { success: true, data: `dragged from (${action.fromX},${action.fromY}) to (${action.toX},${action.toY}) in ${steps} steps` };
 }
 
+// extension/src/content/actions/file.ts
+init_input_simulation();
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0;i < binary.length; i++)
+    bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function findFileInput(el) {
+  if (el instanceof HTMLInputElement && el.type === "file")
+    return el;
+  const inner = el.querySelector?.('input[type="file"]');
+  return inner ?? null;
+}
+function isolatedDrop(target, file) {
+  const rect = target.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const base = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y };
+  for (const type of ["dragenter", "dragover", "drop"]) {
+    const dt = new DataTransfer;
+    dt.items.add(file);
+    target.dispatchEvent(new DragEvent(type, { ...base, dataTransfer: dt }));
+  }
+}
+function bridgedDrop(target, bytes, name, type) {
+  return new Promise((resolve) => {
+    const rect = target.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const blob = new Blob([bytes.buffer], { type: type || "application/octet-stream" });
+    const blobUrl = URL.createObjectURL(blob);
+    const id = "fd_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    let settled = false;
+    const finish = (ok) => {
+      if (settled)
+        return;
+      settled = true;
+      target.removeEventListener("__interceptor_file_drop_ack", onAck, true);
+      clearTimeout(timer);
+      try {
+        URL.revokeObjectURL(blobUrl);
+      } catch {}
+      resolve(ok);
+    };
+    const onAck = (e) => {
+      const detail = e.detail;
+      if (!detail || detail.id !== id)
+        return;
+      finish(detail.ok === true);
+    };
+    target.addEventListener("__interceptor_file_drop_ack", onAck, true);
+    const timer = setTimeout(() => finish(false), 3000);
+    target.dispatchEvent(new CustomEvent("__interceptor_file_drop", {
+      bubbles: true,
+      detail: { id, blobUrl, name, type, x, y }
+    }));
+  });
+}
+async function handleFileUpload(action) {
+  const el = resolveElement(action.index, action.ref);
+  if (!el) {
+    return { success: false, error: `stale element [${String(action.ref ?? action.index)}] — run interceptor state to refresh` };
+  }
+  const fileName = String(action.fileName || "file");
+  const mimeType = String(action.mimeType || "application/octet-stream");
+  const dataBase64 = action.dataBase64;
+  if (typeof dataBase64 !== "string")
+    return { success: false, error: "file_upload: missing dataBase64" };
+  let bytes;
+  try {
+    bytes = base64ToBytes(dataBase64);
+  } catch (e) {
+    return { success: false, error: `file_upload: invalid base64 (${e.message})` };
+  }
+  const file = new File([bytes.buffer], fileName, { type: mimeType });
+  const forceDropzone = action.dropzone === true;
+  const fileInput = forceDropzone ? null : findFileInput(el);
+  if (fileInput) {
+    if (fileInput.disabled)
+      return { success: false, error: "file_upload: <input type=file> is disabled" };
+    const dt = new DataTransfer;
+    dt.items.add(file);
+    fileInput.files = dt.files;
+    fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    return {
+      success: true,
+      data: { method: "input", fileName, size: bytes.byteLength, multiple: fileInput.multiple, accept: fileInput.accept || null }
+    };
+  }
+  const target = el;
+  const bridged = await bridgedDrop(target, bytes, fileName, mimeType);
+  if (bridged)
+    return { success: true, data: { method: "dropzone-trusted", fileName, size: bytes.byteLength } };
+  isolatedDrop(target, file);
+  return { success: true, data: { method: "dropzone-isolated", fileName, size: bytes.byteLength } };
+}
+
 // extension/src/content/actions/hover.ts
 init_input_simulation();
 async function handleHover(action) {
@@ -4427,6 +4527,8 @@ async function executeAction(action) {
         return handleRightclick(action);
       case "drag":
         return handleDrag(action);
+      case "file_upload":
+        return handleFileUpload(action);
       case "input_text":
         return handleInputText(action);
       case "select_option":

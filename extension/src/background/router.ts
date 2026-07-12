@@ -24,6 +24,7 @@ import { handleMetaActions } from "./capabilities/meta"
 import { handlePassiveNetActions, restorePageCommCaptureConfig } from "./capabilities/passive-net"
 import { handleCdpNetworkActions } from "./capabilities/cdp-network-actions"
 import { handleMonitorActions, registerMonitorListeners } from "./capabilities/monitor"
+import { handlePowerIdleActions } from "./keepawake"
 
 registerMonitorListeners()
 restorePageCommCaptureConfig()
@@ -79,6 +80,7 @@ const PASSIVE_NET_ACTIONS = new Set([
 ])
 const CDP_NETWORK_ACTIONS = new Set(["network_intercept", "network_log", "network_override"])
 const MONITOR_ACTIONS = new Set(["monitor_start", "monitor_stop", "monitor_status", "monitor_pause", "monitor_resume"])
+const POWER_IDLE_ACTIONS = new Set(["keepawake", "idle_state"])
 const SCENE_ACTIONS = new Set([
   "scene_list", "scene_click", "scene_dblclick", "scene_select", "scene_hit",
   "scene_selected", "scene_text", "scene_insert", "scene_cursor_to", "scene_cursor",
@@ -114,6 +116,7 @@ export async function routeAction(
   if (PASSIVE_NET_ACTIONS.has(action.type)) return handlePassiveNetActions(action, tabId)
   if (CDP_NETWORK_ACTIONS.has(action.type)) return handleCdpNetworkActions(action, tabId)
   if (MONITOR_ACTIONS.has(action.type)) return handleMonitorActions(action, tabId)
+  if (POWER_IDLE_ACTIONS.has(action.type)) return handlePowerIdleActions(action)
 
   // Default: forward to content script
   const contentResult = await sendToContentScript(
