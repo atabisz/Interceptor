@@ -35,11 +35,24 @@
     "alarms",
     "offscreen",
     "tabCapture",
-    "debugger"
+    "debugger",
+    "contextMenus",
+    "idle",
+    "power"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
+  "commands": {
+    "delegate-page": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Hand the current page to the agent"
+    },
+    "delegate-selection": {
+      "suggested_key": { "default": "Ctrl+Shift+U", "mac": "Command+Shift+U" },
+      "description": "Hand the current selection to the agent"
+    }
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

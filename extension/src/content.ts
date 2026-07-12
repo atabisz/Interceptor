@@ -13,6 +13,7 @@ import { handleInputText, handleSelectOption, handleCheck } from "./content/acti
 import { handleScroll, handleScrollAbsolute, handleScrollTo, handleGetPageDimensions } from "./content/actions/scroll"
 import { handleWait, handleWaitFor, handleWaitStable } from "./content/actions/wait"
 import { handleDrag } from "./content/actions/drag"
+import { handleFileUpload } from "./content/actions/file"
 import { handleHover } from "./content/actions/hover"
 import { handleFocus, handleBlur, handleGetFocus } from "./content/actions/focus"
 import { handleExtractText, handleExtractMarkdown, handleExtractHtml } from "./content/data/extract"
@@ -83,6 +84,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
       case "dblclick":            return handleDblclick(action)
       case "rightclick":          return handleRightclick(action)
       case "drag":                return handleDrag(action)
+      case "file_upload":         return handleFileUpload(action)
       case "input_text":          return handleInputText(action)
       case "select_option":       return handleSelectOption(action)
       case "check":               return handleCheck(action)

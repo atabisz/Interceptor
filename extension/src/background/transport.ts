@@ -36,7 +36,7 @@ function describeOutboundMessage(msg: unknown): string {
   return JSON.stringify(msg).slice(0, 200)
 }
 
-function emitEvent(event: string, data: Record<string, unknown> = {}) {
+export function emitEvent(event: string, data: Record<string, unknown> = {}) {
   sendToHost({ type: "event", event, ...data })
 }
 

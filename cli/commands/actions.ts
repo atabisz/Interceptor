@@ -5,6 +5,8 @@
 
 import { parseElementTarget } from "../parse"
 import { hasTrustedFlag, TRUSTED_FLAG_VALUES } from "./flags"
+import { inferMime, baseName } from "../../shared/upload"
+import { readFileSync } from "node:fs"
 
 type Action = { type: string; [key: string]: unknown }
 
@@ -88,6 +90,33 @@ export function parseActionsCommand(filtered: string[]): Action {
       if (filtered.includes("--steps")) dragAction.steps = parseInt(filtered[filtered.indexOf("--steps") + 1])
       if (filtered.includes("--duration")) dragAction.duration = parseInt(filtered[filtered.indexOf("--duration") + 1])
       return dragAction
+    }
+
+    case "upload": {
+      const ref = filtered[1]
+      const path = filtered[2]
+      if (!ref || !path) {
+        console.error("error: usage — interceptor upload <ref|index> <path> [--dropzone]")
+        process.exit(1)
+      }
+      const target = parseElementTarget(ref)
+      let buf: Buffer
+      try {
+        buf = readFileSync(path)
+      } catch (e) {
+        console.error(`error: cannot read file '${path}': ${(e as Error).message}`)
+        process.exit(1)
+      }
+      const fileName = baseName(path)
+      const action: Action = {
+        type: "file_upload",
+        ...target,
+        fileName,
+        mimeType: inferMime(fileName),
+        dataBase64: buf.toString("base64"),
+      }
+      if (filtered.includes("--dropzone")) action.dropzone = true
+      return action
     }
 
     case "dblclick": {

@@ -14,6 +14,7 @@ import {
 import { ensureDaemon } from "./daemon-spawn"
 import { parseStateCommand } from "./commands/state"
 import { parseActionsCommand } from "./commands/actions"
+import { parsePowerCommand, runDelegateCommand } from "./commands/power"
 import { parseNavigationCommand } from "./commands/navigation"
 import { parseTabsCommand } from "./commands/tabs"
 import { parseNetworkCommand } from "./commands/network"
@@ -43,7 +44,7 @@ import { normalizeArgs } from "./normalize"
 
 // Command → module routing
 const STATE_CMDS = new Set(["state", "tree", "diff", "find", "text", "html"])
-const ACTION_CMDS = new Set(["click", "type", "select", "focus", "blur", "hover", "drag", "dblclick", "rightclick", "check", "keys", "click-at", "what-at", "regions"])
+const ACTION_CMDS = new Set(["click", "type", "select", "focus", "blur", "hover", "drag", "upload", "dblclick", "rightclick", "check", "keys", "click-at", "what-at", "regions"])
 const NAV_CMDS = new Set(["navigate", "back", "forward", "scroll", "wait", "wait-stable", "wait_for"])
 const TAB_CMDS = new Set(["tabs", "tab", "window", "frames", "session"])
 const NET_CMDS = new Set(["network", "net", "headers"])
@@ -56,6 +57,8 @@ const BRAND_CMDS = new Set(["brand"])
 const GROUP_CMDS = new Set(["group"])
 const BATCH_CMDS = new Set(["batch", "raw"])
 const MONITOR_CMDS = new Set(["monitor"])
+const POWER_CMDS = new Set(["keepawake", "idle"])
+const DELEGATE_CMDS = new Set(["delegate"])
 const SCENE_CMDS = new Set(["scene"])
 const SSE_CMDS = new Set(["sse"])
 const COMPOUND_CMDS = new Set(["open", "read", "act", "inspect"])
@@ -74,7 +77,7 @@ const MANIFEST_CMDS = new Set(["manifest"])
 // bootstrap it themselves rather than relying on the pre-dispatch auto-spawn).
 // `research` prints guidance / manages an on-disk ledger — no browser, no daemon.
 // `diagnose` reads local state + optionally probes the daemon — never auto-spawns.
-const NO_DAEMON = new Set(["status", "help", "events", "session", "upgrade", "init", "research", "extensions", "skills", "manifest", "diagnose"])
+const NO_DAEMON = new Set(["status", "help", "events", "delegate", "session", "upgrade", "init", "research", "extensions", "skills", "manifest", "diagnose"])
 
 // Every command the CLI dispatches. Used to reject unknown commands
 // before any daemon-spawning side effect runs.
@@ -85,6 +88,7 @@ const ALL_KNOWN_CMDS = new Set<string>([
   ...COMPOUND_CMDS, ...OVERRIDE_CMDS, ...MACOS_CMDS, ...IOS_CMDS,
   ...UPGRADE_CMDS, ...INIT_CMDS, ...RESEARCH_CMDS, ...EXTENSIONS_CMDS,
   ...SKILLS_CMDS, ...MANIFEST_CMDS, ...DIAGNOSE_CMDS,
+  ...POWER_CMDS, ...DELEGATE_CMDS,
   "help", "contexts",
 ])
 
@@ -314,6 +318,11 @@ async function main() {
     return
   }
 
+  if (DELEGATE_CMDS.has(cmd)) {
+    await runDelegateCommand(filtered, jsonMode)
+    return
+  }
+
   if (STATE_CMDS.has(cmd))       action = parseStateCommand(filtered)
   else if (ACTION_CMDS.has(cmd)) action = parseActionsCommand(filtered)
   else if (NAV_CMDS.has(cmd))    action = parseNavigationCommand(filtered)
@@ -327,6 +336,7 @@ async function main() {
   else if (BRAND_CMDS.has(cmd))  action = parseBrandCommand(filtered)
   else if (GROUP_CMDS.has(cmd))  action = parseGroupCommand(filtered)
   else if (BATCH_CMDS.has(cmd))  action = parseBatchCommand(filtered)
+  else if (POWER_CMDS.has(cmd))   action = parsePowerCommand(filtered)
   else if (MONITOR_CMDS.has(cmd)) action = await parseMonitorCommand(filtered, jsonMode)
   else if (SCENE_CMDS.has(cmd))   action = await parseSceneCommand(filtered, jsonMode)
   else if (SSE_CMDS.has(cmd))     action = parseSseCommand(filtered)
