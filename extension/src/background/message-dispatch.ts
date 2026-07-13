@@ -105,6 +105,19 @@ export async function handleDaemonMessage(msg: {
   const action = msg.action
   let tabId = msg.tabId
 
+  // Tab-targeted actions name their target tab in `action.tabId` — the CLI puts
+  // the `tab close <id>` / `tab switch <id>` argument there, while the top-level
+  // `msg.tabId` only carries the global `--tab` override. Without honoring the
+  // explicit target here, resolution below falls through to the active tab, so a
+  // tab-targeted request group-validates and operates on whatever tab is
+  // foregrounded: `tab close <id>` fails with "tab <active-id> is not in the
+  // interceptor group" and leaves <id> open, and switch-then-close acknowledges
+  // while the tab survives. Prefer an explicit `--tab` override when present;
+  // otherwise the action's own target wins.
+  if (msg.tabId === undefined && typeof action.tabId === "number" && !Number.isNaN(action.tabId)) {
+    tabId = action.tabId
+  }
+
   const fail = (error: string): void => {
     clearTimeout(requestTimer)
     pendingRequests.delete(msg.id!)
