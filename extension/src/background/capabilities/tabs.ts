@@ -12,6 +12,13 @@ function activeTabKey(group?: string): string {
   return group ? `activeTabId:${group}` : "activeTabId"
 }
 
+// storage.session is MV3-only (Chrome 102+); the MV2 Electron package shares
+// this handler, so fall back to storage.local exactly like message-dispatch.
+function sessionArea(): chrome.storage.StorageArea {
+  const storage = chrome.storage as typeof chrome.storage & { session?: chrome.storage.StorageArea }
+  return storage.session ?? chrome.storage.local
+}
+
 export async function handleTabActions(
   action: { type: string; [key: string]: unknown },
   tabId: number
@@ -62,7 +69,7 @@ export async function handleTabActions(
                 // — whether new or reused — must update the (per-group)
                 // activeTabId so a fresh CLI invocation (no --tab) routes here
                 // instead of a stale id or the user's foreground tab.
-                await chrome.storage.session.set({ [activeTabKey(group)]: candidate.id })
+                await sessionArea().set({ [activeTabKey(group)]: candidate.id })
                 return {
                   success: true,
                   data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, group, reused: true }
@@ -89,7 +96,7 @@ export async function handleTabActions(
         // so a fresh CLI invocation (no --tab) routes to this tab instead of a
         // stale activeTabId or whatever Chrome reports as "active in currentWindow"
         // (which may be the user's foreground tab, not the one we just opened).
-        await chrome.storage.session.set({ [activeTabKey(group)]: newTab.id })
+        await sessionArea().set({ [activeTabKey(group)]: newTab.id })
         return { success: true, data: { tabId: newTab.id, url: newTab.url, groupId, group, reused: false } }
       }
       return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } }
@@ -103,16 +110,19 @@ export async function handleTabActions(
       // Checks the caller's per-group key too.
       const keys = ["activeTabId", typeof action.group === "string" ? activeTabKey(action.group) : null]
         .filter((k): k is string => !!k)
-      const stored = await chrome.storage.session.get(keys) as Record<string, number | undefined>
+      const stored = await sessionArea().get(keys) as Record<string, number | undefined>
       for (const key of keys) {
-        if (stored[key] === closedId) await chrome.storage.session.remove(key)
+        if (stored[key] === closedId) await sessionArea().remove(key)
       }
       return { success: true }
     }
 
     case "tab_switch": {
+      // No auto-target write here: the dispatcher's post-gate persist already
+      // stored the switch target under the caller's (per-group or global) key;
+      // a handler-side global write would clobber the ungrouped key on
+      // grouped switches.
       await chrome.tabs.update(action.tabId as number, { active: true })
-      await chrome.storage.session.set({ activeTabId: action.tabId as number })
       return { success: true }
     }
 
