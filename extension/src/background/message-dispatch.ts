@@ -5,6 +5,7 @@ import {
 } from "./tab-group"
 import { routeAction } from "./router"
 import { needsTab } from "./no-tab-actions"
+import { resolveWorkingTabId } from "./resolve-tab"
 
 export const MESSAGE_QUEUE_CAP = 50
 export const messageQueue: Array<{
@@ -103,7 +104,17 @@ export async function handleDaemonMessage(msg: {
   })
 
   const action = msg.action
-  let tabId = msg.tabId
+  // Tab-targeted actions name their target tab in `action.tabId` — the CLI puts
+  // the `tab close <id>` / `tab switch <id>` argument there, while the top-level
+  // `msg.tabId` only carries the global `--tab` override. Without honoring the
+  // explicit target here, resolution below falls through to the active tab, so a
+  // tab-targeted request group-validates and operates on whatever tab is
+  // foregrounded: `tab close <id>` fails with "tab <active-id> is not in the
+  // interceptor group" and leaves <id> open, and switch-then-close acknowledges
+  // while the tab survives. The explicit target wins over `--tab`: the tab
+  // handlers act on `action.tabId` whenever it is present, so the gate below
+  // must validate that same tab, never a different one.
+  let tabId = resolveWorkingTabId(msg.tabId, action.tabId)
 
   const fail = (error: string): void => {
     clearTimeout(requestTimer)
@@ -152,9 +163,11 @@ export async function handleDaemonMessage(msg: {
   }
 
   if (!tabId && needsTab(action.type)) {
+    // No pre-gate persist here: the post-gate persist below is the only
+    // auto-target write, so a request the group gate rejects (e.g. the
+    // browser-active tab is unmanaged) can never poison the stored target.
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
     tabId = activeTab?.id
-    if (tabId) setActiveTabId(tabId)
   }
 
   if (!tabId && needsTab(action.type)) {

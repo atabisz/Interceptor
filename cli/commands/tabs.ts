@@ -137,10 +137,20 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
           return action
         }
         case "close":
+          // Strict digits: parseInt would partial-parse '12abc' to 12 and turn
+          // a typo'd id into a close of a different (or the active) tab.
+          if (filtered[2] !== undefined && !/^\d+$/.test(filtered[2])) {
+            console.error(`error: tab close requires a numeric tab ID, got '${filtered[2]}'`)
+            process.exit(1)
+          }
           return filtered[2]
             ? { type: "tab_close", tabId: parseInt(filtered[2]) }
             : { type: "tab_close" }
         case "switch":
+          if (filtered[2] === undefined || !/^\d+$/.test(filtered[2])) {
+            console.error(`error: tab switch requires a numeric tab ID${filtered[2] !== undefined ? `, got '${filtered[2]}'` : ""}`)
+            process.exit(1)
+          }
           return { type: "tab_switch", tabId: parseInt(filtered[2]) }
         default:
           console.error("error: unknown tab subcommand. Use: new, close, switch")
