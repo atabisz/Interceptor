@@ -316,7 +316,7 @@ The legacy individual commands (`interceptor tab new`, `interceptor tree`, `inte
 
 **Element Refs** — `interceptor tree` returns elements with refs like `e1`, `e5`, `e23`. Use these to click, type, hover. Refs survive between commands until the DOM changes.
 
-**Interceptor Group** — Every `interceptor tab new` adds tabs to a cyan "interceptor" group. Commands only work on tabs in this group. Your personal tabs are never touched. Use `--any-tab` to override.
+**Interceptor Group** — Every `interceptor tab new` adds tabs to a cyan "interceptor" group. Commands only work on tabs in this group. Your personal tabs are never touched. Use `--any-tab` to override. `tab close <id>` and `tab switch <id>` act on exactly the id you pass — the group check validates that same tab, and an explicit id takes precedence over `--tab`. Ids must be numeric; a malformed id is a CLI error rather than a silent fallback to the active tab.
 
 **Focus Model (Background-First Contract)** — Interceptor never steals focus from the tab you're working in. `interceptor open <url>` and `interceptor tab new <url>` create their tabs in the **background** by default — the tab you had active stays active. Only four browser verbs intentionally move focus: `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>`. The reuse path preserves the reused tab's existing focus state; add `--activate` to bring it forward. All other operations (`click`, `type`, `read`, `screenshot`, `net`, `scene`, `monitor`, etc.) work against the target tab without touching whichever tab you're looking at. This mirrors the macOS surface's same background-first contract — see `AGENTS.md` "Background First (Browser + macOS)" for the full inventory.
 
@@ -414,9 +414,9 @@ interceptor wait-stable                      # Wait for DOM to stop changing
 ```bash
 interceptor tabs                             # List all tabs (* = active)
 interceptor tab new "https://example.com"    # Open new tab
-interceptor tab switch 12345                 # Switch to tab by ID
-interceptor tab close                        # Close current tab
-interceptor tab close 12345                  # Close specific tab
+interceptor tab switch 12345                 # Switch to tab by ID (acts on that exact id)
+interceptor tab close                        # Close the auto-target tab
+interceptor tab close 12345                  # Close specific tab (acts on that exact id)
 interceptor window new "https://example.com" # New window
 interceptor window list                      # List all windows
 interceptor window focus 123                 # Focus a window (explicit focus move)
@@ -599,8 +599,8 @@ interceptor capabilities                     # Check available input layers
 | Flag | Effect |
 |------|--------|
 | `--json` | JSON output instead of plain text |
-| `--tab <id>` | Target specific tab by ID |
-| `--any-tab` | Operate outside the interceptor group |
+| `--tab <id>` | Target specific tab by ID. When an action names its own tab (`tab close <id>`, `tab switch <id>`), the explicit id wins over `--tab`. |
+| `--any-tab` | Operate outside the interceptor group (also required to `tab close <id>` / `tab switch <id>` an unmanaged tab) |
 | `--context <id>` | Route command to a specific browser context (profile). See `interceptor contexts`. Omitting this flag succeeds only when exactly one context is connected; the daemon errors when zero or multiple contexts are present. |
 | `--os` | FALLBACK: use OS-level CGEvent (macOS) when synthetic input is observed to fail. Default to synthetic — the pre-load `userActivation` override + `__interceptor_trust` event marker satisfy most `isTrusted` checks. |
 | `--frame <id>` | Target specific iframe |
