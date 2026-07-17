@@ -41,6 +41,8 @@ import AVFoundation
 
 final class MonitorDomain: DomainHandler, @unchecked Sendable {
     private let lock = NSLock()
+    // the accessibility preflight routes through the transport.
+    private let axTransport: any AXTransport = LiveAXTransport()
     // Phase 5 — concurrent multi-session map. Each runtime owns its own AX /
     // workspace / input / tap bridges plus optional source state.
     var runtimes: [String: MonitorRuntime] = [:]
@@ -64,7 +66,7 @@ final class MonitorDomain: DomainHandler, @unchecked Sendable {
 
     private func startSession(_ action: [String: Any], completion: @escaping @Sendable ([String: Any]) -> Void) {
         // Accessibility preflight (shared across sessions).
-        let axTrusted = AXIsProcessTrusted()
+        let axTrusted = axTransport.isProcessTrusted()
         if !axTrusted {
             var err = WireFormat.error("missing_tcc:Accessibility")
             err["remediation"] = "interceptor macos trust --accessibility-prompt"

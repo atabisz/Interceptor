@@ -229,6 +229,11 @@ export function parseMacosCommand(filtered: string[], extensionPrefixes?: Set<st
         pid: flagInt(filtered, "--pid"),
         filter: flagVal(filtered, "--filter") || "interactive",
         depth: flagInt(filtered, "--depth") || 10,
+        // help advertises `--max-chars`; forward it (was dropped).
+        maxChars: flagInt(filtered, "--max-chars") || 50000,
+        // traversal bounds (bridge clamps to the safety hard caps; omit ⇒ defaults).
+        maxNodes: flagInt(filtered, "--max-nodes"),
+        maxMs: flagInt(filtered, "--max-ms"),
       }
 
     case "find": {
@@ -238,7 +243,10 @@ export function parseMacosCommand(filtered: string[], extensionPrefixes?: Set<st
         type: "macos_find",
         query,
         app: flagVal(filtered, "--app"),
+        pid: flagInt(filtered, "--pid"),          // was dropped
         role: flagVal(filtered, "--role"),
+        maxNodes: flagInt(filtered, "--max-nodes"),
+        maxMs: flagInt(filtered, "--max-ms"),
       }
     }
 
@@ -268,10 +276,10 @@ export function parseMacosCommand(filtered: string[], extensionPrefixes?: Set<st
     }
 
     case "focused":
-      return { type: "macos_focused", app: flagVal(filtered, "--app") }
+      return { type: "macos_focused", app: flagVal(filtered, "--app"), pid: flagInt(filtered, "--pid") }
 
     case "windows":
-      return { type: "macos_windows", app: flagVal(filtered, "--app") }
+      return { type: "macos_windows", app: flagVal(filtered, "--app"), pid: flagInt(filtered, "--pid") }
 
     // ── Text ──
     case "text": {

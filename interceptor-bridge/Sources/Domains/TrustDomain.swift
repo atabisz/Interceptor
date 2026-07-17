@@ -46,6 +46,9 @@ struct Permission {
 
 final class TrustDomain: DomainHandler, @unchecked Sendable {
     private let microphoneProvider: MicrophoneAuthorizationProvider
+    // AXIsProcessTrusted[/WithOptions] route through the
+    // transport (the one Accessibility C-call surface).
+    private let transport: any AXTransport = LiveAXTransport()
 
     init(microphoneProvider: MicrophoneAuthorizationProvider = LiveMicrophoneAuthorizationProvider()) {
         self.microphoneProvider = microphoneProvider
@@ -206,9 +209,9 @@ final class TrustDomain: DomainHandler, @unchecked Sendable {
         if prompt {
             let key = "AXTrustedCheckOptionPrompt" as CFString
             let options = [key: true] as CFDictionary
-            trusted = AXIsProcessTrustedWithOptions(options)
+            trusted = transport.isProcessTrustedWithOptions(options)
         } else {
-            trusted = AXIsProcessTrusted()
+            trusted = transport.isProcessTrusted()
         }
         return PermissionStatus.fromBool(trusted)
     }

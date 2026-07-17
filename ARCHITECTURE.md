@@ -263,6 +263,16 @@ The Router collapses an action `type` like `macos_nlp` into `command="nlp"` for 
 
 For screenshot saving, `interceptor-bridge/Sources/Domains/CaptureDomain.swift` no longer relies on `FileManager.default.currentDirectoryPath` when running under `launchd`. The CLI passes its working directory (`cli/commands/macos.ts`), and the bridge falls back through Downloads, home, then temp so `interceptor macos screenshot --save` works cleanly under LaunchAgent execution.
 
+#### AX transport seam, typed codec, and traversal budget
+
+Every Accessibility C call in the bridge routes through one injectable seam, `AXTransport` ([`interceptor-bridge/Sources/AXTransport.swift`](interceptor-bridge/Sources/AXTransport.swift)). `LiveAXTransport` is the only production implementation that imports `ApplicationServices`; a fake implementation drives the same surface in unit tests, so messaging timeouts, malformed values, and per-slot errors are testable without a live app. Nine domains route through it (`AccessibilityDomain`, `TextDomain`, `MenuDomain`, `InputDomain`, `MonitorAxBridge`, `MonitorInputBridge`, `MonitorDomain`, `DisplayDomain`, `TrustDomain`) — no domain calls an AX C function directly.
+
+Values decode through one non-trapping typed codec, `AXValueCodec`, which checks the CF type ID, then `AXValueGetType`, then the typed extraction result before touching a value. Failed extraction becomes a typed `decode_failed` instead of a trap, and the previous force casts (`as! AXValue`, `as! AXUIElement`, `unsafeBitCast`) are removed. Output is acyclic and JSON-safe: elements become ref tokens (never nested handles), integers outside the JS safe-integer range become decimal strings, and non-finite numbers never leak into JSON.
+
+Secure classification is centralized in `AXSecureRedaction`: a value from an `AXSecureTextField` is redacted to a fixed placeholder before serialization, logging, and error construction, and no flag can override it.
+
+`tree` and `find` walk under a per-command budget (`AXBudget`): a wall-clock deadline plus node and AX-call caps, checked cooperatively between calls, with a per-element messaging timeout as the in-flight bound for a single synchronous call. A large or slow tree returns a bounded partial ending in a `… (stopped: <reason>)` marker instead of running to the CLI timeout; callers tune it with `--max-nodes` / `--max-ms`, and the bridge clamps to safety hard caps.
+
 ### CDP app control — Electron / Chromium desktop apps
 
 A third control surface (after browser and macOS bridge): drive the *web content

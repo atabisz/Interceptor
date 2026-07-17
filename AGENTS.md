@@ -88,8 +88,10 @@ Deep mechanic notes (the `userActivation` override + `__interceptor_trust` marke
 - Rich editor exposes no usable DOM refs → `scene profile`.
 - Action did nothing → `inspect` before retrying.
 - Network behavior unclear → `inspect --net-only` or `net log --filter <term>`.
+- AX tree came back truncated with a trailing `… (stopped: …)` line → that is the traversal budget, not an error. Widen with `interceptor macos tree --max-nodes N` / `--max-ms N`, or scope tighter with `--app` / `--depth`. Large trees (e.g. Finder with the desktop) intentionally return a bounded partial instead of hanging.
+- `interceptor macos text` on a password / secure field returns `•••` → secure fields are always redacted. That is correct behavior; do not retry expecting the value.
 - Native control failed → `interceptor macos trust` to check permissions.
-- Interceptor itself unavailable → see install routes in repository scripts.
+- `interceptor macos *` hangs or returns stale results → confirm exactly one bridge owns `/tmp/interceptor-bridge.sock`; a leftover duplicate install can shadow the current one. Otherwise see install routes in repository scripts.
 
 ## Repository Maintenance
 
