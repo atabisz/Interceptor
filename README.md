@@ -838,12 +838,17 @@ The Swift bridge exposes 28 domains. The five **daily-driver domains** are surfa
 
 Refs (`e1`, `e2`, ...) work the same as browser refs. AXObserver auto-invalidates when the tree changes.
 
+**Bounded by construction.** `tree` and `find` walk under a per-command budget (node cap + wall-clock deadline). A large or slow app returns a **partial result** ending in a `… (stopped: <reason>)` marker rather than hanging — widen with `--max-nodes` / `--max-ms`, or scope with `--app` / `--depth`. **Secure fields are never emitted:** `interceptor macos text` on a password field (`AXSecureTextField`) returns `•••`, never the contents.
+
 ```bash
 interceptor macos tree                           # AX tree for frontmost app
 interceptor macos tree --app "Finder"            # Specific app
 interceptor macos tree --filter interactive      # Only actionable elements (default)
 interceptor macos tree --depth 5                 # Limit depth
+interceptor macos tree --app Finder --max-nodes 500   # Bound nodes visited (partial + stop marker)
+interceptor macos tree --app Finder --max-ms 3000     # Bound wall-clock time
 interceptor macos find "Save" --role button      # Find elements by name/role
+interceptor macos find "Save" --pid 1234         # --pid targets find/focused/windows too
 interceptor macos inspect e5                     # All attributes + actions for ref
 interceptor macos value e5                       # Read element value
 interceptor macos value e5 "new text"            # Set element value
