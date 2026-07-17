@@ -1699,6 +1699,10 @@ async function handleCanvasActions(action, tabId) {
 function activeTabKey(group) {
   return group ? `activeTabId:${group}` : "activeTabId";
 }
+function sessionArea3() {
+  const storage = chrome.storage;
+  return storage.session ?? chrome.storage.local;
+}
 async function handleTabActions(action, tabId) {
   switch (action.type) {
     case "tab_create": {
@@ -1722,7 +1726,7 @@ async function handleTabActions(action, tabId) {
                   updateProps.active = true;
                 const updated = await chrome.tabs.update(candidate.id, updateProps);
                 await waitForTabLoad(candidate.id);
-                await chrome.storage.session.set({ [activeTabKey(group)]: candidate.id });
+                await sessionArea3().set({ [activeTabKey(group)]: candidate.id });
                 return {
                   success: true,
                   data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, group, reused: true }
@@ -1736,7 +1740,7 @@ async function handleTabActions(action, tabId) {
       const newTab = await chrome.tabs.create({ url: targetUrl, active: shouldActivate });
       if (newTab.id) {
         const groupId = group ? await addTabToNamedGroup(newTab.id, group, action.groupColor) : await addTabToInterceptorGroup(newTab.id);
-        await chrome.storage.session.set({ [activeTabKey(group)]: newTab.id });
+        await sessionArea3().set({ [activeTabKey(group)]: newTab.id });
         return { success: true, data: { tabId: newTab.id, url: newTab.url, groupId, group, reused: false } };
       }
       return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } };
@@ -1745,16 +1749,15 @@ async function handleTabActions(action, tabId) {
       const closedId = action.tabId || tabId;
       await chrome.tabs.remove(closedId);
       const keys = ["activeTabId", typeof action.group === "string" ? activeTabKey(action.group) : null].filter((k) => !!k);
-      const stored = await chrome.storage.session.get(keys);
+      const stored = await sessionArea3().get(keys);
       for (const key of keys) {
         if (stored[key] === closedId)
-          await chrome.storage.session.remove(key);
+          await sessionArea3().remove(key);
       }
       return { success: true };
     }
     case "tab_switch": {
       await chrome.tabs.update(action.tabId, { active: true });
-      await chrome.storage.session.set({ activeTabId: action.tabId });
       return { success: true };
     }
     case "tab_list": {
@@ -4352,6 +4355,13 @@ function needsTab(type) {
   return !NO_TAB_ACTIONS.has(type);
 }
 
+// extension/src/background/resolve-tab.ts
+function resolveWorkingTabId(msgTabId, actionTabId) {
+  if (typeof actionTabId === "number" && !Number.isNaN(actionTabId))
+    return actionTabId;
+  return msgTabId;
+}
+
 // extension/src/background/message-dispatch.ts
 var MESSAGE_QUEUE_CAP = 50;
 var messageQueue = [];
@@ -4420,7 +4430,7 @@ async function handleDaemonMessage(msg) {
     viaWs: respondViaWs
   });
   const action = msg.action;
-  let tabId = msg.tabId;
+  let tabId = resolveWorkingTabId(msg.tabId, action.tabId);
   const fail = (error) => {
     clearTimeout(requestTimer);
     pendingRequests.delete(msg.id);
@@ -4457,8 +4467,6 @@ async function handleDaemonMessage(msg) {
   if (!tabId && needsTab(action.type)) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = activeTab?.id;
-    if (tabId)
-      setActiveTabId(tabId);
   }
   if (!tabId && needsTab(action.type)) {
     fail("no active tab");
