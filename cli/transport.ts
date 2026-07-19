@@ -3,6 +3,8 @@
  */
 
 import { IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/platform"
+import { IOS_SVC_ACTION_TYPES } from "../shared/ios-service"
+import { IOS_DEV_ACTION_TYPES } from "../shared/ios-dev"
 
 export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT || "15000")
 
@@ -36,6 +38,31 @@ const ACTION_TIMEOUT_OVERRIDES_MS: Record<string, number> = {
   ios_refresh: 600_000,
   ios_enable: 120_000,
   ios_install: 240_000,
+  // iOS web lane: cold target discovery can take up to ~15s and attach
+  // ~10s per spec; give raw calls/eval room for slow expressions.
+  ios_web_targets: 20_000,
+  ios_web_attach: 20_000,
+  ios_web_read: 20_000,
+  ios_web_eval: 30_000,
+  ios_web_call: 30_000,
+  ios_web_screenshot: 60_000,
+  // iOS device-service lane: diagnostics/filesystem/backup pulls can be
+  // large; give them headroom over the 15s default.
+  ios_diag: 30_000,
+  ios_fs: 60_000,
+  ios_crash: 60_000,
+  ios_profiles: 20_000,
+  ios_springboard: 30_000,
+  // iOS Instruments/DTX + telemetry lanes: the first call opens the
+  // RemoteXPC tunnel (~1-3s) + a DTX channel; screenshot/backup can be large.
+  ios_proc: 30_000,
+  ios_apps: 30_000,
+  ios_spawn: 30_000,
+  ios_kill: 30_000,
+  ios_location: 30_000,
+  ios_shot: 30_000,
+  ios_backup: 30_000,
+  ios_axtree: 30_000,
   screenshot: 45_000,
   binary_sink_save: 600_000,
   screenshot_background: 45_000,
@@ -58,6 +85,12 @@ function timeoutMessage(actionType: string, ms: number): string {
   const seconds = Math.round(ms / 1000)
   if (actionType.startsWith("macos_")) {
     return `timeout: no response for '${actionType}' after ${seconds}s. The macOS bridge may be waiting on a TCC permission prompt (Microphone / Speech Recognition for listen/vad, Screen Recording for screenshot/capture/vision). Check System Settings → Privacy & Security.`
+  }
+  if (IOS_SVC_ACTION_TYPES.has(actionType)) {
+    return `timeout: no response for '${actionType}' after ${seconds}s. The classic-Lockdown service didn't reply in time — a large fs/crash pull can exceed this; confirm the device is unlocked and 'interceptor ios status' shows it connected.`
+  }
+  if (IOS_DEV_ACTION_TYPES.has(actionType)) {
+    return `timeout: no response for '${actionType}' after ${seconds}s. The Instruments/telemetry lane opens a RemoteXPC tunnel + DTX channel — confirm the device is unlocked and paired; a busy developer service can be retried.`
   }
   if (actionType.startsWith("ios_")) {
     return `timeout: no response for '${actionType}' after ${seconds}s. The InterceptorRunner may be busy with a slow XCUITest snapshot or a non-quiescing app; confirm the device is unlocked and 'interceptor ios status' shows it connected.`

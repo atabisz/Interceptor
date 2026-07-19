@@ -39,7 +39,7 @@ Interceptor gives agents human-style control of the tools you already use — **
 
 - **Interceptor Browser** — runs as a Chrome extension inside your actual browser. Your cookies, sessions, logins, and tabs stay intact. Read pages, click, type, navigate, observe network traffic, automate rich editors, record-and-replay user flows.
 - **Interceptor macOS** — runs as a Swift bridge daemon. Drives native macOS apps the same way: structured accessibility trees, OS-level trusted input, on-device vision/speech/NLP, system-wide event monitoring.
-- **Interceptor iOS** *(new)* — drives any installed app on an owned, unlocked, Developer-Mode iPhone via an on-device XCUITest runner that dials into the daemon over WiFi. Ref-tagged element trees, deterministic coordinate taps, reliable text entry, screenshots, and app lifecycle — addressed as `--on <phone>` / `ios:<udid>`. See `interceptor ios help`.
+- **Interceptor iOS** — drives any installed app on an owned, unlocked, Developer-Mode iPhone via an on-device XCUITest runner that dials into the daemon over WiFi: ref-tagged element trees, deterministic coordinate taps, reliable text entry, screenshots, and app lifecycle. Plus runner-free **Instruments/telemetry** (`ios proc / top / spawn / kill / location / gpu / shot`), an **on-device JS brain** (`ios eval` — a whole observe→decide→act loop runs on the phone in one round-trip), **WebKit inspection** (`ios web`), and classic-Lockdown **device services** (`ios logs / diag / fs / crash / profiles`). Addressed as `--on <phone>` / `ios:<udid>`. See `interceptor ios help`.
 
 The agent calls `interceptor` CLI commands, reads the output, and decides what to do next. No MCP required. No API keys required.
 
@@ -159,6 +159,7 @@ Interceptor ships one CLI binary with two product surfaces. Pick by what you're 
 | Record & replay a human's native-app flow | macOS | `interceptor macos monitor *` |
 | Drive Apple Events to background apps without raising them | macOS | `interceptor macos intent dispatch` |
 | Drive any app on an owned, unlocked iPhone (tree/tap/type/screenshot/app lifecycle) | iOS | `interceptor ios tree / find / click / type / screenshot / app *` |
+| Runner-free iPhone process/telemetry, launch/kill, GPS simulation; on-device JS brain; WebKit inspection | iOS | `interceptor ios proc / top / spawn / kill / location / eval`, `ios web *` |
 
 If the task is content **inside** a browser tab, use Browser. If the task is the **shell** the browser runs inside (or any other macOS app), use macOS. If the task is an app on your **iPhone**, use iOS.
 

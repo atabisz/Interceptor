@@ -362,6 +362,27 @@ carries an **unsigned** runner and **no** signing material — signing is delega
 at runtime to the user's Apple ID (no-Xcode path) or the operator's Xcode config
 (`scripts/audit-capability-blind.sh` check #4). See `docs/ios/app-route.md`.
 
+**Beyond the runner — sibling lanes on the same `ios:<udid>` context.** These route
+*before* the runner fallback (their action sets in `shared/ios-dev.ts` /
+`shared/ios-service.ts` / `shared/ios-web.ts` are tested first), so they never wake
+the XCUITest runner and work even while it's idle. All are pure-Bun and add no
+runtime dependencies; NSKeyedArchiver replies decode through `daemon/ios/nskeyed.ts`.
+
+- **Instruments / DTX + telemetry** (`daemon/ios/instruments.ts`, `dev-manager.ts`,
+  `tunnel-pool.ts`): a direct `com.apple.instruments.dtservicehub` RSD service over
+  the shared tunnel — live process list, per-process CPU (sysmontap), launch/kill
+  (processcontrol), GPS simulation, GPU sampling, and a runner-free screenshot.
+  `interceptor ios proc / top / spawn / kill / location / gpu / shot / backup / axtree`.
+- **On-device JS brain** (`ios eval`): pushes a JS program into the runner's
+  `JSContext` with an `Interceptor` global (`tree / tap / type / sleep / log /
+  foreground`), so an observe→decide→act loop runs on the device in one round-trip.
+- **Classic-Lockdown device services** (`daemon/ios/service-*.ts`): diagnostics,
+  syslog, AFC files, crash reports, profiles, Darwin notifications, SpringBoard —
+  `interceptor ios logs / diag / fs / crash / profiles / notify / springboard`.
+- **WebKit inspection** (`daemon/ios/webinspector-*.ts`, `web-manager.ts`): the
+  WebInspector protocol over RemoteXPC to read/drive Safari & WKWebView content —
+  `interceptor ios web *`.
+
 ### Native Agent — CDP-depth inside native apps
 
 The fourth surface. Where the macOS bridge sees the *outside* of a native app
