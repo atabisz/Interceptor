@@ -10,6 +10,15 @@
  */
 
 import { sendCommand, type DaemonResponse, type DaemonResult } from "../transport"
+import { runIosWebCommand } from "./ios-web"
+import { runIosSvcCommand } from "./ios-svc"
+import { runIosDevCommand } from "./ios-dev"
+
+/** Device-service introspection subcommands, delegated to ios-svc.ts. */
+const IOS_SVC_SUBCOMMANDS = new Set(["diag", "logs", "fs", "crash", "profiles", "notify", "springboard"])
+
+/** Instruments / telemetry / developer-service subcommands, delegated to ios-dev.ts. */
+const IOS_DEV_SUBCOMMANDS = new Set(["proc", "ps", "top", "spawn", "kill", "location", "gpu", "shot", "backup", "screen", "axtree"])
 
 type Action = { type: string; [key: string]: unknown }
 
@@ -112,6 +121,7 @@ Drive a phone (add --on <name>, or it uses your only phone):
   screenshot                                 capture the screen
   apps                                       installed apps
   app     launch|activate|terminate <id>     app lifecycle
+  eval    "<js>" | --file <f.js>              run a JS program in the on-device brain (Interceptor.tree/tap/type/sleep/log/foreground)
 
 Connection model (how the runner reaches the phone):
   • The phone runs an on-device XCUITest runner (InterceptorRunner) that DIALS IN
@@ -127,6 +137,35 @@ Connection model (how the runner reaches the phone):
   • If a verb hangs or times out: confirm the phone is unlocked, on the same
     network, and reachable — 'interceptor ios status' shows the live context and
     'xcrun devicectl list devices' shows whether macOS sees it as "available".
+
+Troubleshooting — when things aren't working, try these IN ORDER:
+  1. "device not found" / "not visible to usbmuxd" — the phone dropped off the
+     Mac's device bus. Most common right after a device REBOOT: the whole tunnel
+     rides usbmuxd, and its WiFi route is cleared on reboot even though
+     'xcrun devicectl list devices' still shows the phone "available".
+       → Plug the iPhone in by USB for ~10s (then you may unplug — WiFi resumes).
+         This re-seeds usbmuxd instantly. Or restart it:
+         'sudo launchctl kickstart -k system/com.apple.usbmuxd'.
+  2. "Before First Unlock" — after a reboot, developer services stay locked until
+     you enter the PASSCODE once (Face ID alone won't leave this state). Unlock
+     with the passcode, then retry.
+  2b. Runner verbs time out with 'timeout requesting channel …XCTestManager_IDEInterface'
+     but Instruments (proc/top/shot) works — the FIRST XCUITest launch after a
+     reboot pops an on-device dialog: "Enter iPhone Passcode for XCTest — Enable
+     UI Automation". iOS gates the runner until you enter your passcode on it.
+     Approve it, then restart the daemon (so it drops the stale testmanagerd
+     session) and retry a verb.
+  3. Verbs time out / Instruments (proc, top, shot) return nothing — the Developer
+     Disk Image unmounts every boot. Re-mount it:
+       'xcrun devicectl device info details --device <udid>'   (brings back
+       testmanagerd/Instruments), then retry.
+  4. Runner drops mid-sequence ('ios runner disconnected') — the runner dials in
+     per session and iOS suspends its socket when it backgrounds to drive another
+     app. Keep the phone UNLOCKED with Auto-Lock = Never (Settings › Display &
+     Brightness › Auto-Lock), and run multi-step flows as a tight burst (don't let
+     it idle between verbs). The next verb re-launches it automatically.
+  5. Still stuck — capture detail with 'DEBUG_IOS=1 DBG=1' in the daemon env, and
+     check 'interceptor ios status' (tunnel/connection) + 'interceptor ios devices'.
 
 Phones connect automatically — no enable, no cable required once paired over WiFi.
 Drives UI only: can't pass Face ID/passcode/Apple Pay or unlock the phone.`
@@ -149,6 +188,17 @@ export async function runIosCommand(
     console.log(Array.isArray(list) && list.length > 0 ? FULL_HELP : SETUP_HELP)
     return
   }
+
+  // ios web … — the WebKit-inspection lane. Delegated wholesale.
+  if (sub === "web") { await runIosWebCommand(filtered, { jsonMode, contextId }); return }
+
+  // ios diag|logs|fs|crash|profiles|notify|springboard — device-service
+  // introspection lane. Runner-free classic Lockdown.
+  if (sub && IOS_SVC_SUBCOMMANDS.has(sub)) { await runIosSvcCommand(filtered, { jsonMode, contextId }); return }
+
+  // ios proc|top|spawn|kill|location|gpu|shot|backup|screen|axtree —
+  // Instruments/DTX + telemetry + developer-service lanes. Runner-free.
+  if (sub && IOS_DEV_SUBCOMMANDS.has(sub)) { await runIosDevCommand(filtered, { jsonMode, contextId }); return }
 
   // device ref for setup commands = first non-flag positional after the subcommand
   const deviceRef = args[2] && !args[2].startsWith("--") ? args[2] : undefined
@@ -242,6 +292,17 @@ export async function runIosCommand(
     case "fgdebug":
       emitExit(await send({ type: "ios_fgdebug" }, contextId), jsonMode)
       return
+
+    case "eval": {
+      // Lane D — the on-device JSCore brain. The script runs inside the runner's
+      // JSContext with an `Interceptor` global (tree/tap/type/sleep/log/foreground),
+      // so a whole observe→decide→act loop executes on the phone in one round-trip.
+      const file = flagValue(args, "--file")
+      const script = file ? await Bun.file(file).text() : (args[2] && !args[2].startsWith("--") ? args[2] : undefined)
+      if (!script) { console.error('error: ios eval requires a script, e.g. ios eval "Interceptor.tap(200,400); Interceptor.log(Interceptor.foreground())"  (or --file loop.js)'); process.exit(1) }
+      emitExit(await send({ type: "ios_eval", script }, contextId), jsonMode)
+      return
+    }
 
     case "tree":
       emitExit(await send({

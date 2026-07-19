@@ -256,6 +256,16 @@ export class IosManager {
           return ctx.channel instanceof RunnerChannel
             ? { success: true, data: await ctx.channel.rawOp("fgdebug") }
             : { success: false, error: "fgdebug is runner-only" }
+        case "ios_eval": {
+          // Lane D: push a JavaScript program onto the device and run it inside the
+          // runner's JSContext, where an `Interceptor` global (tree/tap/type/sleep/
+          // log/foreground) drives the foreground app. The agent's inner loop runs
+          // ON the phone — one round-trip instead of one per action.
+          if (!(ctx.channel instanceof RunnerChannel)) return { success: false, error: "eval is runner-only" }
+          const script = typeof action.script === "string" ? action.script : ""
+          if (!script.trim()) return { success: false, error: "ios eval requires a script (a JS program string)" }
+          return { success: true, data: await ctx.channel.rawOp("eval", { script }) }
+        }
         default: return { success: false, error: `unknown ios verb: ${action.type}` }
       }
     } catch (err) {

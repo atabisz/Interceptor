@@ -37,6 +37,7 @@ export const IOS_RUNNER_OPS = {
   keys: "keys",
   press: "press",
   app: "app",
+  eval: "eval",
 } as const
 export type IosRunnerOp = (typeof IOS_RUNNER_OPS)[keyof typeof IOS_RUNNER_OPS]
 
@@ -72,7 +73,7 @@ export const IOS_ACTION_TYPES = new Set<string>([
 export const IOS_VERB_TYPES = new Set<string>([
   "ios_tree", "ios_find", "ios_inspect", "ios_click", "ios_type", "ios_keys",
   "ios_scroll", "ios_drag", "ios_press", "ios_screenshot", "ios_apps", "ios_app",
-  "ios_fgdebug",
+  "ios_fgdebug", "ios_eval",
 ])
 
 /**

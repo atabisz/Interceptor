@@ -35,6 +35,35 @@ phone is set up. Phones auto-connect on the first drive verb.
 | `interceptor ios apps` | Installed apps on the phone (bundle id, name, version). |
 | `interceptor ios app launch\|activate\|terminate <bundleId>` | App lifecycle by bundle id (e.g. `com.apple.Preferences`). |
 
+## Runner-free lanes (Instruments / DTX / telemetry)
+
+These reach the device over the RemoteXPC tunnel **without** the XCUITest runner, so
+they work even when the runner is idle or asleep. Routed before the runner fallback.
+
+| Command | What it does |
+|---|---|
+| `interceptor ios proc` | Live process list (Instruments deviceinfo). |
+| `interceptor ios top [--follow]` | Per-process CPU/mem + per-core load (sysmontap). First real sample lands ~1.2 s in. |
+| `interceptor ios gpu [--follow]` | FPS / GPU sampling (graphics.opengl). |
+| `interceptor ios spawn <bundle> [--env K=V ...] [--arg X ...]` | Launch an app with env/args (processcontrol) → returns pid. |
+| `interceptor ios kill <pid>` | Kill a process by pid. |
+| `interceptor ios location set <lat> <lon>` / `location clear` | Simulate / clear the device GPS fix. |
+| `interceptor ios shot [<out.png>]` | One-shot screenshot via Instruments (runner-free; falls back to the runner). |
+| `interceptor ios backup` | mobilebackup2 handshake + protocol info. |
+| `interceptor ios screen [--out <dir>] [--seconds N] [--fps F]` | Live screen frames (via the runner). |
+| `interceptor ios axtree` | Runner-free accessibility probe (axAuditDaemon). |
+
+## On-device JS brain
+
+| Command | What it does |
+|---|---|
+| `interceptor ios eval "<js>" \| --file <f.js>` | Run a JS program inside the runner's JSContext. An `Interceptor` global bridges to the device: `tree()`, `tap(x,y)`, `type(text)`, `sleep(ms)`, `log(msg)`, `foreground()`. A whole observe→decide→act loop runs on the phone in **one round-trip**. `tree()` nodes carry `{label, type, rect:{x,y,width,height}, children[]}`; a `rect` center is directly tappable. |
+
+## Other lanes
+
+- `interceptor ios web <targets\|attach\|read\|text\|find\|eval\|call\|console\|network\|...>` — inspect/drive Safari & WKWebView content (WebInspector). `interceptor ios web --help`.
+- `interceptor ios <logs\|diag\|fs\|crash\|profiles\|notify\|springboard>` — runner-free classic-Lockdown device services (diagnostics, syslog, AFC files, crash reports, profiles, Darwin notifications, SpringBoard). `interceptor ios <sub> --help`.
+
 ## Addressing
 
 - `--on <alias>` — the friendly name set with `interceptor ios name`.
@@ -49,4 +78,5 @@ phone is set up. Phones auto-connect on the first drive verb.
 - **Unlocked + foreground.** A locked phone refuses app launches. The runner drops on
   idle and re-dials per verb, so chain a `launch` and its follow-up verbs closely.
 - **UI only.** Cannot pass Face ID / passcode / Apple Pay or unlock the phone.
+- **After a device reboot.** The phone drops off usbmux (its Wi‑Fi route is cleared even though `xcrun devicectl list devices` still lists it) → a brief USB cable touch reseeds it. The first runner launch also pops an on-device *"Enter iPhone Passcode for XCTest — Enable UI Automation"* dialog; approve it, then a daemon restart clears the stale testmanagerd session. Runner-free lanes (`proc`/`shot`) keep working through all of this.
 - Add `--json` to any command for machine-readable output.

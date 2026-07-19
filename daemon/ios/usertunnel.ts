@@ -90,7 +90,7 @@ type Conn = {
   sport: number; dport: number; seq: number; ack: number
   established: boolean; onData: (b: Buffer) => void; onEstablished: () => void; onClose: () => void
 }
-class Tun {
+export class Tun {
   private conns = new Map<number, Conn>()
   private racc = Buffer.alloc(0)
   constructor(private cdp: net.Socket, private myIp: Buffer, private devIp: Buffer) {
@@ -160,7 +160,7 @@ class Tun {
     })
   }
 }
-type TcpChan = { write: (b: Buffer) => void; onData: (cb: (b: Buffer) => void) => void; onClose: (cb: () => void) => void; close: () => void }
+export type TcpChan = { write: (b: Buffer) => void; onData: (cb: (b: Buffer) => void) => void; onClose: (cb: () => void) => void; close: () => void }
 
 // ── XPC wire codec (from rsd.ts, matches go-ios xpc/encoding.go) ──────────────
 const WRAPPER_MAGIC = 0x29b00b92, OBJ_MAGIC = 0x42133742, OBJ_VERSION = 5
@@ -270,7 +270,7 @@ const ROOT = 1, REPLY = 3
 // A RemoteXPC "service" connection over one TCP chan: 2 H2 streams (1=cs, 3=sc),
 // the per-service init handshake, then send()/receive() XPC dicts. Mirrors
 // go-ios ios/http + ios/xpc CreateXpcConnection/initializeXpcConnection.
-class XpcService {
+export class XpcService {
   private inbound = Buffer.alloc(0)
   private csBuf = Buffer.alloc(0)   // stream 1 XPC bytes
   private scBuf = Buffer.alloc(0)   // stream 3 XPC bytes
@@ -414,7 +414,7 @@ function encodeDtx(identifier: number, conversationIndex: number, channelCode: n
   }
   return msg
 }
-type DtxMsg = {
+export type DtxMsg = {
   fragments: number; fragmentIndex: number; messageLength: number
   identifier: number; conversationIndex: number; channelCode: number; expectsReply: boolean
   msgType: number; auxLen: number; totalPayloadLen: number
@@ -433,6 +433,13 @@ function decodeDtx(buf: Buffer): { msg: DtxMsg; consumed: number } | null {
   }
   const total = 32 + messageLength
   if (buf.length < total) return null
+  // Mid/last fragment of a multi-fragment message: the bytes after the 32-byte
+  // routing header are a RAW payload chunk — there is NO per-fragment payload
+  // header (only the reassembled whole has one). Hand back the chunk as
+  // payloadRaw; handle() concatenates chunks then parses the real header.
+  if (fragments > 1 && fragmentIndex > 0) {
+    return { msg: { fragments, fragmentIndex, messageLength, identifier, conversationIndex, channelCode, expectsReply, msgType: -1, auxLen: 0, totalPayloadLen: 0, aux: Buffer.alloc(0), payloadRaw: Buffer.from(buf.subarray(32, total)) }, consumed: total }
+  }
   const msgType = buf.readUInt32LE(32)
   const auxLen = buf.readUInt32LE(36)          // includes 16-byte aux header when >0
   const totalPayloadLen = buf.readUInt32LE(40)
@@ -443,8 +450,23 @@ function decodeDtx(buf: Buffer): { msg: DtxMsg; consumed: number } | null {
   if (payLen > 0) payloadRaw = Buffer.from(buf.subarray(payStart, payStart + payLen))
   return { msg: { fragments, fragmentIndex, messageLength, identifier, conversationIndex, channelCode, expectsReply, msgType, auxLen, totalPayloadLen, aux, payloadRaw }, consumed: total }
 }
+// Reassemble a fragmented DTX message: `full` is the concatenated payload chunks
+// (fragments 1..N-1), which begins with the 16-byte DTXMessagePayloadHeader. Mirrors
+// decodeDtx's non-fragmented payload slicing but relative to the payload start.
+function reassembleDtxPayload(full: Buffer, routing: DtxMsg): DtxMsg {
+  const msgType = full.readUInt32LE(0)
+  const auxLen = full.readUInt32LE(4)          // includes 16-byte aux header when >0
+  const totalPayloadLen = full.readUInt32LE(8)
+  let aux = Buffer.alloc(0), payloadRaw = Buffer.alloc(0)
+  if (auxLen > 0) aux = Buffer.from(full.subarray(32, 16 + auxLen))
+  const payStart = auxLen > 0 ? 16 + auxLen : 16
+  const payLen = totalPayloadLen - auxLen
+  if (payLen > 0) payloadRaw = Buffer.from(full.subarray(payStart, payStart + payLen))
+  return { ...routing, msgType, auxLen, totalPayloadLen, aux, payloadRaw }
+}
+
 // parse aux primitive dict -> ordered list of {type, value}
-function parseAux(aux: Buffer): Array<{ type: number; value: Buffer | number }> {
+export function parseAux(aux: Buffer): Array<{ type: number; value: Buffer | number }> {
   const out: Array<{ type: number; value: Buffer | number }> = []
   let o = 0
   while (o + 4 <= aux.length) {
@@ -459,13 +481,13 @@ function parseAux(aux: Buffer): Array<{ type: number; value: Buffer | number }> 
 }
 
 // ── NSKeyedArchiver via plutil (XML object graph -> binary plist) ─────────────
-type PlistNode =
+export type PlistNode =
   | { str: string } | { int: number | bigint } | { real: number } | { bool: boolean }
   | { data: Buffer } | { uuid: Buffer } | { dict: Record<string, PlistNode> } | { arr: PlistNode[] }
   | { url: string } | { nul: true } | { obj: { cls: string; props: Record<string, PlistNode> } }
   | { xctcaps: Record<string, PlistNode> }
 function xmlEscape(s: string) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") }
-function nskeyedArchive(n: PlistNode): Buffer {
+export function nskeyedArchive(n: PlistNode): Buffer {
   return buildArchiveOffset(n)
 }
 // Build objects with a leading $null already accounted for.
@@ -566,7 +588,7 @@ function plutilToXml(bin: Buffer): string {
 
 // ── a DTX channel abstraction over a raw TCP chan ─────────────────────────────
 const DTX_METHODINVOCATION = 0x2, DTX_ACK = 0x0, DTX_RESPONSE = 0x3, DTX_ERROR = 0x4
-class DtxConnection {
+export class DtxConnection {
   private inbound = Buffer.alloc(0)
   private frags = new Map<number, Buffer[]>()   // identifier -> collected fragment bodies
   private globalMsgId = 5
@@ -578,9 +600,24 @@ class DtxConnection {
   // a DTX RESPONSE (e.g. _XCT_testRunnerReadyWithCapabilities: -> XCTestConfiguration).
   private handlers = new Map<string, (m: DtxMsg) => PlistNode | null | void>()
   onCall(selector: string, fn: (m: DtxMsg) => PlistNode | null | void): void { this.handlers.set(selector, fn) }
+  // Per-channel raw-message listeners for streaming services (e.g. Instruments
+  // sysmontap/graphics push samples as unsolicited channel frames). Registered
+  // AFTER the setup calls resolve, so it never swallows a channelCall reply.
+  private channelListeners = new Map<number, (m: DtxMsg) => void>()
+  onChannelMessage(code: number, cb: (m: DtxMsg) => void): void { this.channelListeners.set(code, cb) }
+  offChannelMessage(code: number): void { this.channelListeners.delete(code) }
+  // Broadcast listener for services that push unsolicited samples on the device's
+  // OWN channel (Instruments sysmontap/graphics stream on channelCode -1, NOT the
+  // requested channel). Returns true if it consumed the frame. Registered only
+  // while streaming (after setup resolves), so it never eats a pending reply.
+  private broadcast?: (m: DtxMsg) => boolean
+  onBroadcast(cb: (m: DtxMsg) => boolean): void { this.broadcast = cb }
+  offBroadcast(): void { this.broadcast = undefined }
   constructor(private chan: TcpChan, private tag: string) {
     chan.onData((c) => this.onData(c))
   }
+  /** Release the underlying channel. */
+  close(): void { try { this.chan.close() } catch {} }
   private onData(chunk: Buffer) {
     this.inbound = Buffer.concat([this.inbound, chunk])
     let dec = decodeDtx(this.inbound)
@@ -591,18 +628,29 @@ class DtxConnection {
     }
   }
   private handle(m: DtxMsg) {
-    // reassemble fragments
+    // reassemble fragments: fragment 0 is header-only; fragments 1..N-1 each carry a
+    // raw payload chunk. Concatenate the chunks, then parse the single payload header
+    // (msgType/auxLen/totalPayloadLen) out of the reassembled whole.
     if (m.fragments > 1) {
       if (m.fragmentIndex === 0) { this.frags.set(m.identifier, []); if (m.expectsReply) this.sendAck(m); return }
       const list = this.frags.get(m.identifier)
       if (list) {
-        // for non-first fragments, we stored raw messageLength bytes; but our decoder
-        // already parsed the payload/aux on the last-fragment header. Simplify: only
-        // multi-fragment we expect are large replies; collect payloadRaw+aux.
-        list.push(Buffer.concat([m.aux, m.payloadRaw]))
-        if (m.fragments - m.fragmentIndex === 1) { this.frags.delete(m.identifier); /* treat as complete below */ }
+        list.push(m.payloadRaw)
+        if (m.fragments - m.fragmentIndex === 1) { this.frags.delete(m.identifier); m = reassembleDtxPayload(Buffer.concat(list), m) }
         else return
       }
+    }
+    // Streaming channel listener (sysmontap/graphics): consume every frame on a
+    // listened non-global channel. Only set while streaming, so no call replies race it.
+    if (m.channelCode !== 0) {
+      const cl = this.channelListeners.get(m.channelCode)
+      if (cl) { cl(m); if (m.expectsReply) this.sendAck(m); return }
+    }
+    // Broadcast: Instruments streams samples on the device's push channel (-1),
+    // not the requested channel. Give a registered broadcast first refusal on any
+    // non-global frame; if it consumes, we're done.
+    if (m.channelCode !== 0 && this.broadcast) {
+      if (this.broadcast(m)) { if (m.expectsReply) this.sendAck(m); return }
     }
     if (DBG) {
       const tName = { 0: "Ack", 2: "Invoke", 3: "Response", 4: "Error" }[m.msgType] ?? `t${m.msgType}`
@@ -792,20 +840,8 @@ function createTestConfig(sessionUuidBytes: Buffer, productModuleName: string, t
 export async function launchRunnerOverUserspaceTunnel(udid: string, opts: UserspaceLaunchOptions): Promise<UserspaceRunnerHandle> {
   const runnerBundle = opts.bundleId ?? RUNNER_BUNDLE
   const log = opts.log ?? (() => {})
-  // 1. tunnel + RSD
-  const { sock: cdp } = await connectServiceSocket(udid, "com.apple.internal.devicecompute.CoreDeviceProxy")
-  const rq = Buffer.from(JSON.stringify({ type: "clientHandshakeRequest", mtu: 1280 }))
-  cdp.write(Buffer.concat([Buffer.from("CDTunnel\0"), Buffer.from([rq.length]), rq]))
-  const params: any = await new Promise((res, rej) => {
-    let acc = Buffer.alloc(0); const t = setTimeout(() => rej(new Error("cdtunnel hs timeout")), 8000)
-    const on = (c: Buffer) => { acc = Buffer.concat([acc, c]); if (acc.length >= 10 && acc.length >= 10 + acc[9]) { clearTimeout(t); cdp.off("data", on); res(JSON.parse(acc.subarray(10, 10 + acc[9]).toString())) } }
-    cdp.on("data", on); cdp.on("error", rej)
-  })
-  const myIp = parseIp6(params.clientParameters.address), devIp = parseIp6(params.serverAddress)
-  const tun = new Tun(cdp, myIp, devIp)
-  const rsdChan = await tun.connect(params.serverRSDPort as number)
-  const services = await rsdHandshake(rsdChan)
-  log(`RSD: ${Object.keys(services).length} services enumerated`)
+  // 1. tunnel + RSD (shared with the web-inspection device-service broker)
+  const { tun, cdp, services } = await openRemoteXpcTunnel(udid, log)
   const port = (name: string) => {
     const p = services[name]; if (!p) throw new Error(`service ${name} not found`); return p
   }
@@ -847,6 +883,20 @@ export async function launchRunnerOverUserspaceTunnel(udid: string, opts: Usersp
   dtx1.onCall("_XCT_logDebugMessage:", (m) => { const s = decodeArg0(m); if (s.trim()) log(`RUNNER LOG: ${s.slice(0, 240)}`) })
   dtx1.onCall("_XCT_didFinishExecutingTestPlan", () => { log("*** test plan FINISHED ***") })
   dtx1.onCall("_XCT_didBeginExecutingTestPlan", () => { log("*** test plan BEGAN ***") })
+  // The runner reports XCUITest init failures here. The dominant one (error 10300
+  // "Failed to background test runner within 30.0s") is NOT a transport/DTX defect:
+  // the test plan began fine and the runner is talking to us — XCUITest simply
+  // could not send the runner app to the background because the device screen is
+  // LOCKED/asleep, so it times out after 30s and the runner aborts in
+  // +[XCTRunnerDaemonSession sharedSession]. Surface the real cause + fix instead
+  // of leaving a cryptic ~30s timeout. [reports/ios-runner-30s-session-death*]
+  dtx1.onCall("_XCT_initializationForUITestingDidFailWithError:", (m) => {
+    const err = decodeArg0(m)
+    log(`*** UI-TESTING INIT FAILED: ${err.slice(0, 220)} ***`)
+    if (/background test runner|\b10300\b/i.test(err)) {
+      log("HINT: the iPhone screen is LOCKED/asleep — XCUITest cannot background the runner while locked. Unlock the device and set Settings → Display & Brightness → Auto-Lock → Never, then retry. (This is the real cause of the '30s session death'.)")
+    }
+  })
   const localCaps: Record<string, PlistNode> = {
     "XCTIssue capability": { int: 1 }, "daemon container sandbox extension": { int: 1 },
     "delayed attachment transfer": { int: 1 }, "expected failure test capability": { int: 1 },
@@ -1102,6 +1152,32 @@ function reportReply(name: string, m: any, log: (message: string) => void = cons
     summary = xml.replace(/\s+/g, " ").slice(0, 300)
   }
   log(`  ${name}: OK (c${m.channelCode} i${m.identifier}.${m.conversationIndex}) ${summary}`)
+}
+
+export type RemoteXpcTunnel = { tun: Tun; cdp: net.Socket; services: Record<string, number> }
+
+/**
+ * Bring up the CoreDeviceProxy CDTunnel + userspace TCP mux + RSD handshake and
+ * return the tunnel plus the enumerated service→port map. Extracted verbatim
+ * from launchRunnerOverUserspaceTunnel so runner-launch and the web-inspection
+ * device-service broker (daemon/ios/device-services.ts) share ONE RemoteXPC
+ * bring-up instead of duplicating the tunnel handshake.
+ */
+export async function openRemoteXpcTunnel(udid: string, log: (m: string) => void = () => {}): Promise<RemoteXpcTunnel> {
+  const { sock: cdp } = await connectServiceSocket(udid, "com.apple.internal.devicecompute.CoreDeviceProxy")
+  const rq = Buffer.from(JSON.stringify({ type: "clientHandshakeRequest", mtu: 1280 }))
+  cdp.write(Buffer.concat([Buffer.from("CDTunnel\0"), Buffer.from([rq.length]), rq]))
+  const params: any = await new Promise((res, rej) => {
+    let acc = Buffer.alloc(0); const t = setTimeout(() => rej(new Error("cdtunnel hs timeout")), 8000)
+    const on = (c: Buffer) => { acc = Buffer.concat([acc, c]); if (acc.length >= 10 && acc.length >= 10 + acc[9]) { clearTimeout(t); cdp.off("data", on); res(JSON.parse(acc.subarray(10, 10 + acc[9]).toString())) } }
+    cdp.on("data", on); cdp.on("error", rej)
+  })
+  const myIp = parseIp6(params.clientParameters.address), devIp = parseIp6(params.serverAddress)
+  const tun = new Tun(cdp, myIp, devIp)
+  const rsdChan = await tun.connect(params.serverRSDPort as number)
+  const services = await rsdHandshake(rsdChan)
+  log(`RSD: ${Object.keys(services).length} services enumerated`)
+  return { tun, cdp, services }
 }
 
 // RSD handshake over the given TCP chan; returns {serviceName: port}

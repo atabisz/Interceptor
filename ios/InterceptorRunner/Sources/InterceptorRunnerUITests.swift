@@ -28,6 +28,7 @@
 import XCTest
 import Foundation
 import ObjectiveC.runtime
+import JavaScriptCore  // Lane D: on-device JSCore scripting brain
 
 final class InterceptorRunnerUITests: XCTestCase {
 
@@ -246,9 +247,38 @@ enum Runner {
             return pressButton(args["name"] as? String ?? "")
         case "app":
             return appOp(action: args["action"] as? String ?? "", bundleId: args["bundleId"] as? String ?? "")
+        case "eval":
+            return jsEval(script: args["script"] as? String ?? "")
         default:
             return err("unknown op '\(op)'")
         }
+    }
+
+    /// Lane D — the on-device JSCore brain. Runs a pushed script inside a JSContext
+    /// with an `Interceptor` global bridged to the native surface, so loops / waits /
+    /// multi-step flows execute ON THE PHONE and only the result crosses the wire.
+    ///
+    private static func jsEval(script: String) -> [String: Any] {
+        guard let ctx = JSContext() else { return err("JSContext unavailable") }
+        if #available(iOS 16.4, *) { ctx.isInspectable = true }  // attachable by Lane B
+        var logs: [String] = []
+        ctx.exceptionHandler = { _, exc in logs.append("JS exception: \(exc?.toString() ?? "?")") }
+        let bridge = JSValue(newObjectIn: ctx)!
+        let logFn: @convention(block) (String) -> Void = { msg in logs.append(msg) }
+        bridge.setObject(logFn, forKeyedSubscript: "log" as NSString)
+        let treeFn: @convention(block) () -> Any = { (try? serialize(foregroundApp().snapshot())) ?? [:] }
+        bridge.setObject(treeFn, forKeyedSubscript: "tree" as NSString)
+        let tapFn: @convention(block) (Double, Double) -> Void = { x, y in coord(x, y).tap() }
+        bridge.setObject(tapFn, forKeyedSubscript: "tap" as NSString)
+        let typeFn: @convention(block) (String) -> Void = { t in app().typeText(t) }
+        bridge.setObject(typeFn, forKeyedSubscript: "type" as NSString)
+        let sleepFn: @convention(block) (Double) -> Void = { ms in Thread.sleep(forTimeInterval: ms / 1000.0) }
+        bridge.setObject(sleepFn, forKeyedSubscript: "sleep" as NSString)
+        let fgFn: @convention(block) () -> Any = { ICActiveApplicationBundleID() ?? "" }
+        bridge.setObject(fgFn, forKeyedSubscript: "foreground" as NSString)
+        ctx.setObject(bridge, forKeyedSubscript: "Interceptor" as NSString)
+        let value = ctx.evaluateScript(script)
+        return ok(["result": value?.toObject() ?? NSNull(), "logs": logs])
     }
 
     private static func pressButton(_ name: String) -> [String: Any] {

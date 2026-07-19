@@ -25,7 +25,13 @@ import { VERSION } from "../cli/version"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
 import { CDP_CONTEXT_PREFIX } from "../shared/cdp-app"
 import { IosManager } from "./ios/manager"
+import { IosWebManager } from "./ios/web-manager"
+import { IosDeviceServiceManager } from "./ios/service-manager"
+import { IosDevServiceManager } from "./ios/dev-manager"
 import { IOS_ACTION_TYPES, IOS_CONTEXT_PREFIX, IOS_REGISTER_TYPE, IOS_VERB_TYPES } from "../shared/ios-device"
+import { IOS_WEB_ACTION_TYPES } from "../shared/ios-web"
+import { IOS_SVC_ACTION_TYPES } from "../shared/ios-service"
+import { IOS_DEV_ACTION_TYPES } from "../shared/ios-dev"
 import {
   NATIVE_REGISTER_TYPE, NATIVE_DELEGATE_TYPE, NATIVE_CONTEXT_PREFIX,
   type NativeAgentState, type CodeSlice, type NativeWayIn,
@@ -829,6 +835,39 @@ const iosManager = new IosManager({
   wsPort: WS_PORT,
 })
 
+// web lane. Reuses iosManager's runner for native-lane work (screenshot,
+// native input) but the web lane itself needs no runner / Developer Mode.
+const iosWebManager = new IosWebManager({
+  nativeLane: {
+    isAvailable: (ctx) => iosManager.contextIds().includes(ctx),
+    screenshot: (ctx, max) => iosManager.executeVerb(ctx, { type: "ios_screenshot", targetMaxLongEdge: max }),
+    tap: (ctx, x, y) => iosManager.executeVerb(ctx, { type: "ios_click", x, y }),
+    type: (ctx, text) => iosManager.executeVerb(ctx, { type: "ios_type", text }),
+    keys: (ctx, text) => iosManager.executeVerb(ctx, { type: "ios_keys", text }),
+    tree: (ctx) => iosManager.executeVerb(ctx, { type: "ios_tree" }),
+  },
+  managerDescriptors: () => iosManager.contextIds()
+    .filter((c) => c.startsWith(IOS_CONTEXT_PREFIX))
+    .map((c) => ({ udid: c.slice(IOS_CONTEXT_PREFIX.length), contextId: c })),
+})
+
+// device-service introspection lane. Runner-free classic Lockdown
+// (diagnostics/logs/filesystem/crashes/profiles/notifications/springboard).
+const iosServiceManager = new IosDeviceServiceManager({
+  managerDescriptors: () => iosManager.contextIds()
+    .filter((c) => c.startsWith(IOS_CONTEXT_PREFIX))
+    .map((c) => ({ udid: c.slice(IOS_CONTEXT_PREFIX.length), contextId: c })),
+})
+
+// Instruments/DTX + telemetry + developer-service lanes. Runner-free by
+// default; `shot`/`screen` fall back to the on-device XCUITest runner via runnerVerb.
+const iosDevManager = new IosDevServiceManager({
+  managerDescriptors: () => iosManager.contextIds()
+    .filter((c) => c.startsWith(IOS_CONTEXT_PREFIX))
+    .map((c) => ({ udid: c.slice(IOS_CONTEXT_PREFIX.length), contextId: c })),
+  runnerVerb: (contextId, action) => iosManager.executeVerb(contextId, action),
+})
+
 function drainWsOutboundQueue(ctxId: string): void {
   const ws = extensionWsMap.get(ctxId)
   if (!ws) return
@@ -1330,6 +1369,31 @@ try {
               .catch((err) => socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `ios dispatch failed: ${(err as Error).message}` } })))
             continue
           }
+          // iOS WEB lane: MUST be tested before the broad `ios:` fallback
+          // below so a web action never reaches ensureRunner just for carrying a
+          // device context. The web lane needs no runner / Developer Mode.
+          if (action?.type && IOS_WEB_ACTION_TYPES.has(action.type)) {
+            iosWebManager.handle(action as { type: string; [k: string]: unknown }, request.contextId)
+              .then((result) => socketWriteFramed(socket, JSON.stringify({ id, result })))
+              .catch((err) => socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `ios web dispatch failed: ${(err as Error).message}` } })))
+            continue
+          }
+          // iOS device-service introspection lane: tested before the
+          // broad `ios:` fallback so service actions never reach ensureRunner.
+          if (action?.type && IOS_SVC_ACTION_TYPES.has(action.type)) {
+            iosServiceManager.handle(action as { type: string; [k: string]: unknown }, request.contextId)
+              .then((result) => socketWriteFramed(socket, JSON.stringify({ id, result })))
+              .catch((err) => socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `ios svc dispatch failed: ${(err as Error).message}` } })))
+            continue
+          }
+          // iOS Instruments/DTX + telemetry + developer-service lanes:
+          // tested before the broad `ios:` fallback so they never reach ensureRunner.
+          if (action?.type && IOS_DEV_ACTION_TYPES.has(action.type)) {
+            iosDevManager.handle(action as { type: string; [k: string]: unknown }, request.contextId)
+              .then((result) => socketWriteFramed(socket, JSON.stringify({ id, result })))
+              .catch((err) => socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `ios dev dispatch failed: ${(err as Error).message}` } })))
+            continue
+          }
           if ((action?.type && IOS_VERB_TYPES.has(action.type)) || (request.contextId && request.contextId.startsWith(IOS_CONTEXT_PREFIX))) {
             iosManager.executeVerb(request.contextId ?? "", (action as { type: string; [k: string]: unknown }) ?? { type: "unknown" })
               .then((result) => socketWriteFramed(socket, JSON.stringify({ id, result })))
@@ -1587,6 +1651,27 @@ function startWsServer(): ReturnType<typeof Bun.serve> {
           iosManager.handle(request.action as { type: string; [k: string]: unknown })
             .then((result) => ws.send(JSON.stringify({ id, result })))
             .catch((err) => { try { ws.send(JSON.stringify({ id, result: { success: false, error: `ios dispatch failed: ${(err as Error).message}` } })) } catch {} })
+          return
+        }
+        // iOS WEB lane: tested before the broad `ios:` fallback below.
+        if (IOS_WEB_ACTION_TYPES.has(actionType)) {
+          iosWebManager.handle(request.action as { type: string; [k: string]: unknown }, request.contextId)
+            .then((result) => ws.send(JSON.stringify({ id, result })))
+            .catch((err) => { try { ws.send(JSON.stringify({ id, result: { success: false, error: `ios web dispatch failed: ${(err as Error).message}` } })) } catch {} })
+          return
+        }
+        // iOS device-service introspection lane: before the broad `ios:` fallback.
+        if (IOS_SVC_ACTION_TYPES.has(actionType)) {
+          iosServiceManager.handle(request.action as { type: string; [k: string]: unknown }, request.contextId)
+            .then((result) => ws.send(JSON.stringify({ id, result })))
+            .catch((err) => { try { ws.send(JSON.stringify({ id, result: { success: false, error: `ios svc dispatch failed: ${(err as Error).message}` } })) } catch {} })
+          return
+        }
+        // iOS Instruments/DTX + telemetry + developer-service lanes: before the broad `ios:` fallback.
+        if (IOS_DEV_ACTION_TYPES.has(actionType)) {
+          iosDevManager.handle(request.action as { type: string; [k: string]: unknown }, request.contextId)
+            .then((result) => ws.send(JSON.stringify({ id, result })))
+            .catch((err) => { try { ws.send(JSON.stringify({ id, result: { success: false, error: `ios dev dispatch failed: ${(err as Error).message}` } })) } catch {} })
           return
         }
         if ((IOS_VERB_TYPES.has(actionType)) || (request.contextId && request.contextId.startsWith(IOS_CONTEXT_PREFIX))) {
