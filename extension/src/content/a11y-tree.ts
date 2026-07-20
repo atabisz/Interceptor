@@ -5,6 +5,28 @@ import { getRelevantAttrs, getStyleBundle } from "./element-tree"
 export const LANDMARK_ROLES = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"])
 export const LANDMARK_TAGS = new Set(["NAV", "MAIN", "ASIDE", "HEADER", "FOOTER", "FORM", "SECTION"])
 
+// An element is an upload target if it IS a file input or shallowly wraps one.
+// The depth bound keeps the hint high-signal — a dropzone root
+// renders its hidden <input type=file> as a near child, whereas a big modal /
+// <body> that merely contains one far below is not flagged. Surfacing this in
+// the a11y tree steers agents to `interceptor upload <ref> <path>` instead of
+// clicking (which opens a native OS panel the browser surface can't drive).
+export function isUploadTarget(el: Element, maxDepth = 3): boolean {
+  if (el instanceof HTMLInputElement && el.type === "file") return true
+  let frontier: Element[] = [el]
+  for (let d = 0; d < maxDepth && frontier.length; d++) {
+    const next: Element[] = []
+    for (const node of frontier) {
+      for (const child of Array.from(node.children)) {
+        if (child instanceof HTMLInputElement && child.type === "file") return true
+        next.push(child)
+      }
+    }
+    frontier = next
+  }
+  return false
+}
+
 export function getEffectiveRole(el: Element): string {
   const explicit = el.getAttribute("role")
   if (explicit) return explicit
@@ -170,16 +192,19 @@ export function buildA11yTree(
       const name = getAccessibleName(el)
       const attrs = getRelevantAttrs(el)
       const styleBundle = includeStyle ? getStyleBundle(el) : ""
+      const uploadable = isUploadTarget(el)
       if (compact) {
         const nameClause = name ? `|${name}` : ""
         const attrClause = compactAttrClause(attrs)
         const styleClause = styleBundle ? `|style={${styleBundle}}` : ""
-        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}]`)
+        const uploadClause = uploadable ? "|upload" : ""
+        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}${uploadClause}]`)
       } else {
         const nameStr = name ? ` "${name}"` : ""
         const attrStr = attrs ? ` ${attrs}` : ""
         const styleStr = styleBundle ? ` style="${styleBundle}"` : ""
-        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}`)
+        const uploadStr = uploadable ? ` upload="interceptor upload ${refId} <path>"` : ""
+        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}${uploadStr}`)
       }
     }
 

@@ -4,7 +4,9 @@ import { runSkillsCommand, maybeEmitSkillsHint } from "./commands/skills"
 import { runManifestCommand } from "./manifest"
 import { parseTabFlag, parseContextFlag, parseGroupFlag, parseGroupColorFlag } from "./parse"
 import { formatState, formatTabs, formatCookies, formatResult } from "./format"
-import { sendCommand, sendCommandWs, setGlobalGroup, type DaemonResult, type DaemonResponse } from "./transport"
+import { sendCommand, sendCommandWs, setGlobalGroup, type DaemonResult, type DaemonResponse, type Action } from "./transport"
+import { UPLOAD_CHUNK_B64_BYTES } from "../shared/platform"
+import { chunkBase64 } from "../shared/upload"
 import { fromPassive, writeExport, type PassiveNetEntry, type ExportFormat } from "../shared/exports"
 import {
   attachMonitorTaskSource,
@@ -349,6 +351,39 @@ async function main() {
 
   // null means the command handled its own output (status, events, session)
   if (action === null) return
+
+  // Large-file upload: split the base64 payload into sequential
+  // chunks so every daemon<->extension transport carries it (each chunk stays
+  // under Chrome's hard 1 MiB native-messaging limit), then a final assemble
+  // message attaches the file. Small files still go single-shot below.
+  if (action && action.type === "file_upload" && typeof action.dataBase64 === "string" && (action.dataBase64 as string).length > UPLOAD_CHUNK_B64_BYTES) {
+    const full = action.dataBase64 as string
+    const uploadId = crypto.randomUUID()
+    const chunks = chunkBase64(full, UPLOAD_CHUNK_B64_BYTES)
+    const total = chunks.length
+    const send = (a: Action) => useWs
+      ? sendCommandWs(a, globalTabId, globalContextId)
+      : sendCommand(a, globalTabId, globalContextId)
+    try {
+      for (let seq = 0; seq < total; seq++) {
+        const r = unwrapResult(await send({ type: "file_upload_chunk", uploadId, seq, total, chunk: chunks[seq] }))
+        if (!r.success) {
+          console.error(`error: upload chunk ${seq + 1}/${total} failed: ${r.error || "unknown"}`)
+          process.exit(1)
+        }
+      }
+      const assemble: Action = { type: "file_upload", uploadId, fileName: action.fileName, mimeType: action.mimeType }
+      if (action.ref !== undefined) assemble.ref = action.ref
+      if (action.index !== undefined) assemble.index = action.index
+      if (action.dropzone) assemble.dropzone = true
+      const finalResult = unwrapResult(await send(assemble))
+      console.log(formatResult(finalResult, jsonMode))
+    } catch (err) {
+      console.error(`error: ${(err as Error).message}`)
+      process.exit(1)
+    }
+    return
+  }
 
   if (action && action.type === "sse_tail") {
     const filter = (action.filter as string) || ""

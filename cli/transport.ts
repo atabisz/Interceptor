@@ -2,7 +2,7 @@
  * cli/transport.ts — sendCommand (Unix socket / TCP) and sendCommandWs (WebSocket)
  */
 
-import { IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/platform"
+import { IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT, MAX_UPLOAD_FRAME_BYTES } from "../shared/platform"
 import { IOS_SVC_ACTION_TYPES } from "../shared/ios-service"
 import { IOS_DEV_ACTION_TYPES } from "../shared/ios-dev"
 
@@ -95,6 +95,9 @@ function timeoutMessage(actionType: string, ms: number): string {
   if (actionType.startsWith("ios_")) {
     return `timeout: no response for '${actionType}' after ${seconds}s. The InterceptorRunner may be busy with a slow XCUITest snapshot or a non-quiescing app; confirm the device is unlocked and 'interceptor ios status' shows it connected.`
   }
+  if (actionType === "file_upload" || actionType === "file_upload_chunk") {
+    return `timeout: no response for '${actionType}' after ${seconds}s. The daemon may have rejected an oversized upload frame (check 'interceptor status' and the daemon log for "oversized socket frame"), or the tab/content script isn't reachable — large files are chunked automatically, so this usually means the target tab changed. Retry after 'interceptor state'.`
+  }
   return `timeout: no response for '${actionType}' after ${seconds}s. Ensure Chrome/Brave is open with the Interceptor extension loaded.`
 }
 
@@ -135,6 +138,23 @@ export function sendCommand(rawAction: Action, tabId?: number, contextId?: strin
     let resolved = false
     let socketRef: Bun.Socket<undefined> | null = null
 
+    // Outbound frame + backpressure handling. Bun's socket.write() does a
+    // PARTIAL write when the payload exceeds the socket's send buffer and
+    // returns the number of bytes actually written — the remainder is NOT
+    // auto-queued. A single naive write() therefore truncates any large frame
+    // (e.g. a 512 KiB upload chunk), and the daemon then blocks forever waiting
+    // for bytes that never arrive. Queue the remainder and flush it on `drain`,
+    // mirroring the daemon's own socketWriteFramed.
+    let pendingWrite: Buffer | null = null
+    const flushWrite = (socket: Bun.Socket<undefined>) => {
+      if (!pendingWrite) return
+      let wrote = 0
+      try { wrote = socket.write(pendingWrite) } catch { return }
+      if (wrote >= pendingWrite.byteLength) pendingWrite = null
+      else if (wrote > 0) pendingWrite = pendingWrite.subarray(wrote)
+      // wrote <= 0: socket buffer full — keep pendingWrite, retry on drain.
+    }
+
     const timeoutMs = pickTimeoutForAction(action.type)
     const timer = setTimeout(() => {
       if (!resolved) {
@@ -151,13 +171,17 @@ export function sendCommand(rawAction: Action, tabId?: number, contextId?: strin
         const encoded = Buffer.from(payload, "utf-8")
         const header = Buffer.alloc(4)
         header.writeUInt32LE(encoded.byteLength, 0)
-        socket.write(Buffer.concat([header, encoded]))
+        pendingWrite = Buffer.concat([header, encoded])
+        flushWrite(socket)
+      },
+      drain(socket: Bun.Socket<undefined>) {
+        flushWrite(socket)
       },
       data(socket: Bun.Socket<undefined>, raw: Buffer<ArrayBufferLike>) {
         buffer = Buffer.concat([buffer, Buffer.from(raw)])
         if (buffer.length >= 4) {
           const msgLen = buffer.readUInt32LE(0)
-          if (msgLen > 0 && msgLen <= 1024 * 1024 && buffer.length >= 4 + msgLen) {
+          if (msgLen > 0 && msgLen <= MAX_UPLOAD_FRAME_BYTES && buffer.length >= 4 + msgLen) {
             const json = buffer.subarray(4, 4 + msgLen).toString("utf-8")
             clearTimeout(timer)
             try {
