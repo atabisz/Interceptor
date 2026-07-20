@@ -4,8 +4,10 @@ import { registerTabGroupListeners, ensureInterceptorGroup } from "./background/
 import { registerBrandTabGroup } from "./background/brand-tab-group"
 import { registerDelegationListeners } from "./background/delegation"
 import { registerPowerIdleListeners } from "./background/keepawake"
+import { initializeActionRouter } from "./background/router"
 
 // Register all event listeners
+initializeActionRouter()
 registerCdpListeners()
 registerTabGroupListeners()
 registerAlarmListener()

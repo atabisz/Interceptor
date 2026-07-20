@@ -262,14 +262,63 @@ async function injectContentScript(tabId, frameId) {
     return { success: false, error: err.message };
   }
 }
+var NAVIGATION_CAPABLE_ACTIONS = new Set(["click", "click_at", "dblclick", "find_and_click"]);
 async function sendToContentScriptOnce(tabId, action, frameId) {
+  const watchesNavigation = NAVIGATION_CAPABLE_ACTIONS.has(action.type);
+  let initialUrl;
+  if (watchesNavigation) {
+    try {
+      initialUrl = (await chrome.tabs.get(tabId)).url;
+    } catch {}
+  }
   return new Promise((resolve) => {
+    let settled = false;
+    let navigationFailureTimer = null;
+    let navigationListener = null;
+    const finish = (result) => {
+      if (settled)
+        return;
+      settled = true;
+      if (navigationFailureTimer)
+        clearTimeout(navigationFailureTimer);
+      if (navigationListener)
+        chrome.tabs.onUpdated.removeListener(navigationListener);
+      resolve(result);
+    };
+    const navigationResult = (url) => ({
+      success: true,
+      data: { navigated: true, url }
+    });
+    if (watchesNavigation) {
+      navigationListener = (updatedTabId, changeInfo, tab) => {
+        if (updatedTabId !== tabId)
+          return;
+        if (changeInfo.status !== "loading" && typeof changeInfo.url !== "string")
+          return;
+        finish(navigationResult(changeInfo.url ?? tab.url));
+      };
+      chrome.tabs.onUpdated.addListener(navigationListener);
+    }
     const targetFrame = frameId !== undefined ? frameId : 0;
     chrome.tabs.sendMessage(tabId, { type: "execute_action", action }, { frameId: targetFrame }, (response) => {
       if (chrome.runtime.lastError) {
-        resolve({ success: false, error: chrome.runtime.lastError.message });
+        const error = chrome.runtime.lastError.message;
+        if (watchesNavigation && shouldRetryContentScript(error)) {
+          navigationFailureTimer = setTimeout(async () => {
+            try {
+              const tab = await chrome.tabs.get(tabId);
+              if (tab.status === "loading" || typeof initialUrl === "string" && typeof tab.url === "string" && tab.url !== initialUrl) {
+                finish(navigationResult(tab.url));
+                return;
+              }
+            } catch {}
+            finish({ success: false, error });
+          }, 250);
+        } else {
+          finish({ success: false, error });
+        }
       } else {
-        resolve(response ?? { success: false, error: "no response from content script" });
+        finish(response ?? { success: false, error: "no response from content script" });
       }
     });
   });
@@ -2252,7 +2301,22 @@ async function handleHeaderActions(action, _tabId) {
         value: r.value
       }]
     },
-    condition: { urlFilter: "*" }
+    condition: {
+      urlFilter: "*",
+      resourceTypes: [
+        "main_frame",
+        "sub_frame",
+        "stylesheet",
+        "script",
+        "image",
+        "font",
+        "xmlhttprequest",
+        "ping",
+        "media",
+        "websocket",
+        "other"
+      ]
+    }
   }));
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: dnrRules.map((r) => r.id),
@@ -3477,8 +3541,11 @@ async function getTopFrameContext(tabId) {
 function registerWebNavListenersOnce() {
   if (webNavRegistered)
     return;
+  const webNavigation = chrome.webNavigation;
+  if (!webNavigation)
+    return;
   webNavRegistered = true;
-  chrome.webNavigation.onCommitted.addListener((details) => {
+  webNavigation.onCommitted?.addListener((details) => {
     if (details.frameId !== 0)
       return;
     const pendingChild = pendingChildTabs.get(details.tabId);
@@ -3515,7 +3582,7 @@ function registerWebNavListenersOnce() {
       tq: details.transitionQualifiers
     });
   });
-  chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  webNavigation.onHistoryStateUpdated?.addListener((details) => {
     if (details.frameId !== 0)
       return;
     const session = getActiveSessionForTab(details.tabId);
@@ -3540,7 +3607,7 @@ function registerWebNavListenersOnce() {
         console.error(`re-arm after history nav failed on tab ${details.tabId}:`, res.error);
     });
   });
-  chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+  webNavigation.onReferenceFragmentUpdated?.addListener((details) => {
     if (details.frameId !== 0)
       return;
     const session = getActiveSessionForTab(details.tabId);
@@ -3565,7 +3632,7 @@ function registerWebNavListenersOnce() {
         console.error(`re-arm after fragment nav failed on tab ${details.tabId}:`, res.error);
     });
   });
-  chrome.webNavigation.onCompleted.addListener((details) => {
+  webNavigation.onCompleted?.addListener((details) => {
     if (details.frameId !== 0)
       return;
     const session = getActiveSessionForTab(details.tabId);
@@ -3577,7 +3644,7 @@ function registerWebNavListenersOnce() {
         console.error(`re-arm after navigation completed failed on tab ${details.tabId}:`, res.error);
     });
   });
-  chrome.webNavigation.onTabReplaced.addListener((details) => {
+  webNavigation.onTabReplaced?.addListener((details) => {
     const session = getActiveSessionForTab(details.replacedTabId);
     if (!session || session.paused)
       return;
@@ -3638,11 +3705,14 @@ async function handleFocusActivated(tabId) {
 function registerTabListenersOnce() {
   if (tabsRegistered)
     return;
+  const tabs = chrome.tabs;
+  if (!tabs)
+    return;
   tabsRegistered = true;
-  chrome.tabs.onActivated.addListener((info) => {
+  tabs.onActivated?.addListener((info) => {
     handleFocusActivated(info.tabId);
   });
-  chrome.tabs.onCreated.addListener((tab) => {
+  tabs.onCreated?.addListener((tab) => {
     if (!tab.id || tab.openerTabId === undefined)
       return;
     const session = getActiveSessionForTab(tab.openerTabId);
@@ -3664,7 +3734,7 @@ function registerTabListenersOnce() {
       createdAt: Date.now()
     });
   });
-  chrome.tabs.onRemoved.addListener((tabId) => {
+  tabs.onRemoved?.addListener((tabId) => {
     pendingChildTabs.delete(tabId);
     const session = getActiveSessionForTab(tabId);
     if (!session)
@@ -3707,8 +3777,11 @@ function registerTabListenersOnce() {
 function registerRuntimeMessageListenerOnce() {
   if (runtimeMsgRegistered)
     return;
+  const runtime = chrome.runtime;
+  if (!runtime?.onMessage)
+    return;
   runtimeMsgRegistered = true;
-  chrome.runtime.onMessage.addListener(monitorRuntimeMessageListener);
+  runtime.onMessage.addListener(monitorRuntimeMessageListener);
 }
 function registerMonitorListeners() {
   registerWebNavListenersOnce();
@@ -4104,8 +4177,10 @@ async function handlePowerIdleActions(action) {
 }
 
 // extension/src/background/router.ts
-registerMonitorListeners();
-restorePageCommCaptureConfig();
+function initializeActionRouter() {
+  registerMonitorListeners();
+  restorePageCommCaptureConfig();
+}
 var OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move"]);
 var SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture", "ocr"]);
 var CAPTURE_STREAM_ACTIONS = new Set(["capture_start", "capture_frame", "capture_stop", "canvas_diff"]);
@@ -4613,6 +4688,129 @@ function clearContextConflictBadge(chromeApi) {
   return updateContextBadge(chromeApi, { text: "" });
 }
 
+// extension/src/background/safari-native-relay.ts
+var SAFARI_NATIVE_RELAY_APPLICATION_ID = "com.interceptor.safari";
+var SAFARI_NATIVE_RELAY_MESSAGE_TYPE = "interceptor_safari_relay";
+var SAFARI_NATIVE_RELAY_QUEUE_CAP = 50;
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function defaultSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+class SafariNativeRelayClient {
+  runtime;
+  contextId;
+  waitMilliseconds;
+  onMessage;
+  onConnectionChange;
+  onError;
+  sleep;
+  outbound = [];
+  running = false;
+  constructor(options) {
+    this.runtime = options.runtime;
+    this.contextId = options.contextId;
+    this.waitMilliseconds = Math.max(100, Math.min(options.waitMilliseconds ?? 1000, 5000));
+    this.onMessage = options.onMessage;
+    this.onConnectionChange = options.onConnectionChange ?? (() => {});
+    this.onError = options.onError ?? (() => {});
+    this.sleep = options.sleep ?? defaultSleep;
+  }
+  enqueue(message) {
+    if (this.outbound.length >= SAFARI_NATIVE_RELAY_QUEUE_CAP) {
+      this.outbound.shift();
+      this.onError(new Error("Safari native relay outbound queue full; dropped oldest message"));
+    }
+    this.outbound.push(message);
+  }
+  start() {
+    if (this.running)
+      return;
+    this.running = true;
+    this.runLoop();
+  }
+  stop() {
+    this.running = false;
+  }
+  async exchangeOnce() {
+    const outboundCount = this.outbound.length;
+    const response = await this.sendNativeMessage({
+      type: SAFARI_NATIVE_RELAY_MESSAGE_TYPE,
+      contextId: this.contextId,
+      outbound: this.outbound.slice(0, outboundCount),
+      waitMilliseconds: this.waitMilliseconds
+    });
+    if (!isRecord(response))
+      throw new Error("Safari native relay returned an invalid response");
+    const reply = response;
+    if (typeof reply.error === "string" && reply.error.length > 0) {
+      throw new Error(reply.error);
+    }
+    if (outboundCount > 0)
+      this.outbound.splice(0, outboundCount);
+    const messages = Array.isArray(reply.messages) ? reply.messages : [];
+    for (const message of messages)
+      await this.onMessage(message);
+    return { connected: reply.connected === true, received: messages.length };
+  }
+  async runLoop() {
+    let retryDelay = 250;
+    while (this.running) {
+      try {
+        const result = await this.exchangeOnce();
+        this.onConnectionChange(result.connected);
+        retryDelay = 250;
+        if (!result.connected)
+          await this.sleep(retryDelay);
+      } catch (error) {
+        const relayError = error instanceof Error ? error : new Error(String(error));
+        this.onConnectionChange(false);
+        this.onError(relayError);
+        await this.sleep(retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 5000);
+      }
+    }
+  }
+  sendNativeMessage(message) {
+    const sendNativeMessage = this.runtime.sendNativeMessage;
+    if (typeof sendNativeMessage !== "function") {
+      return Promise.reject(new Error("Safari runtime.sendNativeMessage is unavailable"));
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const succeed = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      const fail = (error) => {
+        if (settled)
+          return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      const callback = (response) => {
+        const lastError = this.runtime.lastError;
+        if (lastError?.message)
+          fail(new Error(lastError.message));
+        else
+          succeed(response);
+      };
+      try {
+        const maybePromise = sendNativeMessage.call(this.runtime, SAFARI_NATIVE_RELAY_APPLICATION_ID, message, callback);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise.then(succeed, fail);
+        }
+      } catch (error) {
+        fail(error);
+      }
+    });
+  }
+}
+
 // extension/src/background/transport.ts
 var nativePort = null;
 var activeTransport = "none";
@@ -4628,6 +4826,10 @@ var keepalivePongTimer = null;
 var pendingHandshakePort = null;
 var lastNativeActivityAt = 0;
 var WS_URL = "ws://localhost:19222";
+var configuredContextId = null;
+var forceWebSocketTransport = false;
+var safariNativeRelayEnabled = false;
+var safariNativeRelayClient = null;
 var OUTBOUND_RECOVERY_QUEUE_CAP = 50;
 var outboundRecoveryQueue = [];
 function describeOutboundMessage(msg) {
@@ -4660,6 +4862,10 @@ function disconnectNativePort(port) {
   clearNativeStateFor(port);
 }
 function hasNativeMessaging() {
+  if (forceWebSocketTransport)
+    return false;
+  if (globalThis.INTERCEPTOR_FORCE_WS)
+    return false;
   return typeof chrome.runtime.connectNative === "function";
 }
 function postNative(msg, port = nativePort) {
@@ -4744,6 +4950,14 @@ function drainOutboundRecoveryQueue() {
   }
 }
 function sendToHost(msg, forceWs, allowQueue = false) {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel();
+    if (!safariNativeRelayClient) {
+      return allowQueue ? enqueueOutboundRecovery(msg) : "failed";
+    }
+    safariNativeRelayClient.enqueue(msg);
+    return "queued";
+  }
   if (forceWs) {
     if (sendWs(msg))
       return "sent";
@@ -4793,6 +5007,10 @@ function scheduleNativeReconnect() {
   nativeReconnectDelay = nextReconnectDelay(nativeReconnectDelay);
 }
 function connectToHost() {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel();
+    return;
+  }
   if (!hasNativeMessaging()) {
     if (isWsOpen())
       activeTransport = "websocket";
@@ -4865,6 +5083,67 @@ function connectToHost() {
     scheduleNativeReconnect();
   }
 }
+function handleControlPlaneMessage(rawMessage, transport) {
+  if (!rawMessage || typeof rawMessage !== "object")
+    return;
+  const msg = rawMessage;
+  const controlType = registrationControlType(msg);
+  if (controlType === "context_conflict") {
+    if (transport === "websocket")
+      markWsUnregistered();
+    else if (activeTransport === "safari-native")
+      activeTransport = "none";
+    console.error(`[interceptor] context name conflict: '${msg.contextId}' is already registered. Change the context ID in the extension popup.`);
+    setContextConflictBadge(chrome);
+    return;
+  }
+  if (controlType === "context_registered") {
+    if (transport === "websocket") {
+      markWsRegistered();
+    } else {
+      activeTransport = "safari-native";
+      clearContextConflictBadge(chrome);
+      drainMessageQueue();
+      while (outboundRecoveryQueue.length > 0) {
+        safariNativeRelayClient?.enqueue(outboundRecoveryQueue.shift());
+      }
+    }
+    return;
+  }
+  if (msg.id && msg.action) {
+    msg._viaWs = true;
+    handleDaemonMessage(msg);
+  }
+}
+function connectSafariNativeRelayChannel() {
+  if (!safariNativeRelayEnabled)
+    return;
+  if (safariNativeRelayClient) {
+    safariNativeRelayClient.start();
+    return;
+  }
+  const contextId = configuredContextId;
+  if (!contextId) {
+    console.error("Safari native relay requires an explicit context id");
+    return;
+  }
+  const runtime = chrome.runtime;
+  if (!runtime) {
+    console.error("Safari native relay requires chrome.runtime");
+    return;
+  }
+  safariNativeRelayClient = new SafariNativeRelayClient({
+    runtime,
+    contextId,
+    onMessage: (message) => handleControlPlaneMessage(message, "safari-native"),
+    onConnectionChange: (connected) => {
+      if (!connected && activeTransport === "safari-native")
+        activeTransport = "none";
+    },
+    onError: (error) => console.error("Safari native relay:", error.message)
+  });
+  safariNativeRelayClient.start();
+}
 function startWsKeepAlive() {
   if (wsKeepAliveTimer)
     clearInterval(wsKeepAliveTimer);
@@ -4886,19 +5165,29 @@ function stopWsKeepAlive() {
   wsKeepAliveTimer = null;
 }
 async function getOrCreateContextId() {
-  const configured = globalThis.INTERCEPTOR_APP_CONTEXT_ID;
+  const legacyConfigured = globalThis.INTERCEPTOR_APP_CONTEXT_ID;
+  const configured = configuredContextId ?? legacyConfigured;
+  const storage = chrome.storage?.local;
   if (typeof configured === "string" && configured.length > 0) {
-    await chrome.storage.local.set({ contextId: configured });
+    try {
+      await storage?.set({ contextId: configured });
+    } catch {}
     return configured;
   }
-  const stored = await chrome.storage.local.get("contextId");
-  if (stored.contextId)
+  const stored = storage ? await storage.get("contextId") : {};
+  if (stored?.contextId)
     return stored.contextId;
   const id = crypto.randomUUID();
-  await chrome.storage.local.set({ contextId: id });
+  try {
+    await storage?.set({ contextId: id });
+  } catch {}
   return id;
 }
 function connectWsChannel() {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel();
+    return;
+  }
   if (wsChannel && (wsChannel.readyState === WebSocket.OPEN || wsChannel.readyState === WebSocket.CONNECTING))
     return;
   try {
@@ -4938,21 +5227,7 @@ function connectWsChannel() {
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "");
         console.log("ws onmessage:", JSON.stringify(msg).slice(0, 200));
-        const controlType = registrationControlType(msg);
-        if (controlType === "context_conflict") {
-          markWsUnregistered();
-          console.error(`[interceptor] context name conflict: '${msg.contextId}' is already registered. Change the context ID in the extension popup.`);
-          setContextConflictBadge(chrome);
-          return;
-        }
-        if (controlType === "context_registered") {
-          markWsRegistered();
-          return;
-        }
-        if (msg.id && msg.action) {
-          msg._viaWs = true;
-          handleDaemonMessage(msg);
-        }
+        handleControlPlaneMessage(msg, "websocket");
       } catch (err) {
         console.error("ws onmessage error:", err);
       }
@@ -4981,7 +5256,10 @@ function connectWsChannel() {
 }
 var lastSwKeepalive = 0;
 function registerSwKeepaliveListener() {
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  const onMessage = chrome.runtime?.onMessage;
+  if (!onMessage?.addListener)
+    return;
+  onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type !== "sw_keepalive")
       return false;
     const now = Date.now();
@@ -4995,7 +5273,10 @@ function registerSwKeepaliveListener() {
   });
 }
 function registerStorageContextListener() {
-  chrome.storage.onChanged.addListener((changes, area) => {
+  const onChanged = chrome.storage?.onChanged;
+  if (!onChanged?.addListener)
+    return;
+  onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.contextId)
       return;
     const newId = changes.contextId.newValue;
@@ -5011,6 +5292,7 @@ function registerStorageContextListener() {
 }
 
 // extension/src/background-electron.ts
+initializeActionRouter();
 registerSwKeepaliveListener();
 registerStorageContextListener();
 connectWsChannel();

@@ -46,7 +46,7 @@ function installFakeChrome(): void {
     storage: {
       local: {
         get: async () => ({}),
-        set: async () => {},
+        set: async () => { throw new Error("Safari storage unavailable during bootstrap") },
       },
     },
     scripting: {
@@ -62,9 +62,6 @@ function installFakeChrome(): void {
       getFrame: async () => undefined,
       onCommitted: { addListener },
       onCompleted: { addListener },
-      onHistoryStateUpdated: { addListener },
-      onReferenceFragmentUpdated: { addListener },
-      onTabReplaced: { addListener },
     },
   }
 }
@@ -80,11 +77,15 @@ afterEach(() => {
 })
 
 describe("extension websocket lifecycle", () => {
-  test("coalesces overlapping websocket connection attempts before onopen", async () => {
+  test("Safari-shaped startup registers the explicit context once without storage", async () => {
     ;(globalThis as { WebSocket: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket
     installFakeChrome()
 
-    const { connectWsChannel } = await import("../extension/src/background/transport")
+    const { configureTransport, connectWsChannel } = await import("../extension/src/background/transport")
+    const { initializeActionRouter } = await import("../extension/src/background/router")
+
+    expect(() => initializeActionRouter()).not.toThrow()
+    configureTransport({ contextId: "safari", forceWebSocket: true })
 
     connectWsChannel()
     connectWsChannel()
@@ -92,5 +93,12 @@ describe("extension websocket lifecycle", () => {
     expect(FakeWebSocket.instances).toHaveLength(1)
     expect(FakeWebSocket.instances[0].url).toBe("ws://localhost:19222")
     expect(FakeWebSocket.instances[0].sent).toEqual([])
+
+    FakeWebSocket.instances[0].readyState = FakeWebSocket.OPEN
+    await FakeWebSocket.instances[0].onopen?.()
+
+    expect(FakeWebSocket.instances[0].sent).toEqual([
+      JSON.stringify({ type: "extension", contextId: "safari" }),
+    ])
   })
 })

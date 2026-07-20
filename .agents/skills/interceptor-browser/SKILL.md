@@ -1,13 +1,13 @@
 ---
 name: interceptor-browser
-description: "Drive a signed-in Chrome / Brave session via the interceptor CLI: open/read pages, click, type, inspect DOM/text/network, automate rich browser editors and scene graphs, capture WebSocket/Beacon/BroadcastChannel traffic, record/replay flows, take VLM-budgeted screenshots, compare pages, and route to specific browser profiles with --context. Use for browser page content, tabs, forms, SPA extraction, request overrides, page communication capture, and deployment checks. Not for native macOS apps, Electron desktop app web contents, OS dialogs, browser chrome, or large scraping."
+description: "Drive a signed-in Chrome / Brave / Safari session via the interceptor CLI: open/read pages, click, type, inspect DOM/text/network, automate rich browser editors and scene graphs, capture WebSocket/Beacon/BroadcastChannel traffic, record/replay flows, take VLM-budgeted screenshots, compare pages, and route to specific browser contexts with --context. Use for browser page content, tabs, forms, SPA extraction, request overrides, page communication capture, and deployment checks. Not for native macOS apps, Electron desktop app web contents, OS dialogs, browser chrome, or large scraping."
 metadata:
-  short-description: Drive a real signed-in Chrome / Brave session via the interceptor CLI
+  short-description: Drive a real signed-in Chrome / Brave / Safari session via the interceptor CLI
 ---
 
 # Interceptor Browser
 
-Agent-operator skill for the Browser surface of Interceptor. Use the `interceptor` CLI (no prefix) to drive a live Chrome / Brave session: pages, network, scene graph, monitor, screenshots. For native macOS apps load `interceptor-macos` instead.
+Agent-operator skill for the Browser surface of Interceptor. Use the `interceptor` CLI (no prefix) to drive a live Chrome, Brave, or Safari session: pages, network, scene graph, monitor, screenshots. For native macOS apps load `interceptor-macos` instead.
 
 This installed skill is self-contained. Source checkouts also have `AGENTS.md`, but packaged users may only have the skill directory below `/Library/Application Support/Interceptor/skills`.
 
@@ -18,9 +18,12 @@ This installed skill is self-contained. Source checkouts also have `AGENTS.md`, 
 - When other agents may share this browser, scope yourself with `--group <label>` on every command (or set `INTERCEPTOR_GROUP` once): your tabs live in their own colored group, resolution never leaves it, and cross-group targets are rejected. Run `interceptor group close <label>` when your job is done; `interceptor group list` shows what's running.
 - `interceptor open <url>` and `interceptor tab new <url>` create background tabs by default. Only `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>` intentionally move browser focus.
 - If multiple browser profiles are connected, run `interceptor contexts` and pass `--context <id>`.
+- Safari registers as the stable context `safari`; route with `interceptor --context safari <verb>`. If it is absent, verify the notarized Interceptor Safari extension is enabled before attempting page commands. Safari's enable switch is a protected user-present action; never try to bypass its Touch ID/password gate.
 - Prefer structured reads (`read`, `tree`, `text`, `inspect`, `scene`) before screenshots. Open `references/screenshot-policy.md` before screenshot-heavy work.
 - Default to plain text output. Use `--json` only when piping into scripts or when a downstream tool needs a machine-readable contract.
 - If an already-loaded unpacked extension behaves stale after a package update, reload it from `chrome://extensions` or `brave://extensions`, or run `interceptor reload` once the extension is reachable.
+- Safari package updates are loaded through the containing app/appex; do not look for a Chrome-style unpacked-extension reload button.
+- Safari suspends its background worker when idle, so `--context safari` can briefly report "context 'safari' not found" between commands and then self-heal. Re-issue the command rather than treating one transient drop as failure. Note two Safari capability limits: `headers add` only modifies recognized standard headers (arbitrary `X-…` names are refused — use `override` instead), and passive `net` capture reflects genuine page traffic, not requests you originate from `eval` (its world is separate from the page's).
 
 ## Fast Path
 

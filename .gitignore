@@ -3,6 +3,7 @@ node_modules/
 .claude/worktrees/
 dist/
 extension/dist/
+extension/dist-safari/
 daemon/interceptor-daemon
 daemon/*.exe
 daemon/.generated/
@@ -25,6 +26,8 @@ scripts/refresh-apple-docs.ts
 scripts/flatten-apple-docs.ts
 apple-developer-docs/
 interceptor-bridge/.build/
+safari/build/
+safari/InterceptorSafari/InterceptorSafari\ Extension/Resources/
 keys/
 /.vscode/
 /Auto\ Run\ Docs/

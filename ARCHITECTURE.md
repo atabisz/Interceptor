@@ -17,7 +17,8 @@ This document describes the live architecture as of the current monitor, CSP-fal
                                                      │ + WebSocket fallback
                                                      ▼
                                           ┌─────────────────────────┐
-                                          │ Chrome / Brave extension │
+                                          │ Browser WebExtensions     │
+                                          │ Chrome / Brave / Safari   │
                                           │ extension/src/*          │
                                           │ (background SW + content │
                                           │  scripts + inject-net)   │
@@ -34,7 +35,7 @@ This document describes the live architecture as of the current monitor, CSP-fal
 
 - **CLI** is a Bun-bundled standalone binary. It parses args, sends an action over `/tmp/interceptor.sock` to the daemon, and prints the response.
 - **Daemon** is a singleton (PID at `/tmp/interceptor.pid`). Spawned automatically by Chrome via native messaging, *or* started by the CLI on demand. It bridges CLI ⇄ extension ⇄ bridge, owns event persistence, and tracks per-session monitor artifacts.
-- **Extension** is an MV3 service worker plus content scripts + a MAIN-world inject script. It owns DOM capture, ref assignment, monitor session in-memory state, network monkey-patching, and scene-graph access for rich editors.
+- **Extension** is an MV3 service worker plus content scripts + a MAIN-world inject script. Chromium builds use `extension/src/background.ts`; Safari uses the native-relay `background-safari.ts` entrypoint inside a native containing app. Both own DOM capture, ref assignment, monitor session in-memory state, network monkey-patching, and scene-graph access for rich editors.
 - **Bridge** is a Swift LaunchAgent-style daemon that exposes macOS-native capabilities (AX tree, CGEvent input, ScreenCaptureKit, AVFoundation audio, Vision/NLP frameworks).
 
 ### CLI-first browser install
@@ -42,6 +43,7 @@ This document describes the live architecture as of the current monitor, CSP-fal
 - The primary repo install path builds `dist/interceptor`, `daemon/interceptor-daemon`, and `extension/dist/`, then runs `scripts/install.sh --brave --profile <profile>`.
 - `scripts/install.sh` writes native messaging host manifests for Chrome and Brave, then launches Brave with `--load-extension=extension/dist`. If Brave is already running, the script prompts before quitting and relaunching it.
 - Google Chrome branded desktop builds ignore `--load-extension`; the Chrome CLI path installs native messaging metadata, but the unpacked extension must be loaded manually from `chrome://extensions`.
+- Safari ships as the separate notarized `Interceptor-Safari-<version>.pkg` containing app. Opening the app once registers its appex; the user then enables Interceptor in Safari Settings through Safari's protected user-presence gate. Until that approval, Safari does not start the worker and no `safari` context exists. Its stable daemon context is `safari` after connection.
 - `interceptor macos trust` is a permission snapshot for native macOS automation. Browser runtime health should be checked through `interceptor status`, which confirms daemon, extension, and browser bridge state.
 
 ---
@@ -230,10 +232,15 @@ The daemon talks to the extension via three channels, routed by [`daemon/outboun
 - **Native messaging stdio** — when daemon was spawned by Chrome
 - **WebSocket** (`ws://localhost:19222`) — fallback / preferred for action requests
 - **Native relay** — secondary daemon instances become transparent stdin/stdout bridges to the singleton (eliminates the every-30-second native-host disconnect noise; introduced in [#28](https://github.com/Hacker-Valley-Media/interceptor/pull/28))
+- **Safari native relay** — Safari's service worker long-polls its containing appex with `runtime.sendNativeMessage`; the appex owns a `URLSessionWebSocketTask` to `127.0.0.1:19222` and relays the unchanged command/response envelope
+
+Safari uses the Safari native relay because public `WKWebExtension` probes showed that its background JavaScript did not open a direct loopback WebSocket, even with both `localhost` and `127.0.0.1`. `background-safari.ts` calls `configureTransport({ contextId: "safari", safariNativeRelay: true })` before opening the relay and optional capabilities. One-shot native messages carry a bounded long-poll exchange; `SafariWebExtensionHandler.swift` keeps the daemon WebSocket alive between exchanges. Safari-absent APIs degrade locally. The shared action router is import-safe: entrypoints call `initializeActionRouter()` explicitly, preventing a missing WebExtension event from becoming a background-content load failure before registration.
+
+Two Safari-specific behaviors live above the transport. **Navigation acknowledgment:** Safari can unload a content script before delivering its async `sendResponse` when a click starts a navigation, leaving the message channel pending. `content-bridge.ts` treats a loading/url update on the exact target tab as the acknowledgement for click-like actions only, so a navigating click resolves instead of hanging or replaying against the new document (this also hardens Chrome). **Header modification:** DNR `modifyHeaders` rules declare an explicit `resourceTypes` set (omitting it excludes `main_frame`, so top-level requests are never rewritten on any browser), and the Safari manifest requests `declarativeNetRequestWithHostAccess`, which Safari requires for `modifyHeaders`/`redirect`. Safari additionally restricts modification to recognized standard header names; arbitrary custom headers are rejected at rule registration and must be rewritten through the MAIN-world override path instead.
 
 #### Named contexts (multi-browser isolation)
 
-The daemon tracks all connected extensions in `extensionWsMap: Map<string, WebSocket>` rather than a single scalar. On first startup each extension generates a UUID and persists it in `chrome.storage.local` (unique per Chrome profile, survives MV3 service-worker restarts). The UUID is announced in every WebSocket registration message `{ type: "extension", contextId: "<uuid>" }`.
+The daemon tracks all connected extensions in `extensionWsMap: Map<string, WebSocket>` rather than a single scalar. Chrome/Brave profiles generate a UUID and persist it in `chrome.storage.local`; Safari uses the fixed id `safari`, and its registration does not depend on storage being available. The id is announced in every WebSocket registration message `{ type: "extension", contextId: "<id>" }`; for Safari, the appex sends that registration over its relay-owned socket.
 
 CLI commands carry an optional `contextId` field in the IPC message. `sendNativeMessage` resolves the target WebSocket by:
 1. Exact `contextId` match from the map (when `--context <id>` is passed)
@@ -474,8 +481,10 @@ extension. `release.sh` (Step 6.5) asserts the `.pkg` ships no extension bundle.
 | `extension/dist/inject-net.js` | `extension/src/inject-net.ts` (Bun bundle, target=browser) | MAIN-world net interceptor |
 | `extension/dist/inject-canvas.js` | `extension/src/inject-canvas.ts` (Bun bundle, target=browser) | MAIN-world canvas observer |
 | `extension/dist/offscreen.js` | `extension/src/offscreen.ts` (Bun bundle, target=browser) | Extension offscreen worker for OCR/image helpers |
+| `extension/dist-safari/background-safari.js` | `extension/src/background-safari.ts` (Bun bundle, target=browser) | Safari MV3 native-relay service worker |
+| `safari/build/Build/Products/Release/InterceptorSafari.app` | `scripts/build-safari.sh` + Xcode project | Safari containing app + embedded appex |
 
-`bash scripts/build.sh` builds the extension, CLI, daemon, and macOS bridge when Swift is available. Windows builds skip the macOS bridge.
+`bash scripts/build.sh` builds the Chromium, Electron, and Safari web bundles plus the CLI, daemon, and macOS bridge when Swift is available. `scripts/build-safari.sh` rebuilds those source bundles by default, runs a `WKWebExtension` background-bootstrap verifier, notarizes and staples the containing app, copies it to a guarded system-volume staging directory, requires Gatekeeper to accept that copy, and feeds those exact bytes to `pkgbuild` before notarizing/stapling the package. The Safari package postinstall moves only identifier-verified legacy `.InterceptorSafari-*.noindex` backup apps out of `/Applications` to recoverable Application Support storage, unregisters them, and registers the installed app; this prevents duplicate appexes with the same identifier. `INTERCEPTOR_SKIP_BASE_BUILD=1` is an advanced/CI escape hatch for an already-verified fresh bundle. Skip-notary builds are named `*-UNNOTARIZED.pkg` so they cannot be confused with installable release artifacts. On macOS older than 15.4 the engine-level verifier is skipped because the hosting API is unavailable. Windows builds skip native macOS artifacts.
 
 ---
 

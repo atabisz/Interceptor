@@ -241,11 +241,12 @@ interceptor contexts                                # List IDs of all connected 
 interceptor --context <id> read                     # Route command to a specific profile
 interceptor --context <id> open <url>
 interceptor --context <id> act e7 "value"
+interceptor --context safari read                   # Safari uses a stable context id
 ```
 
-Each browser profile auto-generates a stable UUID on first run (stored in `chrome.storage.local`). `contexts` lists all currently connected IDs. Without `--context`, commands auto-route only when exactly one context is connected; zero or multiple connected contexts fail fast and require `--context <id>`.
+Chrome/Brave profiles auto-generate stable UUIDs on first run (stored in `chrome.storage.local`); Safari registers the fixed id `safari`. `contexts` lists all currently connected IDs. Without `--context`, commands auto-route only when exactly one context is connected; zero or multiple connected contexts fail fast and require `--context <id>`.
 
-Primary use case: two Chrome profiles logged in to different accounts simultaneously (cross-account security testing, multi-tenant verification).
+Primary use cases: multiple Chrome profiles logged in to different accounts, or Chrome/Brave and Safari connected to the same daemon simultaneously.
 
 ## Capabilities + Reload
 
