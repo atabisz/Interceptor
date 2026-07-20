@@ -7,7 +7,7 @@ import { createHash } from "node:crypto"
 import { dirname } from "node:path"
 import { validateBinarySinkPath, binarySinkIntegrityError } from "./binary-sink"
 import { osClick, osKey, osType, osMove, generateBezierPath, translateCoords } from "./os-input-loader"
-import { IS_WIN, SOCKET_PATH, IPC_PORT, PID_PATH, LOCK_PATH, LOG_PATH, EVENTS_PATH, WS_PORT, EVENTS_MAX_SIZE, transportLabel } from "../shared/platform"
+import { IS_WIN, SOCKET_PATH, IPC_PORT, PID_PATH, LOCK_PATH, LOG_PATH, EVENTS_PATH, WS_PORT, EVENTS_MAX_SIZE, MAX_UPLOAD_FRAME_BYTES, transportLabel } from "../shared/platform"
 import {
   MONITOR_EVENT_NAMES,
   appendSessionEvent,
@@ -1284,8 +1284,21 @@ try {
 
         while (buf.length >= 4) {
           const msgLen = buf.readUInt32LE(0)
-          if (msgLen === 0 || msgLen > 1024 * 1024) {
-            log(`invalid socket message length: ${msgLen}, discarding`)
+          if (msgLen === 0 || msgLen > MAX_UPLOAD_FRAME_BYTES) {
+            // Oversized/corrupt frame. Recover the request id from the buffered
+            // prefix — it sits at the front of the JSON ({"id":"…","action":…}) —
+            // so the CLI gets an honest error instead of a silent 15s timeout,
+            // then drop the buffer.
+            let recoveredId: string | undefined
+            try {
+              const prefix = buf.subarray(4, Math.min(buf.length, 4 + 256)).toString("utf-8")
+              const m = prefix.match(/"id"\s*:\s*"([^"]+)"/)
+              if (m) recoveredId = m[1]
+            } catch {}
+            log(`oversized socket frame: ${msgLen} bytes exceeds ${MAX_UPLOAD_FRAME_BYTES}, discarding${recoveredId ? ` (id ${recoveredId})` : ""}`)
+            if (recoveredId) {
+              socketWriteFramed(socket, JSON.stringify({ id: recoveredId, result: { success: false, error: `payload too large: ${msgLen} bytes exceeds transport limit ${MAX_UPLOAD_FRAME_BYTES} — split the upload or use a smaller file` } }))
+            }
             buf = Buffer.alloc(0)
             break
           }

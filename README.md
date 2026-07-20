@@ -398,7 +398,11 @@ interceptor focus e5                         # Focus element
 interceptor drag e5 --from 0,0 --to 100,50  # Drag gesture
 interceptor dblclick e5                      # Double-click
 interceptor rightclick e5                    # Right-click (context menu)
+interceptor upload e5 ./resume.pdf           # Attach a local file to an <input type=file> or dropzone (no OS dialog, no CDP)
+interceptor upload e5 ./clip.mp4 --dropzone  # Force the drag-and-drop path (skip input detection)
+interceptor upload e5 ./photo.png --picker   # Stage for a File System Access picker, then click the trigger
 ```
+`upload` handles `<input type=file>`, drag-and-drop dropzones, and File System Access pickers. Files of any size work — large files are split into frames and reassembled automatically. The result reports the `method` used and a `verified` flag. `read` marks an uploadable element with an `upload=` hint. If a site creates its file input only on click, `interceptor click` the upload button first, then `upload`.
 
 ### Navigate
 ```bash

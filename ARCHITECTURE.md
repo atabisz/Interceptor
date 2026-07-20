@@ -245,6 +245,15 @@ Per-context outbound queues (`wsOutboundQueues: Map<string, string[]>`) replace 
 
 `interceptor contexts` lists all connected context IDs. Use `--context <id>` on any command to route it to a specific profile.
 
+#### Message framing and large payloads (file upload)
+
+CLI↔daemon IPC and the daemon↔extension channels use length-prefixed frames (a 4-byte little-endian length followed by JSON). Two rules keep large frames intact:
+
+- **Backpressure.** `socket.write()` returns a partial byte count when a frame exceeds the socket send buffer; the unwritten remainder is queued and flushed on the `drain` event (`sendCommand` in `cli/transport.ts`, `socketWriteFramed` in `daemon/index.ts`). A single unchecked write silently truncates a large frame and the peer then blocks forever.
+- **Frame ceiling.** The IPC readers accept frames up to `MAX_UPLOAD_FRAME_BYTES` (`shared/platform.ts`). An oversized frame is dropped, but the request id is recovered from the buffered prefix so the caller gets an honest "payload too large" error instead of a silent timeout.
+
+**File-upload transport.** `interceptor upload` ships file bytes base64-encoded. Above `UPLOAD_CHUNK_B64_BYTES` the CLI splits the payload into sequential `file_upload_chunk` actions sharing an `uploadId`; the content script buffers them and a final `file_upload` assemble message reconstructs the file. Each chunk stays under the browser's ~1 MiB native-messaging host→extension limit, so uploads work on every daemon↔extension transport, not just WebSocket. The content handler prefers setting a resolved `<input type=file>`'s `.files` (which is `isTrusted`-independent), then falls back to a trusted synthetic drop and a File System Access `showOpenFilePicker` shim; every path returns a `verified` flag rather than claiming blind success.
+
 ### macOS bridge
 
 [`interceptor-bridge/`](interceptor-bridge/) is a Swift Package binary launched as a LaunchAgent. It exposes:

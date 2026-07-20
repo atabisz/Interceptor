@@ -137,6 +137,47 @@ if ((window as any).__interceptor_net_installed) {
     })()
   }) as EventListener, true)
 
+  // File System Access API shim. Sites whose "browse" button calls
+  // window.showOpenFilePicker() open a native OS panel the browser surface can't
+  // drive. The content script stages a file via __interceptor_stage_file; the
+  // next showOpenFilePicker() call resolves to that file instead of opening the
+  // panel. Only installed when the native API exists (Chromium), so we never
+  // fake support that would change a page's feature detection.
+  {
+    const stagedFiles: Array<{ blobUrl: string; name: string; type: string }> = []
+    document.addEventListener("__interceptor_stage_file", ((e: CustomEvent) => {
+      const d = (e.detail || {}) as { blobUrl?: string; name?: string; type?: string }
+      if (d.blobUrl) stagedFiles.push({ blobUrl: d.blobUrl, name: d.name || "file", type: d.type || "application/octet-stream" })
+    }) as EventListener)
+
+    const win = window as unknown as { showOpenFilePicker?: (...a: unknown[]) => Promise<unknown> }
+    if (typeof win.showOpenFilePicker === "function") {
+      const orig = win.showOpenFilePicker.bind(window)
+      try {
+        Object.defineProperty(window, "showOpenFilePicker", {
+          configurable: true,
+          writable: true,
+          value: async function (...args: unknown[]) {
+            const staged = stagedFiles.shift()
+            if (!staged) return orig(...args)
+            const resp = await fetch(staged.blobUrl)
+            const blob = await resp.blob()
+            const file = new File([blob], staged.name, { type: staged.type || blob.type || "application/octet-stream" })
+            try { URL.revokeObjectURL(staged.blobUrl) } catch {}
+            return [{
+              kind: "file",
+              name: staged.name,
+              getFile: async () => file,
+              isSameEntry: async () => false,
+              queryPermission: async () => "granted",
+              requestPermission: async () => "granted",
+            }]
+          }
+        })
+      } catch {}
+    }
+  }
+
   function applyOverrides(rawUrl: string): string {
     if (!overrideRules.length) return rawUrl
     for (const rule of overrideRules) {

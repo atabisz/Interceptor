@@ -83,6 +83,14 @@ The historical reflex of "site checks `isTrusted` → use `--os`" is no longer c
 
 Deep mechanic notes (the `userActivation` override + `__interceptor_trust` marker, canvas-rendered editor input, blob export capture): [`.agents/skills/interceptor-browser/references/rich-editors.md`](.agents/skills/interceptor-browser/references/rich-editors.md).
 
+## File Uploads (browser)
+
+`interceptor upload <ref> <path>` attaches a local file to any web upload area — no OS dialog, no CDP. It covers `<input type=file>`, drag-and-drop dropzones, and File System Access pickers (`--picker`). Any size works: files past the single-frame limit are chunked and reassembled automatically. The result reports the `method` used and a `verified` flag.
+
+- Prefer `upload` over clicking an upload control. A raw click can raise a native OS file panel the browser surface cannot drive.
+- `read` tags an uploadable element with `upload="interceptor upload <ref> <path>"`. Target that ref; resolution is forgiving of which sub-node of the dropzone you name.
+- Some sites create the hidden file input only in response to a real click (it is absent on first paint). If no file input exists yet, `interceptor click` the upload button first — the trusted pointer sequence materializes it — then `upload`.
+
 ## Recovery Reflexes
 
 - Stale ref → `read` or `find` again.
@@ -90,6 +98,7 @@ Deep mechanic notes (the `userActivation` override + `__interceptor_trust` marke
 - Canvas page has no DOM text → `canvas status`, `canvas log`, `canvas objects`.
 - Rich editor exposes no usable DOM refs → `scene profile`.
 - Action did nothing → `inspect` before retrying.
+- `upload` timed out or the file never attached → the site likely creates its file input lazily. `interceptor click` the upload button first, then re-run `upload`. If the control only opens a native OS panel, drive it with `interceptor macos` (⌘⇧G → absolute path → Return).
 - Network behavior unclear → `inspect --net-only` or `net log --filter <term>`.
 - AX tree came back truncated with a trailing `… (stopped: …)` line → that is the traversal budget, not an error. Widen with `interceptor macos tree --max-nodes N` / `--max-ms N`, or scope tighter with `--app` / `--depth`. Large trees (e.g. Finder with the desktop) intentionally return a bounded partial instead of hanging.
 - `interceptor macos text` on a password / secure field returns `•••` → secure fields are always redacted. That is correct behavior; do not retry expecting the value.

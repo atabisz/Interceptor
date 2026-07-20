@@ -47,6 +47,23 @@ export const EVENTS_PATH = current.eventsPath
 export const MONITOR_SESSIONS_DIR = current.monitorSessionsDir
 export const EVENTS_MAX_SIZE = 10 * 1024 * 1024
 
+// File-upload transport sizing. The `upload` verb ships file bytes
+// base64-encoded inside the command JSON. Three limits gate the path:
+//  - MAX_UPLOAD_FRAME_BYTES: the largest single length-prefixed frame the
+//    CLI<->daemon Unix socket will accept. Raised from the historical 1 MiB
+//    (which silently discarded any file > ~768 KiB) to 64 MiB so a single-shot
+//    upload can ride the WS daemon<->extension transport up to the
+//    tabs.sendMessage ceiling.
+//  - UPLOAD_CHUNK_B64_BYTES: base64 length above which the CLI splits the file
+//    into sequential `file_upload_chunk` actions. Kept well under Chrome's hard
+//    1 MiB native-messaging host->extension limit so chunked uploads work on
+//    EVERY daemon<->extension transport (ws / native / relay), not just WS.
+//  - MAX_UPLOAD_FILE_BYTES: raw-file preflight ceiling. Above this the CLI
+//    fails fast with an honest error instead of a silent timeout.
+export const MAX_UPLOAD_FRAME_BYTES = 64 * 1024 * 1024
+export const UPLOAD_CHUNK_B64_BYTES = 512 * 1024
+export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
+
 export function listenOptions(socketHandlers: Record<string, unknown>) {
   if (IS_WIN) {
     return { hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers }

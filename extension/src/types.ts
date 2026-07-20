@@ -29,7 +29,8 @@ export type Action =
   | { type: "focus"; index?: number; ref?: string }
   | { type: "hover"; index?: number; ref?: string; fromX?: number; fromY?: number; steps?: number }
   | { type: "drag"; index?: number; ref?: string; fromX: number; fromY: number; toX: number; toY: number; steps?: number; duration?: number }
-  | { type: "file_upload"; index?: number; ref?: string; fileName: string; mimeType: string; dataBase64: string; dropzone?: boolean }
+  | { type: "file_upload"; index?: number; ref?: string; fileName?: string; mimeType?: string; dataBase64?: string; dropzone?: boolean; picker?: boolean; uploadId?: string }
+  | { type: "file_upload_chunk"; uploadId: string; seq: number; total: number; chunk: string }
   | { type: "keepawake"; on: boolean; level?: "system" | "display" }
   | { type: "idle_state"; detectionInterval?: number }
   | { type: "get_state"; full?: boolean; tabId?: number }

@@ -142,6 +142,23 @@ var init_element_tree = __esm(() => {
 });
 
 // extension/src/content/a11y-tree.ts
+function isUploadTarget(el, maxDepth = 3) {
+  if (el instanceof HTMLInputElement && el.type === "file")
+    return true;
+  let frontier = [el];
+  for (let d = 0;d < maxDepth && frontier.length; d++) {
+    const next = [];
+    for (const node of frontier) {
+      for (const child of Array.from(node.children)) {
+        if (child instanceof HTMLInputElement && child.type === "file")
+          return true;
+        next.push(child);
+      }
+    }
+    frontier = next;
+  }
+  return false;
+}
 function getEffectiveRole(el) {
   const explicit = el.getAttribute("role");
   if (explicit)
@@ -309,16 +326,19 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
       const name = getAccessibleName(el);
       const attrs = getRelevantAttrs(el);
       const styleBundle = includeStyle ? getStyleBundle(el) : "";
+      const uploadable = isUploadTarget(el);
       if (compact) {
         const nameClause = name ? `|${name}` : "";
         const attrClause = compactAttrClause(attrs);
         const styleClause = styleBundle ? `|style={${styleBundle}}` : "";
-        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}]`);
+        const uploadClause = uploadable ? "|upload" : "";
+        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}${uploadClause}]`);
       } else {
         const nameStr = name ? ` "${name}"` : "";
         const attrStr = attrs ? ` ${attrs}` : "";
         const styleStr = styleBundle ? ` style="${styleBundle}"` : "";
-        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}`);
+        const uploadStr = uploadable ? ` upload="interceptor upload ${refId} <path>"` : "";
+        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}${uploadStr}`);
       }
     }
     const shadow = getShadowRoot(el);
@@ -2044,7 +2064,23 @@ function findFileInput(el) {
   if (el instanceof HTMLInputElement && el.type === "file")
     return el;
   const inner = el.querySelector?.('input[type="file"]');
-  return inner ?? null;
+  if (inner)
+    return inner;
+  let anc = el.parentElement;
+  let hops = 0;
+  while (anc && hops < 5) {
+    if (anc instanceof HTMLInputElement && anc.type === "file")
+      return anc;
+    const found = anc.querySelector?.('input[type="file"]');
+    if (found)
+      return found;
+    anc = anc.parentElement;
+    hops++;
+  }
+  const all = Array.from(document.querySelectorAll('input[type="file"]'));
+  if (all.length === 1)
+    return all[0];
+  return null;
 }
 function isolatedDrop(target, file) {
   const rect = target.getBoundingClientRect();
@@ -2091,16 +2127,87 @@ function bridgedDrop(target, bytes, name, type) {
     }));
   });
 }
+function anyInputHasFiles() {
+  for (const inp of Array.from(document.querySelectorAll('input[type="file"]'))) {
+    if (inp.files && inp.files.length > 0)
+      return true;
+  }
+  return false;
+}
+function nameVisibleIn(scope, needle) {
+  return (scope.textContent || "").toLowerCase().includes(needle);
+}
+function verifyUploaded(target, fileName, nameAlreadyPresent) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const needle = fileName.toLowerCase();
+    const scope = target.closest("form") || document.body;
+    const check = () => {
+      if (anyInputHasFiles())
+        return true;
+      if (!nameAlreadyPresent && needle && nameVisibleIn(scope, needle))
+        return true;
+      return false;
+    };
+    const tick = () => {
+      if (check())
+        return resolve(true);
+      if (Date.now() - started > 1500)
+        return resolve(false);
+      setTimeout(tick, 150);
+    };
+    tick();
+  });
+}
+function stageForPicker(bytes, name, type) {
+  const blob = new Blob([bytes.buffer], { type: type || "application/octet-stream" });
+  const blobUrl = URL.createObjectURL(blob);
+  document.dispatchEvent(new CustomEvent("__interceptor_stage_file", {
+    detail: { blobUrl, name, type }
+  }));
+}
+var chunkBuffers = new Map;
+function handleFileUploadChunk(action) {
+  const uploadId = String(action.uploadId || "");
+  const seq2 = Number(action.seq);
+  const total = Number(action.total);
+  const chunk = typeof action.chunk === "string" ? action.chunk : "";
+  if (!uploadId || !Number.isInteger(seq2) || !Number.isInteger(total) || total <= 0) {
+    return { success: false, error: "file_upload_chunk: malformed chunk header" };
+  }
+  let buf = chunkBuffers.get(uploadId);
+  if (!buf) {
+    buf = { parts: new Array(total).fill(null), total };
+    chunkBuffers.set(uploadId, buf);
+  }
+  if (seq2 < 0 || seq2 >= buf.total) {
+    return { success: false, error: `file_upload_chunk: seq ${seq2} out of range 0..${buf.total - 1}` };
+  }
+  buf.parts[seq2] = chunk;
+  const received = buf.parts.reduce((n, p) => n + (p !== null ? 1 : 0), 0);
+  return { success: true, data: { buffered: received, of: buf.total } };
+}
 async function handleFileUpload(action) {
+  let dataBase64;
+  if (typeof action.dataBase64 === "string") {
+    dataBase64 = action.dataBase64;
+  } else if (typeof action.uploadId === "string") {
+    const buf = chunkBuffers.get(action.uploadId);
+    if (!buf)
+      return { success: false, error: `file_upload: no buffered chunks for uploadId ${action.uploadId} — the tab may have reloaded mid-upload; retry` };
+    if (buf.parts.some((p) => p === null))
+      return { success: false, error: `file_upload: missing chunks for uploadId ${action.uploadId}` };
+    dataBase64 = buf.parts.join("");
+    chunkBuffers.delete(action.uploadId);
+  } else {
+    return { success: false, error: "file_upload: missing dataBase64" };
+  }
   const el = resolveElement(action.index, action.ref);
   if (!el) {
     return { success: false, error: `stale element [${String(action.ref ?? action.index)}] — run interceptor state to refresh` };
   }
   const fileName = String(action.fileName || "file");
   const mimeType = String(action.mimeType || "application/octet-stream");
-  const dataBase64 = action.dataBase64;
-  if (typeof dataBase64 !== "string")
-    return { success: false, error: "file_upload: missing dataBase64" };
   let bytes;
   try {
     bytes = base64ToBytes(dataBase64);
@@ -2108,6 +2215,19 @@ async function handleFileUpload(action) {
     return { success: false, error: `file_upload: invalid base64 (${e.message})` };
   }
   const file = new File([bytes.buffer], fileName, { type: mimeType });
+  if (action.picker === true) {
+    stageForPicker(bytes, fileName, mimeType);
+    return {
+      success: true,
+      data: {
+        method: "picker-staged",
+        fileName,
+        size: bytes.byteLength,
+        verified: false,
+        note: "file staged for the next window.showOpenFilePicker() — now click the element that opens the file picker"
+      }
+    };
+  }
   const forceDropzone = action.dropzone === true;
   const fileInput = forceDropzone ? null : findFileInput(el);
   if (fileInput) {
@@ -2118,17 +2238,30 @@ async function handleFileUpload(action) {
     fileInput.files = dt.files;
     fileInput.dispatchEvent(new Event("input", { bubbles: true }));
     fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    const verified2 = fileInput.files.length > 0;
     return {
       success: true,
-      data: { method: "input", fileName, size: bytes.byteLength, multiple: fileInput.multiple, accept: fileInput.accept || null }
+      data: { method: "input", fileName, size: bytes.byteLength, verified: verified2, multiple: fileInput.multiple, accept: fileInput.accept || null }
     };
   }
   const target = el;
+  const scope = target.closest("form") || document.body;
+  const nameAlreadyPresent = nameVisibleIn(scope, fileName.toLowerCase());
   const bridged = await bridgedDrop(target, bytes, fileName, mimeType);
-  if (bridged)
-    return { success: true, data: { method: "dropzone-trusted", fileName, size: bytes.byteLength } };
-  isolatedDrop(target, file);
-  return { success: true, data: { method: "dropzone-isolated", fileName, size: bytes.byteLength } };
+  if (!bridged)
+    isolatedDrop(target, file);
+  const method = bridged ? "dropzone-trusted" : "dropzone-isolated";
+  const verified = await verifyUploaded(target, fileName, nameAlreadyPresent);
+  return {
+    success: true,
+    data: {
+      method,
+      fileName,
+      size: bytes.byteLength,
+      verified,
+      ...verified ? {} : { hint: "the page showed no sign of accepting the drop — the target may not be the dropzone, or it opens a native file picker (retry with --picker)" }
+    }
+  };
 }
 
 // extension/src/content/actions/hover.ts
@@ -4529,6 +4662,8 @@ async function executeAction(action) {
         return handleDrag(action);
       case "file_upload":
         return handleFileUpload(action);
+      case "file_upload_chunk":
+        return handleFileUploadChunk(action);
       case "input_text":
         return handleInputText(action);
       case "select_option":
