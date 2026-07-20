@@ -26,8 +26,16 @@ import { handleCdpNetworkActions } from "./capabilities/cdp-network-actions"
 import { handleMonitorActions, registerMonitorListeners } from "./capabilities/monitor"
 import { handlePowerIdleActions } from "./keepawake"
 
-registerMonitorListeners()
-restorePageCommCaptureConfig()
+// Keep this module import-safe. `transport.ts` imports the message dispatcher,
+// which imports this router, so any top-level browser API call here runs before
+// an entrypoint can select its browser-specific transport and capabilities.
+// Safari treats an exception during that phase as a background-content load
+// failure and never reaches the daemon. Each entrypoint calls this explicitly
+// after it has configured its own runtime.
+export function initializeActionRouter(): void {
+  registerMonitorListeners()
+  restorePageCommCaptureConfig()
+}
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 

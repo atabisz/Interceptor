@@ -163,6 +163,72 @@ fs.writeFileSync("extension/dist-mv2/manifest.json", JSON.stringify(manifest, nu
   chmod -R u+rwX,go+rX extension/dist-mv2/icons 2>/dev/null || true
 }
 
+build_extension_safari() {
+  # Safari Web Extension (MV3). Retarget of the same src tree:
+  # native-relay background (background-safari), portable content/inject scripts
+  # reused verbatim from dist, and a permission-stripped manifest (Safari has no
+  # debugger/tabGroups/offscreen/tabCapture/power/idle/sessions/pageCapture, so
+  # OCR/pixel-capture route to the native `interceptor macos` lane, not tesseract).
+  echo "Building Safari Web Extension (MV3)..."
+  rm -rf extension/dist-safari
+  mkdir -p extension/dist-safari
+  bun build extension/src/background-safari.ts --outfile=extension/dist-safari/background-safari.js --target=browser
+  cp extension/dist/content.js extension/dist-safari/content.js
+  cp extension/dist/net-buffer-content.js extension/dist-safari/net-buffer-content.js
+  cp extension/dist/inject-net.js extension/dist-safari/inject-net.js
+  cp extension/dist/inject-canvas.js extension/dist-safari/inject-canvas.js
+  cp extension/dist/popup.js extension/dist-safari/popup.js
+  cp extension/popup.html extension/dist-safari/popup.html
+  rm -rf extension/dist-safari/icons
+  cp -R extension/icons extension/dist-safari/icons
+  bun -e '
+const fs = require("fs");
+const base = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+const manifest = {
+  manifest_version: 3,
+  name: "Interceptor",
+  version: base.version,
+  description: base.description,
+  icons: base.icons,
+  // Safari-supported permission subset (verified against WKWebExtension.Permission).
+  // notifications has no permission constant and the packager rejects it, so it is
+  // omitted; notifications route to the native macos lane.
+  // declarativeNetRequestWithHostAccess is required by Safari for modifyHeaders and
+  // redirect actions; declarativeNetRequest alone only authorizes block and allow.
+  permissions: [
+    "activeTab", "scripting", "tabs", "storage", "nativeMessaging", "cookies",
+    "webNavigation", "declarativeNetRequest", "declarativeNetRequestWithHostAccess",
+    "contextMenus", "alarms", "clipboardWrite"
+  ],
+  host_permissions: ["<all_urls>"],
+  commands: base.commands,
+  // The bundle is self-contained (bun inlines every import), so no type:module —
+  // Safari does not honor a module service worker and warns on the key.
+  background: { service_worker: "background-safari.js" },
+  // Safari applies the extension-page CSP to its background worker. Keep the
+  // loopback endpoints explicit for diagnostic/fallback probes. The selected
+  // production path is the containing appex native relay.
+  content_security_policy: {
+    extension_pages: "script-src '"'"'self'"'"'; object-src '"'"'self'"'"'; connect-src ws://localhost:19222 ws://127.0.0.1:19222"
+  },
+  action: {
+    default_title: "Interceptor",
+    default_popup: "popup.html",
+    default_icon: base.action && base.action.default_icon ? base.action.default_icon : base.icons
+  },
+  content_scripts: [
+    { matches: ["<all_urls>"], js: ["net-buffer-content.js"], run_at: "document_start", all_frames: true, match_origin_as_fallback: true },
+    { matches: ["<all_urls>"], js: ["inject-net.js"], run_at: "document_start", world: "MAIN", all_frames: true, match_origin_as_fallback: true },
+    { matches: ["<all_urls>"], js: ["inject-canvas.js"], run_at: "document_start", world: "MAIN", all_frames: true, match_origin_as_fallback: true },
+    { matches: ["<all_urls>"], js: ["content.js"], run_at: "document_idle", all_frames: true, match_origin_as_fallback: true }
+  ]
+};
+fs.writeFileSync("extension/dist-safari/manifest.json", JSON.stringify(manifest, null, 2) + "\n");
+'
+  chmod 644 extension/dist-safari/* 2>/dev/null || true
+  chmod -R u+rwX,go+rX extension/dist-safari/icons 2>/dev/null || true
+}
+
 build_host() {
   echo "Building CLI (host)..."
   bun build cli/index.ts --compile --outfile=dist/interceptor
@@ -208,6 +274,7 @@ build_bridge() {
 
 build_extension
 build_extension_mv2
+build_extension_safari
 
 if [[ "$BUILD_ALL" == "1" ]]; then
   build_host
@@ -253,6 +320,7 @@ fi
 echo "Build complete."
 echo "  Extension: extension/dist/"
 echo "  Electron extension: extension/dist-mv2/"
+echo "  Safari extension: extension/dist-safari/"
 if [[ "$BUILD_ALL" == "1" ]]; then
   echo "  Host CLI:   dist/interceptor"
   echo "  Host Daemon: daemon/interceptor-daemon"

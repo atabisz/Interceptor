@@ -29,8 +29,9 @@ Use this as the routing skill before loading a surface-specific skill.
 - `interceptor open <url>` and `interceptor tab new <url>` create background tabs by default. Only `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>` intentionally move browser focus.
 - The macOS surface is background-first by default. Only `interceptor macos app activate <app>` and `interceptor macos open <app> --activate` intentionally move focus.
 - If multiple browser profiles are connected, run `interceptor contexts` and pass `--context <id>`.
+- Safari registers as `safari`; use `interceptor --context safari <verb>` for page content and `interceptor macos` for Safari chrome or native fallbacks.
 - Prefer compound commands (`open`, `read`, `act`, `inspect`) and structured reads before screenshots.
-- The zero-CDP browser rule governs the user's real Chrome/Brave web session. For owned Electron apps, `interceptor macos cdp` and `interceptor macos cdp app` are intentional app-control surfaces.
+- The zero-CDP browser rule governs the user's real Chrome/Brave/Safari web session. For owned Electron apps, `interceptor macos cdp` and `interceptor macos cdp app` are intentional app-control surfaces.
 - For native app runtime internals, use `interceptor macos runtime` after checking `interceptor status`; public Full installs may require operator-supplied runtime agent dylibs/signing identity before `macos runtime enable`.
 - If an already-loaded unpacked extension behaves stale after a package update, reload it from `chrome://extensions` or `brave://extensions`, or run `interceptor reload` once the extension is reachable.
 

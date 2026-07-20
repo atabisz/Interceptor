@@ -30,14 +30,14 @@
   <img src="https://img.shields.io/github/v/release/Hacker-Valley-Media/Interceptor?label=release" alt="Latest release">
   <img src="https://img.shields.io/github/license/Hacker-Valley-Media/Interceptor" alt="License">
   <img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported">
-  <img src="https://img.shields.io/badge/Chrome%20%26%20Brave-supported-4285F4?logo=googlechrome" alt="Chrome and Brave supported">
+  <img src="https://img.shields.io/badge/Chrome%2C%20Brave%20%26%20Safari-supported-4285F4?logo=googlechrome" alt="Chrome, Brave, and Safari supported">
 </p>
 
 ![Interceptor running cinematic overlays on top of a live website](docs/assets/interceptor-cook-mode.jpg)
 
 Interceptor gives agents human-style control of the tools you already use — **computer-use** for the native macOS apps on your desktop, **browser-use** for the web apps in your browser. Work happens in both places, so Interceptor meets you in the middle. One CLI, two product surfaces:
 
-- **Interceptor Browser** — runs as a Chrome extension inside your actual browser. Your cookies, sessions, logins, and tabs stay intact. Read pages, click, type, navigate, observe network traffic, automate rich editors, record-and-replay user flows.
+- **Interceptor Browser** — runs as a WebExtension inside your actual Chrome, Brave, or Safari session. Your cookies, sessions, logins, and tabs stay intact. Read pages, click, type, navigate, observe network traffic, automate rich editors, record-and-replay user flows.
 - **Interceptor macOS** — runs as a Swift bridge daemon. Drives native macOS apps the same way: structured accessibility trees, OS-level trusted input, on-device vision/speech/NLP, system-wide event monitoring.
 - **Interceptor iOS** — drives any installed app on an owned, unlocked, Developer-Mode iPhone via an on-device XCUITest runner that dials into the daemon over WiFi: ref-tagged element trees, deterministic coordinate taps, reliable text entry, screenshots, and app lifecycle. Plus runner-free **Instruments/telemetry** (`ios proc / top / spawn / kill / location / gpu / shot`), an **on-device JS brain** (`ios eval` — a whole observe→decide→act loop runs on the phone in one round-trip), **WebKit inspection** (`ios web`), and classic-Lockdown **device services** (`ios logs / diag / fs / crash / profiles`). Addressed as `--on <phone>` / `ios:<udid>`. See `interceptor ios help`.
 
@@ -73,12 +73,13 @@ Click the preview to watch the current walkthrough. It shows the CLI flow and li
 
 Download a signed installer and double-click. macOS does the rest.
 
-Two installers ship per release. Pick the one that matches what you actually need:
+Two core installers ship per release, plus an optional Safari add-on. Pick the core installer that matches what you need, then add Safari if desired:
 
 | Installer | What it installs | macOS TCC consents | When to pick it |
 |---|---|---|---|
 | **`Interceptor-Browser-<version>.pkg`** *(recommended default)* | CLI + daemon + extension | **None.** No Screen Recording / Accessibility / Apple Events prompts. | You drive web pages. Web scraping, CI flow tests, browser automation. macOS 11+. |
 | **`Interceptor-Full-<version>.pkg`** | All of the above **plus** `interceptor-bridge.app` + LaunchAgent | Screen Recording, Accessibility, Apple Events (per target app, on first dispatch) | You also drive native macOS apps (Finder, Slack, Notes), need on-screen text capture, dispatch keystrokes outside the browser. macOS 14+. |
+| **`Interceptor-Safari-<version>.pkg`** *(add-on)* | Safari containing app + Safari Web Extension | Safari extension/site-access consent; requires either core pkg for the CLI + daemon | You want the browser surface in Safari. macOS 14+. |
 
 Both download from the same [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page. Start with **Browser** unless you know you need native macOS commands — you can always upgrade to Full later via `interceptor upgrade --full`.
 
@@ -87,7 +88,8 @@ Both download from the same [Releases](https://github.com/Hacker-Valley-Media/In
 1. Download the matching `.pkg` from Releases.
 2. Double-click it. Walk through the installer (admin password required once).
 3. *(Full pkg only)* Open **System Settings → Privacy & Security**. The first time you run `interceptor macos *`, macOS will prompt for **Accessibility**, **Screen Recording**, and **Apple Events** access for `interceptor-bridge` — allow each. The Browser pkg never triggers these prompts.
-4. Open a terminal:
+4. *(Safari add-on only)* Install `Interceptor-Safari-<version>.pkg`, open **InterceptorSafari** once, then enable **Interceptor** in **Safari → Settings → Extensions** and grant website access.
+5. Open a terminal:
 
 ```bash
 interceptor open "https://example.com"        # browser surface (works in both pkgs)
@@ -111,10 +113,26 @@ interceptor macos tree                         # macOS surface (Full pkg only, a
 | `interceptor-bridge.app` | `/Applications/interceptor-bridge.app` |
 | LaunchAgent (auto-start at login) | `/Library/LaunchAgents/com.interceptor.bridge.plist` |
 
-**Browser extension load** is the one manual step neither installer can do for you, because Chrome and Brave do not allow programmatic extension installation outside of the Web Store. After install:
+**Chrome/Brave extension load** is the one manual step the core installers cannot do for you, because those browsers do not allow programmatic extension installation outside of the Web Store. After install:
 
 - **Brave:** open `brave://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
 - **Chrome:** open `chrome://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
+
+**Safari extension load** uses its signed containing app:
+
+1. Install `Interceptor-Safari-<version>.pkg` after either core pkg.
+2. Open `/Applications/InterceptorSafari.app` once (it need not stay open).
+3. In **Safari → Settings → Extensions**, enable **Interceptor** and allow access to the sites you want to drive. This is a protected, user-present action; Safari may require Touch ID or the account password and it cannot be completed by the installer or CLI.
+4. Verify that the fixed Safari context is connected:
+
+```bash
+interceptor contexts                 # includes: safari
+interceptor --context safari open "https://example.com"
+```
+
+If `safari` is absent, confirm the extension is enabled before reinstalling anything. Until the user approves that switch, Safari does not run the background worker and no context can connect. A production package build rebuilds the extension bytes from source, runs `scripts/verify-safari-extension.swift`, notarizes and staples the app, and requires Gatekeeper to accept the exact app bytes placed in the installer. Its postinstall also moves identifier-verified legacy `.InterceptorSafari-*.noindex` backups out of `/Applications` to recoverable storage so LaunchServices cannot expose duplicate extensions. `INTERCEPTOR_SKIP_NOTARIZE=1` produces an explicitly named `*-UNNOTARIZED.pkg` for developer-mode testing; do not install it as a production replacement.
+
+Safari's background worker reaches the daemon through the signed native appex: the worker exchanges bounded long-poll messages with `runtime.sendNativeMessage`, and the appex owns the loopback WebSocket to `127.0.0.1:19222`. This is intentional—direct WebSockets from Safari extension JavaScript did not establish a socket in public WebKit-host probes.
 
 Verify after install with `interceptor status` — the `mode:` line reports `browser-only` or `full` depending on which pkg you installed.
 
@@ -131,6 +149,7 @@ Examples below assume `interceptor` is on your `PATH`. From a repo install, use 
 interceptor open "https://example.com"        # Open, wait, return tree + text (1 command)
 interceptor act e1                             # Click element, return updated tree + diff
 interceptor inspect                            # Tree + text + network log + headers
+interceptor --context safari read              # Target Safari when several browsers are connected
 
 # macOS surface (bridge installed)
 interceptor macos open "Finder"                # Activate + tree + windows
@@ -171,7 +190,9 @@ The deep dives live in the per-surface sections below. Skill packages mirror thi
 
 # Surface 1: Interceptor Browser
 
-`interceptor` (no prefix) drives a real Chrome / Brave session. Pages, network, scene graph, monitor, screenshots — every browser command lives at the top of the CLI namespace.
+`interceptor` (no prefix) drives a real Chrome, Brave, or Safari session. Pages, network, scene graph, monitor, screenshots — every browser command lives at the top of the CLI namespace. Safari registers the stable context id `safari`; use `--context safari` whenever more than one browser is connected.
+
+Safari reuses the portable DOM/content engine and the same command envelope. APIs Safari does not expose (`debugger`, `tabGroups`, `offscreen`, `tabCapture`, `power`, and related Chromium-only capabilities) degrade explicitly or route through `interceptor macos`; they are never allowed to abort the Safari background worker.
 
 ## Why Browser
 
