@@ -469,6 +469,17 @@ extension. `release.sh` (Step 6.5) asserts the `.pkg` ships no extension bundle.
 
 ---
 
+## MCP Control Plane
+
+`interceptor mcp serve` exposes the entire CLI surface over the Model Context Protocol (stdio) as a thin adapter over the same binary — it re-implements no verb. Every tool call shells back out to `interceptor <verb>` via `Bun.spawn` (`cli/mcp/adapter.ts`), inheriting arg parsing, compound fan-out, per-session `--group` isolation, daemon auto-spawn, and result formatting. The server ships inside the `interceptor` binary (no separate sidecar); `interceptor mcp` is dispatched from `cli/index.ts`.
+
+- **Tools (`cli/mcp/server.ts`):** six routers — `interceptor_browser/macos/ios/read/local/raw` — whose verb menus are generated from the binary's own manifest (`COMMAND_SPECS`) plus maintained macOS/iOS lists. Sub-verbs and flags ride in a raw `args` array; the long tail is discoverable through `interceptor://manifest`, `interceptor://help/{macos,ios,verb}`, and `interceptor://extensions` resources.
+- **Safety (`cli/mcp/tiers.ts`):** a (surface, verb, sub-verb) → tier classifier (read / mutate / destructive / arbitrary-exec) with fail-safe family floors — an unknown `vm`/`runtime`/`app` sub-verb defaults to its highest tier. The `INTERCEPTOR_MCP_ALLOW` operator allowlist is the only boundary: read+mutate run by default, destructive+exec fail closed until the operator opts in, and a model-set `confirm` is only a secondary speed-bump.
+- **Inbound fencing (`cli/mcp/output.ts`):** content-bearing output (page text, trees, file/network reads) is wrapped as untrusted data before it reaches the client model. Output also maps to MCP text / `structuredContent` / image / resource-link blocks.
+- **Install (`cli/mcp/install.ts`):** `interceptor mcp install` auto-detects and configures Claude Code, Codex, Gemini CLI, Cursor, and Claude Desktop with idempotent JSON / Codex-TOML merges, self-locating via `process.execPath`.
+
+See `docs/mcp.md`.
+
 ## Build Outputs
 
 | Artifact | Source | Purpose |
