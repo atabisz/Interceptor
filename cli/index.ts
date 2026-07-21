@@ -74,12 +74,13 @@ const DIAGNOSE_CMDS = new Set(["diagnose"])
 const EXTENSIONS_CMDS = new Set(["extensions"])
 const SKILLS_CMDS = new Set(["skills"])
 const MANIFEST_CMDS = new Set(["manifest"])
+const MCP_CMDS = new Set(["mcp"])
 
 // Commands that don't require a daemon connection (or, in init's case,
 // bootstrap it themselves rather than relying on the pre-dispatch auto-spawn).
 // `research` prints guidance / manages an on-disk ledger — no browser, no daemon.
 // `diagnose` reads local state + optionally probes the daemon — never auto-spawns.
-const NO_DAEMON = new Set(["status", "help", "events", "delegate", "session", "upgrade", "init", "research", "extensions", "skills", "manifest", "diagnose"])
+const NO_DAEMON = new Set(["status", "help", "events", "delegate", "session", "upgrade", "init", "research", "extensions", "skills", "manifest", "diagnose", "mcp"])
 
 // Every command the CLI dispatches. Used to reject unknown commands
 // before any daemon-spawning side effect runs.
@@ -89,7 +90,7 @@ const ALL_KNOWN_CMDS = new Set<string>([
   ...SAVE_CMDS, ...BRAND_CMDS, ...GROUP_CMDS, ...BATCH_CMDS, ...MONITOR_CMDS, ...SCENE_CMDS, ...SSE_CMDS,
   ...COMPOUND_CMDS, ...OVERRIDE_CMDS, ...MACOS_CMDS, ...IOS_CMDS,
   ...UPGRADE_CMDS, ...INIT_CMDS, ...RESEARCH_CMDS, ...EXTENSIONS_CMDS,
-  ...SKILLS_CMDS, ...MANIFEST_CMDS, ...DIAGNOSE_CMDS,
+  ...SKILLS_CMDS, ...MANIFEST_CMDS, ...DIAGNOSE_CMDS, ...MCP_CMDS,
   ...POWER_CMDS, ...DELEGATE_CMDS,
   "help", "contexts",
 ])
@@ -249,6 +250,13 @@ async function main() {
 
   if (IOS_CMDS.has(cmd)) {
     await runIosCommand(filtered, { jsonMode, contextId: globalContextId })
+    return
+  }
+
+  if (MCP_CMDS.has(cmd)) {
+    // Dynamic import keeps the MCP SDK out of the hot path for every other verb.
+    const { runMcpCommand } = await import("./commands/mcp")
+    await runMcpCommand(filtered)
     return
   }
 

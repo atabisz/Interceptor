@@ -140,6 +140,25 @@ To uninstall later: `sudo bash "/Library/Application Support/Interceptor/uninsta
 
 Prefer to build from source instead of using the installer? See [Developer Setup](#developer-setup-build-from-source) below.
 
+## MCP: drive Interceptor from any AI client
+
+Interceptor is also an MCP server. Any MCP-native client — Claude Code, Codex, Gemini CLI, Cursor, Claude Desktop — can drive every surface as a small set of typed, safety-gated tools. Because Interceptor is a local binary already on your `PATH`, there is no `npx`, no remote URL, and no auth step. One command registers it everywhere:
+
+```bash
+interceptor mcp install        # auto-configures every detected AI client
+interceptor mcp status         # show where it's registered
+```
+
+Restart the client and you're live. Under the hood the client runs `interceptor mcp serve` (stdio), exposing `interceptor_browser`, `interceptor_macos`, `interceptor_ios`, `interceptor_read`, `interceptor_local`, and `interceptor_raw`, plus `interceptor://…` discovery resources for the full verb reference.
+
+**Safety is operator-controlled.** Read and UI-mutation verbs run by default; irreversible or code-executing verbs (delete, quit, `eval`, `script`, `runtime`, `share`) are refused unless you opt in at launch:
+
+```bash
+interceptor mcp install --allow destructive,arbitrary-exec
+```
+
+A connected model can never lift that restriction, and captured page/file/network content is fenced as untrusted data. Full details in [`docs/mcp.md`](docs/mcp.md).
+
 ## Quick Start
 
 Examples below assume `interceptor` is on your `PATH`. From a repo install, use `./dist/interceptor` if you have not added a symlink.
