@@ -59,9 +59,6 @@ export async function handleDaemonMessage(msg: {
 }): Promise<void> {
   if (!msg.action || !msg.id) return
 
-  const shortIdEntry = msg.id.slice(0, 8)
-  console.log(`[${shortIdEntry}] handleDaemonMessage entry: action=${msg.action.type} activeTransport=${activeTransport} viaWs=${!!(msg as any)._viaWs}`)
-
   if (activeTransport === "none") {
     if (messageQueue.length >= MESSAGE_QUEUE_CAP) {
       const evicted = messageQueue.shift()!
@@ -73,7 +70,6 @@ export async function handleDaemonMessage(msg: {
       console.warn(`message queue at ${messageQueue.length}/${MESSAGE_QUEUE_CAP}`)
     }
     messageQueue.push(msg)
-    console.warn(`[${shortIdEntry}] queued (activeTransport=none); queue size=${messageQueue.length}; calling connectToHost+connectWsChannel`)
     connectToHost()
     connectWsChannel()
     return
