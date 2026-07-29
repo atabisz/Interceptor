@@ -593,7 +593,7 @@ interceptor click "button:Play"
 
 ### Screenshots
 
-Default capture is **DOM render** — no `chrome.tabs.captureVisibleTab` in the hot path. Works regardless of window focus, macOS Space, or service-worker activation context. A vendored `html-to-image` bundle is injected on demand and paired with a per-tab CORS-clearance DNR rule. Use `--pixel` for compositor-accurate capture (requires Chrome focused).
+Default capture is **DOM render** — no `chrome.tabs.captureVisibleTab` in the hot path. Works regardless of window focus, macOS Space, or service-worker activation context. The renderer is native to the content script (no injected library) and is paired with a per-tab CORS-clearance DNR rule. Use `--pixel` for compositor-accurate capture (requires Chrome focused).
 
 ```bash
 interceptor screenshot                       # Default DOM-render full-page (works without focus)
