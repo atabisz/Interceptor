@@ -23,7 +23,7 @@
          /AVFoundation/requesting-authorization-to-capture-and-save-media.md -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
-    <!-- PRD-66 personal-data domains. tccd silently denies privacy prompts
+    <!-- personal-data domains. tccd silently denies privacy prompts
          under hardened runtime when the matching entitlement is absent —
          confirmed in unified log: "Prompting policy for hardened runtime;
          service: kTCCServiceCalendar requires entitlement
@@ -37,5 +37,10 @@
     <true/>
     <key>com.apple.security.personal-information.location</key>
     <true/>
+    <!-- CLI + daemon entitlement set. Bridge-only capabilities (e.g.
+         com.apple.security.virtualization) live in entitlements-bridge.plist
+         to keep this surface minimal — AMFI rejects launchd-spawned
+         binaries that carry entitlements their bundle ID isn't allowlisted
+         for. -->
 </dict>
 </plist>

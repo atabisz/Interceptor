@@ -8,7 +8,11 @@ export const MONITOR_EVENT_NAMES = new Set([
   // Input / interaction (shared)
   "click", "dblclick", "rclick", "input", "change", "submit",
   "key", "scroll", "focus", "blur", "copy", "paste",
-  "mut", "fetch", "xhr", "sse", "nav", "reload", "error",
+  "mut", "fetch", "xhr", "sse",
+  "ws_opening", "ws_open", "ws_send", "ws_message", "ws_error", "ws_close",
+  "beacon", "beacon_error",
+  "broadcast_open", "broadcast_send", "broadcast_message", "broadcast_error", "broadcast_close",
+  "nav", "reload", "error",
   // macOS-only event kinds. AX-backed unless noted.
   "mouseup", "move", "mods",
   "selection", "selection_rows", "title_change", "window_focus",
@@ -27,6 +31,7 @@ export type MonitorEvent = {
   timestamp?: string
   event?: string
   sid?: string
+  taskId?: string
   s?: number
   t?: number
   tid?: number
@@ -65,6 +70,12 @@ export type MonitorSessionMeta = {
   // treated as "browser" by the CLI). macOS sessions write "macos".
   surface?: "browser" | "macos"
   sessionId: string
+  taskId?: string
+  taskModeAtAttach?: "human-observe" | "human-teach" | "agent-record" | "mixed"
+  taskActorAtAttach?: "human" | "agent" | "system" | "verifier" | "guard"
+  taskAttachedAt?: number
+  taskDetachedAt?: number
+  taskSourceSnapshotRoot?: string
   startedAt: number
   endedAt?: number
   status: "active" | "stopped"
@@ -95,7 +106,7 @@ export type MonitorNetArtifact = {
   tid?: number
   doc?: string
   cause?: number
-  kind: "fetch" | "xhr" | "sse"
+  kind: "fetch" | "xhr" | "sse" | "ws" | "beacon" | "broadcast"
   url: string
   method?: string
   status?: number
@@ -103,6 +114,13 @@ export type MonitorNetArtifact = {
   truncated?: boolean
   bodyBytes?: number
   bodyPreview: string
+  direction?: string
+  payloadKind?: string
+  payloadEncoding?: string
+  socketId?: string
+  channelId?: string
+  channelName?: string
+  returnValue?: boolean
 }
 
 function safeParse<T>(raw: string): T | null {

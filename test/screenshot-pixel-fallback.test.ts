@@ -12,6 +12,26 @@ import { planPixelFallback } from "../extension/src/background/capabilities/scre
 const RENDER_FAIL = { success: false, error: "dom render failed: image load failed", fallbackEligible: true }
 
 describe("planPixelFallback", () => {
+  test("no_fallback forbids the fallback entirely (side-effect escape hatch)", () => {
+    // --no-fallback: the caller refuses the pixel path's focus-borrow + scroll
+    // side effects and takes the DOM-render error instead.
+    expect(planPixelFallback({ type: "screenshot", no_fallback: true }, RENDER_FAIL)).toBeNull()
+  })
+
+  test("the note discloses the fallback's side effects and the escape hatch", () => {
+    // The pixel full-page path borrows tab focus and scrolls the page. The
+    // caller never asked for the pixel path, so the result must say so.
+    const plan = planPixelFallback({ type: "screenshot" }, RENDER_FAIL)
+    expect(plan!.note).toContain("borrowed tab focus")
+    expect(plan!.note).toContain("scrolled page")
+    expect(plan!.note).toContain("restored")
+    expect(plan!.note).toContain("--no-fallback")
+    // Disclosure also present when options were dropped.
+    const dropped = planPixelFallback({ type: "screenshot", scale: 2 }, RENDER_FAIL)
+    expect(dropped!.note).toContain("dropped: --scale")
+    expect(dropped!.note).toContain("borrowed tab focus")
+  })
+
   test("#4: only falls back on a genuine render failure (fallbackEligible)", () => {
     // An actionable error (tab not found / restricted) is NOT eligible.
     const notEligible = { success: false, error: "tab 5 not found" }
@@ -61,5 +81,24 @@ describe("planPixelFallback", () => {
   test("the DOM-render error is preserved in the note (reason isn't lost)", () => {
     const plan = planPixelFallback({ type: "screenshot" }, RENDER_FAIL)
     expect(plan!.note).toContain("image load failed")
+  })
+
+  test("F1: unspecified format/quality default to the DOM path's PNG@92 (no silent downgrade)", () => {
+    // A bare `screenshot` that render-fails must fall back to a lossless PNG,
+    // not the pixel path's native JPEG@50 — the caller relied on DOM defaults.
+    const plan = planPixelFallback({ type: "screenshot" }, RENDER_FAIL)
+    expect(plan).not.toBeNull()
+    expect(plan!.pixelAction.format).toBe("png")
+    expect(plan!.pixelAction.quality).toBe(92)
+  })
+
+  test("F1: an explicit format/quality still wins over the PNG@92 default", () => {
+    const jpeg = planPixelFallback({ type: "screenshot", format: "jpeg", quality: 60 }, RENDER_FAIL)
+    expect(jpeg!.pixelAction.format).toBe("jpeg")
+    expect(jpeg!.pixelAction.quality).toBe(60)
+    // format without quality: honor the format, still supply the DOM default quality.
+    const webp = planPixelFallback({ type: "screenshot", format: "webp" }, RENDER_FAIL)
+    expect(webp!.pixelAction.format).toBe("webp")
+    expect(webp!.pixelAction.quality).toBe(92)
   })
 })

@@ -24,9 +24,9 @@ AppId={{#AppId}}
 AppName=Interceptor
 AppVersion={#AppVersion}
 AppPublisher=Hacker Valley Media
-AppPublisherURL=https://github.com/atabisz/Interceptor
-AppSupportURL=https://github.com/atabisz/Interceptor/issues
-AppUpdatesURL=https://github.com/atabisz/Interceptor/releases
+AppPublisherURL=https://github.com/Hacker-Valley-Media/Interceptor
+AppSupportURL=https://github.com/Hacker-Valley-Media/Interceptor/issues
+AppUpdatesURL=https://github.com/Hacker-Valley-Media/Interceptor/releases
 DefaultDirName={localappdata}\Programs\Interceptor
 DefaultGroupName=Interceptor
 DisableProgramGroupPage=yes
@@ -48,11 +48,25 @@ InfoAfterFile=post-install.txt
 
 [Tasks]
 Name: addtopath; Description: "Add Interceptor to your user PATH"; GroupDescription: "Additional integrations:"
+; link the browser-surface skill packs into Claude Code's skills
+; directory (%USERPROFILE%\.claude\skills). Junctions — created by
+; `interceptor skills adopt` — need neither Developer Mode nor elevation.
+; Windows is browser-only, so only the router + browser skills ship here.
+Name: linkskills; Description: "Link Interceptor AI skill packs into %USERPROFILE%\.claude\skills (Claude Code)"; GroupDescription: "Additional integrations:"
 
 [Files]
 Source: "..\..\dist\interceptor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\daemon\interceptor-daemon.exe"; DestDir: "{app}\daemon"; Flags: ignoreversion
 Source: "..\..\extension\dist\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Skill packs — resolved by the CLI's skills verb at {app}\skills
+Source: "..\..\.agents\skills\interceptor\*"; DestDir: "{app}\skills\interceptor"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\.agents\skills\interceptor-browser\*"; DestDir: "{app}\skills\interceptor-browser"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\.agents\skills\interceptor-research\*"; DestDir: "{app}\skills\interceptor-research"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Run]
+; Runs as the installing user (per-user install, no elevation) so the junctions
+; land in the right profile. Codex users: `interceptor skills adopt --into codex`.
+Filename: "{app}\interceptor.exe"; Parameters: "skills adopt --all --into claude"; Flags: runhidden; Tasks: linkskills
 
 [Registry]
 ; Native messaging host registration. Points each Chromium-family browser

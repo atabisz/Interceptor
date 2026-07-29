@@ -16,6 +16,24 @@ import {
   readSessionMeta,
   readSessionNetArtifacts,
 } from "../../shared/monitor-artifacts"
+import {
+  assertMonitorTaskBlueprintReady,
+  attachMonitorTaskSource,
+  buildMonitorTaskTimeline,
+  generateMonitorTaskCaptureQuality,
+  monitorTaskExportObject,
+  readMonitorTaskCaptureQuality,
+  readMonitorTaskMeta,
+  readMonitorTaskTranscriptSegments,
+  renderMonitorTaskStatus,
+  renderMonitorTaskQualitySummary,
+  resolveMonitorTaskId,
+  snapshotMonitorTaskSources,
+  stopMonitorTask,
+  repairMonitorTask,
+  synthesizeMonitorTaskTranscript,
+  validateMonitorTaskMode,
+} from "../../shared/monitor-tasks"
 import { fromMonitorEvents, writeExport } from "../../shared/exports"
 import { VERSION } from "../version"
 
@@ -62,7 +80,27 @@ interface MonEvent {
   dur?: number
   reason?: string
   fid?: number
+  dir?: string
+  pk?: string
+  bp?: string
+  bt?: number
+  enc?: string
+  skt?: string
+  ch?: string
+  cn?: string
+  rv?: boolean
   [key: string]: unknown
+}
+
+function isMonitorNetEvent(eventName: unknown): boolean {
+  if (typeof eventName !== "string") return false
+  return eventName === "fetch" ||
+    eventName === "xhr" ||
+    eventName === "sse" ||
+    eventName.startsWith("ws_") ||
+    eventName === "beacon" ||
+    eventName === "beacon_error" ||
+    eventName.startsWith("broadcast_")
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -92,10 +130,45 @@ function readGlobalMonEvents(filterSid?: string): MonEvent[] {
   return out
 }
 
+function monitorEventKey(ev: MonEvent): string {
+  return [
+    ev.event || "",
+    ev.sid || "",
+    ev.s ?? "",
+    ev.t ?? "",
+    ev.tid ?? "",
+    ev.doc || "",
+    ev.u || ev.url || "",
+  ].join("|")
+}
+
+function mergeMonEvents(primary: MonEvent[], secondary: MonEvent[]): MonEvent[] {
+  if (primary.length === 0) return secondary
+  if (secondary.length === 0) return primary
+  const seen = new Set<string>()
+  const merged: MonEvent[] = []
+  for (const ev of [...primary, ...secondary]) {
+    const key = monitorEventKey(ev)
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(ev)
+  }
+  return merged.sort((a, b) => {
+    const at = typeof a.t === "number" ? a.t : Date.parse(a.timestamp || "")
+    const bt = typeof b.t === "number" ? b.t : Date.parse(b.timestamp || "")
+    return (Number.isFinite(at) ? at : 0) - (Number.isFinite(bt) ? bt : 0)
+  })
+}
+
 export function readMonEvents(filterSid?: string): MonEvent[] {
   if (filterSid && hasSessionArtifacts(filterSid)) {
     const sessionEvents = readSessionEvents(filterSid) as MonEvent[]
-    if (sessionEvents.length > 0) return sessionEvents
+    if (sessionEvents.length > 0) {
+      const sessionEventNames = new Set(sessionEvents.map((ev) => ev.event).filter(Boolean))
+      const missingEventFamilies = readGlobalMonEvents(filterSid)
+        .filter((ev) => ev.event && !sessionEventNames.has(ev.event))
+      return mergeMonEvents(sessionEvents, missingEventFamilies)
+    }
   }
   return readGlobalMonEvents(filterSid)
 }
@@ -117,7 +190,7 @@ function summarizeEvents(
   for (const ev of events) {
     evtCount += 1
     if (ev.event === "mut") mutCount += 1
-    if (ev.event === "fetch" || ev.event === "xhr" || ev.event === "sse") netCount += 1
+    if (isMonitorNetEvent(ev.event)) netCount += 1
   }
   return {
     sid,
@@ -242,6 +315,31 @@ export function renderEvent(ev: MonEvent, base: number): string {
       const u = ev.u ? shortUrl(ev.u) : "?"
       const sz = ev.bz ? `${(ev.bz / 1024).toFixed(1)}kB` : ""
       return `  ${rel}  ${k}  SSE ${u} ${sz}  ${cause}`
+    }
+    case "ws_opening":
+    case "ws_open":
+    case "ws_send":
+    case "ws_message":
+    case "ws_error":
+    case "ws_close": {
+      const u = ev.u ? shortUrl(ev.u) : "?"
+      const payload = ev.pk ? ` ${ev.pk}${ev.bt !== undefined ? ` ${ev.bt}B` : ""}` : ""
+      return `  ${rel}  ${k}  ${ev.dir || ""} ${u}${payload}${ev.skt ? `  ${ev.skt}` : ""}`
+    }
+    case "beacon":
+    case "beacon_error": {
+      const u = ev.u ? shortUrl(ev.u) : "?"
+      const payload = ev.pk ? ` ${ev.pk}${ev.bt !== undefined ? ` ${ev.bt}B` : ""}` : ""
+      const rv = ev.rv !== undefined ? ` return=${ev.rv}` : ""
+      return `  ${rel}  ${k}  POST ${u}${payload}${rv}`
+    }
+    case "broadcast_open":
+    case "broadcast_send":
+    case "broadcast_message":
+    case "broadcast_error":
+    case "broadcast_close": {
+      const payload = ev.pk ? ` ${ev.pk}${ev.bt !== undefined ? ` ${ev.bt}B` : ""}` : ""
+      return `  ${rel}  ${k}  ${ev.dir || ""} ${ev.cn || "?"}${payload}${ev.ch ? `  ${ev.ch}` : ""}`
     }
     case "nav": {
       const cause = ev.cause !== undefined ? `(cause: #${ev.cause})` : ""
@@ -395,7 +493,7 @@ export function renderSession(sid: string, includeBodies = false): string {
   for (const ev of events) {
     if (ev.event === "mon_start" || ev.event === "mon_stop") continue
     lines.push(renderEvent(ev, base))
-    if (includeBodies && (ev.event === "fetch" || ev.event === "xhr" || ev.event === "sse")) {
+    if (includeBodies && isMonitorNetEvent(ev.event)) {
       lines.push(...renderPersistedBodyComments(sid, typeof ev.cause === "number" ? ev.cause : undefined))
     }
   }
@@ -576,6 +674,27 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
       const inst = flagValue(filtered, "--instruction")
       const action: Action = { type: "monitor_start" }
       if (inst) action.instruction = inst
+      const taskRef = flagValue(filtered, "--task")
+      if (taskRef) {
+        action.taskRef = taskRef
+        action.instruction = inst || taskRef
+        const mode = flagValue(filtered, "--mode")
+        try {
+          action.taskMode = validateMonitorTaskMode(mode)
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+        const retentionPolicyId = flagValue(filtered, "--retention-policy")
+        const guardPolicyId = flagValue(filtered, "--guard-policy")
+        const verifierPolicyId = flagValue(filtered, "--verifier-policy")
+        if (retentionPolicyId) action.retentionPolicyId = retentionPolicyId
+        if (guardPolicyId) action.guardPolicyId = guardPolicyId
+        if (verifierPolicyId) action.verifierPolicyId = verifierPolicyId
+      }
+      const capture = flagValue(filtered, "--capture")
+      if (capture) action.capture = capture
+      if (flagPresent(filtered, "--reload") || flagPresent(filtered, "--from-start")) action.reload = true
       // --persist-bodies persists response bodies for EVERY captured fetch/xhr,
       // not just cause-tracked ones. Accepts an optional KB cap (default 64).
       // Example: `monitor start --persist-bodies` or `--persist-bodies 256`.
@@ -590,13 +709,163 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
       return action
     }
     case "stop":
+      if (flagPresent(filtered, "--task")) {
+        try {
+          const taskId = resolveMonitorTaskId(flagValue(filtered, "--task"))
+          const task = stopMonitorTask(taskId, { stopSourcesRequested: flagPresent(filtered, "--stop-sources") })
+          // auto-finalize: regenerate the transcript/segments so the
+          // done→export flow yields a graded, non-empty envelope with no extra steps.
+          synthesizeMonitorTaskTranscript(taskId)
+          if (jsonMode) console.log(JSON.stringify(task, null, 2))
+          else console.log(`${renderMonitorTaskStatus(task.taskId)}\n${renderMonitorTaskQualitySummary(task.taskId)}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
       return { type: "monitor_stop" }
     case "pause":
       return { type: "monitor_pause" }
     case "resume":
       return { type: "monitor_resume" }
     case "status":
+      if (flagPresent(filtered, "--task")) {
+        try {
+          const taskId = resolveMonitorTaskId(flagValue(filtered, "--task"))
+          const task = readMonitorTaskMeta(taskId)
+          if (!task) throw new Error(`task not found: ${taskId}`)
+          if (jsonMode) console.log(JSON.stringify(task, null, 2))
+          else console.log(renderMonitorTaskStatus(taskId))
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
       return { type: "monitor_status" }
+
+    case "repair": {
+      // the long-advertised `monitor repair`. Recovers any
+      // live-but-unattached sessions for the task, snapshots sources, transcribes
+      // offline audio, regenerates the timeline/transcript/segments, and re-grades.
+      if (!flagPresent(filtered, "--task")) {
+        console.error("error: interceptor monitor repair requires --task <taskId>")
+        process.exit(1)
+      }
+      try {
+        const taskId = resolveMonitorTaskId(flagValue(filtered, "--task"))
+        const { report, attached } = repairMonitorTask(taskId, {
+          snapshotSources: flagPresent(filtered, "--snapshot-sources"),
+          regenerate: !flagPresent(filtered, "--no-regenerate"),
+        })
+        if (jsonMode) {
+          console.log(JSON.stringify({ taskId, attached, report }, null, 2))
+        } else {
+          if (attached.length > 0) console.log(`recovered + attached ${attached.length} session(s): ${attached.join(", ")}`)
+          console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+        }
+        return null
+      } catch (err) {
+        console.error(`error: ${(err as Error).message}`)
+        process.exit(1)
+      }
+    }
+
+    case "task": {
+      const op = filtered[2]
+      if (op === "repair") {
+        const taskId = filtered[3]
+        if (!taskId) {
+          console.error("error: interceptor monitor task repair requires <taskId>")
+          process.exit(1)
+        }
+        try {
+          const { report, attached } = repairMonitorTask(taskId, { snapshotSources: true })
+          if (jsonMode) console.log(JSON.stringify({ taskId, attached, report }, null, 2))
+          else console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
+      if (op === "attach") {
+        const taskId = filtered[3]
+        const sid = filtered[4]
+        if (!taskId || !sid) {
+          console.error("error: interceptor monitor task attach requires <taskId> <sid>")
+          process.exit(1)
+        }
+        try {
+          const { task, source } = attachMonitorTaskSource(taskId, sid)
+          if (jsonMode) console.log(JSON.stringify({ task, source }, null, 2))
+          else console.log(`attached ${source.surface} session ${sid} to task ${task.taskId}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
+      if (op === "snapshot") {
+        const taskId = filtered[3]
+        if (!taskId) {
+          console.error("error: interceptor monitor task snapshot requires <taskId>")
+          process.exit(1)
+        }
+        try {
+          const manifest = snapshotMonitorTaskSources(taskId)
+          if (jsonMode) console.log(JSON.stringify(manifest, null, 2))
+          else console.log(`snapshotted ${manifest.filter((entry) => entry.status === "present").length} source artifacts for task ${taskId}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
+      if (op === "quality" || op === "diagnose") {
+        const taskId = filtered[3]
+        if (!taskId) {
+          console.error(`error: interceptor monitor task ${op} requires <taskId>`)
+          process.exit(1)
+        }
+        try {
+          const report = generateMonitorTaskCaptureQuality(taskId)
+          if (jsonMode) console.log(JSON.stringify(report, null, 2))
+          else console.log(renderMonitorTaskQualitySummary(taskId))
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
+      if (op === "compile-blueprint") {
+        const taskId = filtered[3]
+        if (!taskId) {
+          console.error("error: interceptor monitor task compile-blueprint requires <taskId>")
+          process.exit(1)
+        }
+        try {
+          const report = assertMonitorTaskBlueprintReady(taskId, { forceDiagnostic: flagPresent(filtered, "--force-diagnostic") })
+          const draft = {
+            version: 1,
+            taskId,
+            status: "draft",
+            createdAt: Date.now(),
+            diagnosticOnly: !report.gates.blueprintCompilationReady,
+            source: "monitor-task-quality-gate",
+          }
+          if (jsonMode) console.log(JSON.stringify(draft, null, 2))
+          else console.log(`blueprint draft allowed for task ${taskId}`)
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
+      console.error("error: unknown monitor task subcommand. Try: attach, snapshot, repair, quality, diagnose, compile-blueprint")
+      process.exit(1)
+    }
 
     case "tail": {
       const sidFilter = flagValue(filtered, "--session")
@@ -656,6 +925,35 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
     }
 
     case "export": {
+      const taskRef = flagValue(filtered, "--task")
+      if (taskRef) {
+        const format = flagValue(filtered, "--format") || (flagPresent(filtered, "--json") || jsonMode ? "json" : flagPresent(filtered, "--plan") ? "timeline" : "transcript")
+        if (!["json", "timeline", "transcript", "segments", "quality"].includes(format)) {
+          console.error(`error: --format for task export must be one of json|timeline|transcript|segments|quality (got '${format}')`)
+          process.exit(1)
+        }
+        try {
+          const taskId = resolveMonitorTaskId(taskRef)
+          if (format === "timeline") {
+            for (const entry of buildMonitorTaskTimeline(taskId)) console.log(JSON.stringify(entry))
+          } else if (format === "transcript") {
+            for (const entry of synthesizeMonitorTaskTranscript(taskId)) console.log(JSON.stringify(entry))
+            if (!jsonMode) console.error(renderMonitorTaskQualitySummary(taskId))
+          } else if (format === "segments") {
+            synthesizeMonitorTaskTranscript(taskId)
+            for (const entry of readMonitorTaskTranscriptSegments(taskId)) console.log(JSON.stringify(entry))
+            if (!jsonMode) console.error(renderMonitorTaskQualitySummary(taskId))
+          } else if (format === "quality") {
+            console.log(JSON.stringify(readMonitorTaskCaptureQuality(taskId) || generateMonitorTaskCaptureQuality(taskId), null, 2))
+          } else {
+            console.log(JSON.stringify(monitorTaskExportObject(taskId), null, 2))
+          }
+          return null
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }
       const sid = filtered[2]
       if (!sid || sid.startsWith("--")) {
         console.error("error: interceptor monitor export requires a sessionId. Use 'interceptor monitor list' to find one.")
@@ -738,7 +1036,7 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
     }
 
     default:
-      console.error(`error: unknown monitor subcommand '${sub}'. Try: start, stop, status, pause, resume, tail, list, export.`)
+      console.error(`error: unknown monitor subcommand '${sub}'. Try: start, stop, status, pause, resume, repair, tail, list, export.`)
       process.exit(1)
   }
 }
@@ -746,22 +1044,35 @@ export async function parseMonitorCommand(filtered: string[], jsonMode = false):
 const MONITOR_HELP = `interceptor monitor — record user sessions for agent replay
 
 Usage:
-  interceptor monitor start [--instruction "<text>"] [--persist-bodies [<KB>]]
-  interceptor monitor stop
-  interceptor monitor status
+  interceptor monitor start [--instruction "<text>"] [--task "<task|taskId>"] [--mode human-observe|human-teach|agent-record|mixed] [--capture page-comm] [--reload] [--persist-bodies [<KB>]]
+  interceptor monitor stop [--task <taskId>] [--stop-sources]
+  interceptor monitor status [--task <taskId>]
   interceptor monitor pause
   interceptor monitor resume
+  interceptor monitor repair --task <taskId> [--snapshot-sources] [--no-regenerate]
+  interceptor monitor task attach <taskId> <sessionId>
+  interceptor monitor task snapshot <taskId>
+  interceptor monitor task repair <taskId>
+  interceptor monitor task quality <taskId>
+  interceptor monitor task compile-blueprint <taskId> [--force-diagnostic]
   interceptor monitor tail [--session <sid>] [--raw]
   interceptor monitor list
   interceptor monitor export <sessionId> [--format text|json|har|pcapng|plan] [--out <path>] [--json|--plan] [--with-bodies]
+  interceptor monitor export --task <taskId> [--format json|timeline|transcript|segments|quality]
 
-start    Begin recording on the active interceptor-group tab.
+start    Begin recording on the active interceptor-group tab. --capture page-comm includes WebSocket/Beacon/BroadcastChannel events; --reload captures from page start.
+         --task creates or attaches a durable task envelope before source capture starts.
 stop     End the active session and emit a summary.
-status   Show active sessions and counts.
+         --task stops the task envelope without deleting source session artifacts.
+status   Show active sessions and counts, or a task envelope when --task is present.
 pause    Pause emission temporarily (does not unhook listeners).
 resume   Resume emission.
+repair   Recover unattached sessions for a task, snapshot sources, transcribe offline audio, regenerate timeline/transcript, and re-grade.
+task     Manage task-scoped source membership.
+         snapshot copies source evidence under the task root; quality renders readiness gates; compile-blueprint enforces them.
 tail     Live tail of recorded events. Pretty by default; --raw for JSONL.
 list     List all sessions historically present in the event log.
 export   Render a session as text, JSON (--json), or replay plan (--plan).
+         --task renders a task-level JSON object, deterministic timeline, semantic transcript, teachable segments, or quality report.
          --with-bodies turns commented 'interceptor net log' cues into live invocations.
 `

@@ -7,6 +7,23 @@
 
 import { existsSync } from "node:fs"
 import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import {
+  attachMonitorTaskSource,
+  markMonitorTaskSourceAttachFailed,
+  resolveOrCreateMonitorTask,
+  validateMonitorTaskMode,
+  findLatestSessionSidForTask,
+  readMonitorTaskMeta,
+  resolveMonitorTaskId,
+  stopMonitorTask,
+  synthesizeMonitorTaskTranscript,
+  generateMonitorTaskCaptureQuality,
+  renderMonitorTaskStatus,
+  renderMonitorTaskQualitySummary,
+} from "../../shared/monitor-tasks"
+import { runCdpCommand } from "./cdp"
+import { runNativeCommand } from "./native"
+import { extensionMacosPrefixes, extensionActionType } from "../../shared/extensions"
 
 type Action = { type: string; [key: string]: unknown }
 type Result = { success: boolean; error?: string; data?: unknown }
@@ -61,13 +78,22 @@ function bridgePreflightFailure(): string | null {
 
 export async function runMacosCommand(
   filtered: string[],
-  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number }
+  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; contextId?: string }
 ): Promise<void> {
   // Skip preflight only for "trust" — that subcommand is the user-driven
   // first-run permission walkthrough and may legitimately be the very first
   // call before anything else is wired up. The bridge will surface its own
   // not-ready errors there.
   const sub = filtered[1]
+  if (sub === "cdp") {
+    await runCdpCommand(filtered, { jsonMode: opts.jsonMode, contextId: opts.contextId })
+    return
+  }
+  if (sub === "runtime") {
+    await runNativeCommand(["runtime", ...filtered.slice(2)], { jsonMode: opts.jsonMode, contextId: opts.contextId })
+    return
+  }
+
   if (sub !== "trust") {
     const failure = bridgePreflightFailure()
     if (failure !== null) {
@@ -76,14 +102,100 @@ export async function runMacosCommand(
     }
   }
 
-  const action = parseMacosCommand(filtered)
+  // Extension Fabric: synchronously discover the set of
+  // manifest-declared `macos <prefix>` subcommands so an installed extension's
+  // verbs fall through to the generic builder instead of the hard `default`.
+  const extPrefixes = extensionMacosPrefixes()
+  const action = parseMacosCommand(filtered, extPrefixes)
   if (!action) process.exit(1)
+
+  let pendingMonitorTaskId: string | undefined
+  if (action.type === "macos_monitor" && action.sub === "start" && typeof action.taskRef === "string") {
+    try {
+      const { task } = resolveOrCreateMonitorTask({
+        taskRef: action.taskRef,
+        mode: typeof action.taskMode === "string" ? action.taskMode : undefined,
+        instruction: typeof action.instruction === "string" ? action.instruction : undefined,
+        createdBy: "macos-monitor",
+        retentionPolicyId: typeof action.retentionPolicyId === "string" ? action.retentionPolicyId : undefined,
+        guardPolicyId: typeof action.guardPolicyId === "string" ? action.guardPolicyId : undefined,
+        verifierPolicyId: typeof action.verifierPolicyId === "string" ? action.verifierPolicyId : undefined,
+      })
+      pendingMonitorTaskId = task.taskId
+      action.taskId = task.taskId
+    } catch (err) {
+      console.error(`error: ${(err as Error).message}`)
+      process.exit(1)
+    }
+  }
 
   const result = await send(action, opts.globalTabId, opts.useWs)
 
   if (!result.success) {
+    if (pendingMonitorTaskId) {
+      markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, undefined, result.error || "macos monitor start failed")
+    }
     console.error("error:", result.error || "unknown error")
     process.exit(1)
+  }
+
+  if (pendingMonitorTaskId) {
+    const data = (result.data || {}) as Record<string, unknown>
+    // prefer the sid in the response, but if a slow/garbled RPC
+    // dropped it, recover the sid from the freshly-written session meta so the
+    // source still attaches (no more split-brain envelope with empty sources).
+    const sid = typeof data.sid === "string" ? data.sid
+      : typeof data.sessionId === "string" ? data.sessionId
+      : findLatestSessionSidForTask(pendingMonitorTaskId)
+    if (sid) {
+      try {
+        attachMonitorTaskSource(pendingMonitorTaskId, sid, {
+          surface: "macos",
+          rootPid: typeof data.rootPid === "number" ? data.rootPid : undefined,
+          rootBundleId: typeof data.rootBundleId === "string" ? data.rootBundleId : undefined,
+          rootApp: typeof data.rootApp === "string" ? data.rootApp : undefined,
+        })
+        // post-attach verification — confirm the source actually landed.
+        const verify = readMonitorTaskMeta(pendingMonitorTaskId)
+        const attached = verify?.sourceSessions.some((s) => s.sid === sid && s.status !== "detached")
+        if (!attached) {
+          markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, sid, "source attach did not register in task meta")
+          console.error(`error: macOS monitor session ${sid} did not register as a source of task ${pendingMonitorTaskId}`)
+          process.exit(1)
+        }
+        data.taskId = pendingMonitorTaskId
+        data.sid = sid
+        result.data = data
+      } catch (err) {
+        markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, sid, (err as Error).message)
+        console.error(`error: macOS monitor session ${sid} started but task attachment failed: ${(err as Error).message}`)
+        process.exit(1)
+      }
+    } else {
+      markMonitorTaskSourceAttachFailed(pendingMonitorTaskId, undefined, "macos monitor response did not include sid")
+    }
+  }
+
+  // `interceptor macos monitor stop --task <t>` must finalize
+  // the envelope locally (the bridge only stops the session). Mirror the browser
+  // path: snapshot sources, transcribe offline audio, regenerate the
+  // timeline/transcript/segments, re-grade, and print status + quality.
+  if (action.type === "macos_monitor" && action.sub === "stop" && typeof action.taskRef === "string") {
+    try {
+      const taskId = resolveMonitorTaskId(action.taskRef)
+      stopMonitorTask(taskId, {}) // snapshots + transcribes offline audio
+      synthesizeMonitorTaskTranscript(taskId) // timeline + transcript + segments + grade
+      generateMonitorTaskCaptureQuality(taskId)
+      if (opts.jsonMode) {
+        console.log(JSON.stringify(readMonitorTaskMeta(taskId), null, 2))
+      } else {
+        console.log(`${renderMonitorTaskStatus(taskId)}\n${renderMonitorTaskQualitySummary(taskId)}`)
+      }
+      return
+    } catch (err) {
+      console.error(`error: ${(err as Error).message}`)
+      process.exit(1)
+    }
   }
 
   if (opts.jsonMode) {
@@ -97,7 +209,7 @@ export async function runMacosCommand(
   }
 }
 
-export function parseMacosCommand(filtered: string[]): Action | null {
+export function parseMacosCommand(filtered: string[], extensionPrefixes?: Set<string>): Action | null {
   const sub = filtered[1]
   if (!sub) {
     console.error("error: interceptor macos requires a subcommand. Examples:")
@@ -117,6 +229,11 @@ export function parseMacosCommand(filtered: string[]): Action | null {
         pid: flagInt(filtered, "--pid"),
         filter: flagVal(filtered, "--filter") || "interactive",
         depth: flagInt(filtered, "--depth") || 10,
+        // help advertises `--max-chars`; forward it (was dropped).
+        maxChars: flagInt(filtered, "--max-chars") || 50000,
+        // traversal bounds (bridge clamps to the safety hard caps; omit ⇒ defaults).
+        maxNodes: flagInt(filtered, "--max-nodes"),
+        maxMs: flagInt(filtered, "--max-ms"),
       }
 
     case "find": {
@@ -126,7 +243,10 @@ export function parseMacosCommand(filtered: string[]): Action | null {
         type: "macos_find",
         query,
         app: flagVal(filtered, "--app"),
+        pid: flagInt(filtered, "--pid"),          // was dropped
         role: flagVal(filtered, "--role"),
+        maxNodes: flagInt(filtered, "--max-nodes"),
+        maxMs: flagInt(filtered, "--max-ms"),
       }
     }
 
@@ -156,10 +276,10 @@ export function parseMacosCommand(filtered: string[]): Action | null {
     }
 
     case "focused":
-      return { type: "macos_focused", app: flagVal(filtered, "--app") }
+      return { type: "macos_focused", app: flagVal(filtered, "--app"), pid: flagInt(filtered, "--pid") }
 
     case "windows":
-      return { type: "macos_windows", app: flagVal(filtered, "--app") }
+      return { type: "macos_windows", app: flagVal(filtered, "--app"), pid: flagInt(filtered, "--pid") }
 
     // ── Text ──
     case "text": {
@@ -195,15 +315,60 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       // every prompt-triggering flag is forced false in the wire payload so
       // a future caller-side bug cannot accidentally modify TCC state.
       const noPrompt = filtered.includes("--no-prompt")
+      // `interceptor macos trust speech [--prompt]` is sugar for
+      // `interceptor macos trust --speech-prompt`; both surface the distinct
+      // Speech-Recognition TCC dialog.
+      const speechSub = filtered[2] === "speech"
       return {
         type: "macos_trust",
         noPrompt,
-        prompt: !noPrompt && (filtered.includes("--prompt") || filtered.includes("--walkthrough")),
+        prompt: !noPrompt && (filtered.includes("--prompt") || filtered.includes("--walkthrough")) && !speechSub,
         walkthrough: !noPrompt && filtered.includes("--walkthrough"),
         accessibilityPrompt: !noPrompt && filtered.includes("--accessibility-prompt"),
         screenPrompt: !noPrompt && filtered.includes("--screen-prompt"),
         microphonePrompt: !noPrompt && filtered.includes("--microphone-prompt"),
+        speechPrompt: !noPrompt && (filtered.includes("--speech-prompt") || (speechSub && (filtered.includes("--prompt") || filtered.length <= 3))),
       }
+    }
+
+    // ── TCC / PPPC profile management ──
+    case "tcc": {
+      const op = filtered[2] || "status"
+      const target = flagVal(filtered, "--target") || "host"
+
+      if (op === "status") {
+        return {
+          type: "macos_tcc_status",
+          sub: "status",
+          target,
+        }
+      }
+
+      if (op === "profile") {
+        const profileOp = filtered[3]
+        if (profileOp !== "generate") {
+          console.error("error: interceptor macos tcc profile requires subcommand: generate")
+          process.exit(1)
+        }
+        const services = collectMulti(filtered, "--service").flatMap((s) => s.split(",").filter(Boolean))
+        const action: Action = {
+          type: "macos_tcc_profile_generate",
+          sub: "profile_generate",
+          target,
+        }
+        if (services.length > 0) action.services = services
+        if (flagVal(filtered, "--out")) action.out = flagVal(filtered, "--out")
+        if (flagVal(filtered, "--bundle-id")) action.bundleId = flagVal(filtered, "--bundle-id")
+        if (flagVal(filtered, "--app-path")) action.appPath = flagVal(filtered, "--app-path")
+        if (flagVal(filtered, "--identifier-type")) action.identifierType = flagVal(filtered, "--identifier-type")
+        if (flagVal(filtered, "--code-requirement")) action.codeRequirement = flagVal(filtered, "--code-requirement")
+        if (filtered.includes("--full-disk")) action.fullDisk = true
+        if (filtered.includes("--include-user-only")) action.includeUserOnly = true
+        return action
+      }
+
+      console.error("error: interceptor macos tcc requires subcommand: status | profile generate")
+      process.exit(1)
     }
 
     // ── Apps ──
@@ -298,7 +463,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       if (!ref) { console.error("error: interceptor macos resize requires a ref"); process.exit(1) }
       const width = flagInt(filtered, "--width") || parseInt(filtered[3]) || undefined
       const height = flagInt(filtered, "--height") || parseInt(filtered[4]) || undefined
-      // PRD-62: parser parity with click/type/keys/scroll/drag — forward
+      // : parser parity with click/type/keys/scroll/drag — forward
       // --app and --pid so the bridge can use them for ref qualification.
       const action: Action = { type: "macos_resize", ref, width, height }
       const resizeApp = flagVal(filtered, "--app")
@@ -416,7 +581,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
         sub: op,
         app: flagVal(filtered, "--app"),
       }
-      // PRD-63 diagnostic: dump the captured image to disk so the operator
+      // diagnostic: dump the captured image to disk so the operator
       // can see what Vision actually fed VNRecognizeTextRequest. Off by
       // default; opt in with --debug-dump <path>.
       const debugDump = flagVal(filtered, "--debug-dump")
@@ -441,7 +606,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
     // ── Intelligence ──
     case "ai": {
       const op = filtered[2] || "status"
-      // PRD-65 Spec 1 follow-up: `ai session <op>` previously sent
+      // Spec 1 follow-up: `ai session <op>` previously sent
       // filtered[3] as `prompt`, but the bridge's IntelligenceDomain.handleSession
       // reads action["op"], so the inner op (start/send/history/end) was
       // dropped and every session call fell through to "session status"
@@ -496,7 +661,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       // legacy DistributedNotificationCenter flags
       const app = flagVal(filtered, "--app"); if (app) action.app = app
       const limit = flagInt(filtered, "--limit"); if (limit !== undefined) action.limit = limit
-      // PRD-66 — UNUserNotificationCenter flags. Numeric flags must be
+      // UNUserNotificationCenter flags. Numeric flags must be
       // int-typed because the bridge handler casts with `as? Int` and a
       // string value silently drops to nil (NotificationsDomain.swift:297
       // — `--seconds <N> required` fires even when --seconds 5 is passed).
@@ -547,7 +712,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
 
     // ── Audio ──
     case "audio": {
-      // PRD-65 Spec 5 / PRD-64 Spec 5: bare `interceptor macos audio`
+      // Spec 5 / Spec 5: bare `interceptor macos audio`
       // previously defaulted to channel="output" + op="start" — silently
       // starting capture as a side effect of asking for help. Require both
       // explicitly so the no-arg invocation prints usage instead.
@@ -625,6 +790,27 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       // Log-predicate override.
       const logPredicate = flagVal(filtered, "--log-predicate")
 
+      // new capture knobs.
+      const speechMode = flagVal(filtered, "--speech-mode")
+      // --video takes an optional fps (defaults to 4 when bare).
+      const videoIdx = filtered.indexOf("--video")
+      let video: number | undefined
+      if (videoIdx !== -1) {
+        const next = filtered[videoIdx + 1]
+        video = next && /^\d+$/.test(next) ? parseInt(next) : 4
+      }
+      const videoMaxMb = flagInt(filtered, "--video-max-mb")
+      const frameBudget = flagInt(filtered, "--frame-budget")
+      const frameDiskCapMb = flagInt(filtered, "--frame-disk-cap")
+      const framePixelScale = flagInt(filtered, "--frame-pixel-scale")
+      const scrollCoalesceMs = flagInt(filtered, "--scroll-coalesce-ms")
+      const axCoalesceMs = flagInt(filtered, "--ax-coalesce-ms")
+      const includeSystemApps = filtered.includes("--include-system-apps")
+      const excludeAppsRaw = collectMulti(filtered, "--exclude-app")
+      const excludeApps = excludeAppsRaw.length > 0
+        ? excludeAppsRaw.flatMap((s) => s.split(",")).map((s) => s.trim()).filter((s) => s.length > 0)
+        : undefined
+
       const action: Action = {
         type: "macos_monitor",
         sub: op,
@@ -633,6 +819,24 @@ export function parseMacosCommand(filtered: string[]): Action | null {
         format: filtered.includes("--json") ? "json" : filtered.includes("--plan") ? "plan" : "timeline",
         raw: filtered.includes("--raw"),
         limit: flagInt(filtered, "--limit"),
+      }
+      const taskRef = flagVal(filtered, "--task")
+      if (taskRef) {
+        action.taskRef = taskRef
+        if (!action.instruction) action.instruction = taskRef
+        const taskMode = flagVal(filtered, "--mode")
+        try {
+          action.taskMode = validateMonitorTaskMode(taskMode)
+        } catch (err) {
+          console.error(`error: ${(err as Error).message}`)
+          process.exit(1)
+        }
+        const retentionPolicyId = flagVal(filtered, "--retention-policy")
+        const guardPolicyId = flagVal(filtered, "--guard-policy")
+        const verifierPolicyId = flagVal(filtered, "--verifier-policy")
+        if (retentionPolicyId) action.retentionPolicyId = retentionPolicyId
+        if (guardPolicyId) action.guardPolicyId = guardPolicyId
+        if (verifierPolicyId) action.verifierPolicyId = verifierPolicyId
       }
       if (appFlag) action.app = appFlag
       if (apps) action.apps = apps
@@ -648,6 +852,17 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       if (watchPath) action.watchPath = watchPath
       if (watchPaths) action.watchPaths = watchPaths
       if (logPredicate) action.logPredicate = logPredicate
+      // capture knobs (MB flags converted to bytes for the bridge).
+      if (speechMode) action.speechMode = speechMode
+      if (typeof video === "number") action.video = video
+      if (typeof videoMaxMb === "number") action.videoMaxBytes = videoMaxMb * 1024 * 1024
+      if (typeof frameBudget === "number") action.frameBudget = frameBudget
+      if (typeof frameDiskCapMb === "number") action.frameDiskCap = frameDiskCapMb * 1024 * 1024
+      if (typeof framePixelScale === "number") action.framePixelScale = framePixelScale
+      if (typeof scrollCoalesceMs === "number") action.scrollCoalesceMs = scrollCoalesceMs
+      if (typeof axCoalesceMs === "number") action.axCoalesceMs = axCoalesceMs
+      if (includeSystemApps) action.includeSystemApps = true
+      if (excludeApps) action.excludeApps = excludeApps
       return action
     }
 
@@ -823,7 +1038,23 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       }
     }
 
-    // ── app_intent (Apple Events / IntentDomain) ──
+    // ── Apple Events / OSA scripts ──
+    case "script": {
+      const scriptSub = filtered[2]
+      if (!scriptSub) {
+        console.error("error: interceptor macos script requires a subcommand: run")
+        process.exit(1)
+      }
+      switch (scriptSub) {
+        case "run":
+          return parseScriptRunAction(filtered, "macos_script_run")
+        default:
+          console.error(`error: unknown macos script subcommand '${scriptSub}'. Expected: run`)
+          process.exit(1)
+      }
+    }
+
+    // ── legacy structured Apple Events verb dispatch ──
     case "intent": {
       const intentSub = filtered[2]
       if (!intentSub) {
@@ -832,36 +1063,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       }
       switch (intentSub) {
         case "dispatch": {
-          const action: Action = { type: "macos_intent_dispatch" }
-          const script = flagVal(filtered, "--script")
-          const javascript = flagVal(filtered, "--javascript")
-          const bundleId = flagVal(filtered, "--bundle")
-          const intent = flagVal(filtered, "--intent")
-          const target = flagVal(filtered, "--target")
-          const params = flagVal(filtered, "--params")
-          const argsRaw = flagVal(filtered, "--args")
-
-          if (script !== undefined) action.script = script
-          if (javascript !== undefined) action.javascript = javascript
-          if (bundleId !== undefined) action.bundleId = bundleId
-          if (intent !== undefined) action.intent = intent
-          if (target !== undefined) action.target = target
-          if (params !== undefined) {
-            try { action.parameters = JSON.parse(params) }
-            catch { console.error("error: --params must be JSON"); process.exit(1) }
-          }
-          if (argsRaw !== undefined) {
-            try { action.args = JSON.parse(argsRaw) }
-            catch {
-              // Allow space-separated raw form
-              action.args = argsRaw.split(" ").filter(Boolean)
-            }
-          }
-          if (!script && !javascript && !bundleId) {
-            console.error("error: macos intent dispatch requires one of --script, --javascript, or --bundle")
-            process.exit(1)
-          }
-          return action
+          return parseScriptRunAction(filtered, "macos_intent_dispatch", { allowStructuredIntent: true })
         }
         case "warmup": {
           const bundleIds = filtered.slice(3).filter((s) => !s.startsWith("--"))
@@ -873,6 +1075,336 @@ export function parseMacosCommand(filtered: string[]): Action | null {
         }
         default:
           console.error(`error: unknown 'intent' subcommand '${intentSub}'. Use: dispatch | warmup`)
+          process.exit(1)
+      }
+    }
+
+    // ── VM management (VmDomain) — ──
+    case "vm": {
+      const vmSub = filtered[2]
+      if (!vmSub) {
+        console.error("error: interceptor macos vm requires a subcommand: create | adopt | clone | install | pull | list | get | inspect | start | stop | pause | resume | delete | reset | snapshot | restore | exec | cp | share | mount | port-forward | screenshot | type | click | keys | read-ax | console | logs | trust | tcc")
+        process.exit(1)
+      }
+      const stateDir = flagVal(filtered, "--state-dir")
+      const base: Action = { type: `macos_vm_${vmSub.replace(/-/g, "_")}`, sub: vmSub }
+      if (stateDir) base.stateDir = stateDir
+
+      const intArg = (flag: string): number | undefined => flagInt(filtered, flag) ?? undefined
+      const strArg = (flag: string): string | undefined => flagVal(filtered, flag) ?? undefined
+      const boolArg = (flag: string): boolean => filtered.includes(flag)
+
+      switch (vmSub) {
+        case "create": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm create requires a name"); process.exit(1) }
+          base.name = name
+          const kind = strArg("--kind") || "linux"
+          base.kind = kind
+          if (intArg("--cpu") !== undefined) base.cpu = intArg("--cpu")
+          if (intArg("--memory") !== undefined) base.memorySize = intArg("--memory")
+          if (intArg("--disk") !== undefined) base.diskSize = intArg("--disk")
+          if (strArg("--image")) base.image = strArg("--image")
+          if (strArg("--network")) base.network = strArg("--network")
+          if (boolArg("--rosetta")) base.rosetta = true
+          // --share src:tag[:ro|:rw], repeatable
+          const shares: Array<{ hostPath: string; tag: string; readOnly: boolean }> = []
+          for (let i = 0; i < filtered.length - 1; i++) {
+            if (filtered[i] === "--share") {
+              const parts = filtered[i + 1].split(":")
+              if (parts.length >= 2) {
+                shares.push({ hostPath: parts[0], tag: parts[1], readOnly: parts[2] !== "rw" })
+              }
+            }
+          }
+          if (shares.length > 0) base.shares = shares
+          return base
+        }
+        case "adopt": {
+          const sourcePath = filtered[3]
+          if (!sourcePath) { console.error("error: interceptor macos vm adopt requires <path>"); process.exit(1) }
+          base.sourcePath = sourcePath
+          const name = strArg("--name")
+          if (!name) { console.error("error: interceptor macos vm adopt requires --name <name>"); process.exit(1) }
+          base.name = name
+          base.kind = strArg("--kind") || "macos"
+          base.provider = strArg("--provider") || "auto"
+          base.mode = strArg("--mode") || "clone"
+          if (boolArg("--install-agent")) base.installAgent = true
+          if (boolArg("--wait-for-agent")) base.waitForAgent = true
+          return base
+        }
+        case "clone": {
+          const src = filtered[3]
+          const dst = filtered[4]
+          if (!src || !dst) { console.error("error: interceptor macos vm clone requires <src> <dst>"); process.exit(1) }
+          base.src = src; base.dst = dst
+          return base
+        }
+        case "install": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm install requires a name"); process.exit(1) }
+          base.name = name
+          if (strArg("--ipsw")) base.ipsw = strArg("--ipsw")
+          if (boolArg("--from-latest")) base.fromLatest = true
+          return base
+        }
+        case "pull": {
+          const image = filtered[3]
+          if (!image) { console.error("error: interceptor macos vm pull requires an image OCI ref"); process.exit(1) }
+          base.image = image
+          return base
+        }
+        case "list": {
+          return base
+        }
+        case "get":
+        case "inspect": {
+          const name = filtered[3]
+          if (!name) { console.error(`error: interceptor macos vm ${vmSub} requires a name`); process.exit(1) }
+          base.name = name
+          return base
+        }
+        case "start": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm start requires a name"); process.exit(1) }
+          base.name = name
+          if (boolArg("--headless")) base.headless = true
+          if (boolArg("--wait-for-agent") || boolArg("--wait-for-vsock")) {
+            base.waitForAgent = true
+            base.waitForVsock = true
+          }
+          if (boolArg("--detach")) base.detach = true
+          return base
+        }
+        case "stop": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm stop requires a name"); process.exit(1) }
+          base.name = name
+          if (boolArg("--force")) base.force = true
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "pause":
+        case "resume":
+        case "reset": {
+          const name = filtered[3]
+          if (!name) { console.error(`error: interceptor macos vm ${vmSub} requires a name`); process.exit(1) }
+          base.name = name
+          return base
+        }
+        case "delete": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm delete requires a name"); process.exit(1) }
+          base.name = name
+          if (boolArg("--force")) base.force = true
+          if (boolArg("--keep-disk")) base.keepDisk = true
+          return base
+        }
+        case "trust": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm trust requires a name"); process.exit(1) }
+          base.name = name
+          const noPrompt = boolArg("--no-prompt")
+          base.noPrompt = noPrompt
+          base.prompt = !noPrompt && (boolArg("--prompt") || boolArg("--walkthrough"))
+          base.walkthrough = !noPrompt && boolArg("--walkthrough")
+          base.accessibilityPrompt = !noPrompt && boolArg("--accessibility-prompt")
+          base.screenPrompt = !noPrompt && boolArg("--screen-prompt")
+          base.resetDenied = !noPrompt && boolArg("--reset-denied")
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "tcc": {
+          const tccOp = filtered[3]
+          if (tccOp !== "profile") {
+            console.error("error: interceptor macos vm tcc requires subcommand: profile generate <name>")
+            process.exit(1)
+          }
+          const profileOp = filtered[4]
+          if (profileOp !== "generate") {
+            console.error("error: interceptor macos vm tcc profile requires subcommand: generate <name>")
+            process.exit(1)
+          }
+          const name = filtered[5]
+          if (!name) { console.error("error: interceptor macos vm tcc profile generate requires a VM name"); process.exit(1) }
+          base.type = "macos_vm_tcc_profile_generate"
+          base.sub = "tcc_profile_generate"
+          base.name = name
+          const services = collectMulti(filtered, "--service").flatMap((s) => s.split(",").filter(Boolean))
+          if (services.length > 0) base.services = services
+          if (strArg("--out")) base.out = strArg("--out")
+          if (strArg("--bundle-id")) base.bundleId = strArg("--bundle-id")
+          if (strArg("--app-path")) base.appPath = strArg("--app-path")
+          if (strArg("--identifier-type")) base.identifierType = strArg("--identifier-type")
+          if (strArg("--code-requirement")) base.codeRequirement = strArg("--code-requirement")
+          if (boolArg("--full-disk")) base.fullDisk = true
+          if (boolArg("--include-user-only")) base.includeUserOnly = true
+          return base
+        }
+        case "exec": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm exec requires <name> <cmd> [args...]"); process.exit(1) }
+          base.name = name
+          // Everything after the name and -- separator is the command argv
+          const sepIdx = filtered.indexOf("--", 4)
+          const argv = sepIdx >= 0 ? filtered.slice(sepIdx + 1) : filtered.slice(4).filter(a => !a.startsWith("--"))
+          if (argv.length === 0) { console.error("error: interceptor macos vm exec requires a command"); process.exit(1) }
+          base.command = argv
+          if (strArg("--user")) base.user = strArg("--user")
+          if (strArg("--workdir")) base.workdir = strArg("--workdir")
+          if (boolArg("--tty")) base.tty = true
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          // --env KEY=VAL repeatable
+          const env: Record<string, string> = {}
+          for (let i = 0; i < filtered.length - 1; i++) {
+            if (filtered[i] === "--env") {
+              const m = /^([^=]+)=(.*)$/.exec(filtered[i + 1])
+              if (m) env[m[1]] = m[2]
+            }
+          }
+          if (Object.keys(env).length > 0) base.env = env
+          return base
+        }
+        case "snapshot": {
+          const name = filtered[3]
+          const tag = filtered[4]
+          if (!name || !tag) { console.error("error: interceptor macos vm snapshot requires <name> <tag>"); process.exit(1) }
+          base.name = name; base.tag = tag
+          base.snapshotOp = strArg("--op") || "create"
+          if (boolArg("--disk-only")) base.diskOnly = true
+          if (boolArg("--paused-state")) base.pausedStateOnly = true
+          return base
+        }
+        case "restore": {
+          const name = filtered[3]
+          const tag = filtered[4]
+          if (!name || !tag) { console.error("error: interceptor macos vm restore requires <name> <tag>"); process.exit(1) }
+          base.name = name; base.tag = tag
+          if (boolArg("--disk-only")) base.diskOnly = true
+          if (boolArg("--paused-state")) base.pausedStateOnly = true
+          if (boolArg("--headless")) base.headless = true
+          return base
+        }
+        case "cp": {
+          const src = filtered[3]
+          const dst = filtered[4]
+          if (!src || !dst) { console.error("error: interceptor macos vm cp requires <src> <dst>"); process.exit(1) }
+          base.src = src
+          base.dst = dst
+          const srcVm = /^([^/:]+):(.+)$/.exec(src)
+          const dstVm = /^([^/:]+):(.+)$/.exec(dst)
+          base.name = (dstVm && dstVm[1]) || (srcVm && srcVm[1])
+          if (!base.name) { console.error("error: interceptor macos vm cp requires one side as <vm>:<path>"); process.exit(1) }
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "mount": {
+          const name = filtered[3]
+          const tag = filtered[4]
+          const path = filtered[5]
+          if (!name || !tag || !path) { console.error("error: interceptor macos vm mount requires <name> <tag> <guest-path>"); process.exit(1) }
+          base.name = name
+          base.tag = tag
+          base.path = path
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "screenshot": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm screenshot requires <name>"); process.exit(1) }
+          base.name = name
+          if (strArg("--out")) base.out = strArg("--out")
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "type": {
+          const name = filtered[3]
+          const text = filtered[4]
+          if (!name || text === undefined) { console.error("error: interceptor macos vm type requires <name> <text>"); process.exit(1) }
+          base.name = name
+          base.text = text
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "click": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm click requires <name> <x,y> or --x --y"); process.exit(1) }
+          base.name = name
+          const xy = filtered[4] && /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(filtered[4]) ? filtered[4].split(",") : undefined
+          const xRaw = strArg("--x") ?? xy?.[0]
+          const yRaw = strArg("--y") ?? xy?.[1]
+          const x = xRaw !== undefined ? Number(xRaw) : NaN
+          const y = yRaw !== undefined ? Number(yRaw) : NaN
+          if (!Number.isFinite(x) || !Number.isFinite(y)) { console.error("error: interceptor macos vm click requires numeric x/y"); process.exit(1) }
+          base.x = x
+          base.y = y
+          if (strArg("--button")) base.button = strArg("--button")
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "keys": {
+          const name = filtered[3]
+          const keys = filtered[4]
+          if (!name || !keys) { console.error("error: interceptor macos vm keys requires <name> <keys>"); process.exit(1) }
+          base.name = name
+          base.keys = keys
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "read-ax": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm read-ax requires <name>"); process.exit(1) }
+          base.name = name
+          if (intArg("--max-depth") !== undefined) base.max_depth = intArg("--max-depth")
+          if (strArg("--app")) base.app = strArg("--app")
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "logs": {
+          const name = filtered[3]
+          if (!name) { console.error("error: interceptor macos vm logs requires <name>"); process.exit(1) }
+          base.name = name
+          if (intArg("--limit") !== undefined) base.limit = intArg("--limit")
+          if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          return base
+        }
+        case "share": {
+          const name = filtered[3]
+          const hostPath = filtered[4]
+          const tag = filtered[5]
+          if (!name || !hostPath || !tag) { console.error("error: interceptor macos vm share requires <name> <host-path> <tag>"); process.exit(1) }
+          base.name = name
+          base.hostPath = hostPath
+          base.tag = tag
+          base.readOnly = !boolArg("--rw")
+          return base
+        }
+        case "port-forward":
+        case "console": {
+          const name = filtered[3]
+          if (name) base.name = name
+          const rule = filtered[4]
+          if (vmSub === "port-forward" && rule) {
+            const parts = rule.split(":")
+            if (parts.length === 2) {
+              base.hostPort = Number(parts[0])
+              base.guestPort = Number(parts[1])
+            } else if (parts.length === 3) {
+              base.hostAddress = parts[0]
+              base.hostPort = Number(parts[1])
+              base.guestPort = Number(parts[2])
+            }
+          }
+          if (vmSub === "console") {
+            if (strArg("--write")) base.write = strArg("--write")
+            if (intArg("--max-bytes") !== undefined) base.maxBytes = intArg("--max-bytes")
+            if (intArg("--timeout") !== undefined) base.timeout = intArg("--timeout")
+          }
+          return base
+        }
+        default:
+          console.error(`error: interceptor macos vm: unknown subcommand '${vmSub}'`)
           process.exit(1)
       }
     }
@@ -940,13 +1472,13 @@ export function parseMacosCommand(filtered: string[]): Action | null {
           const sceneScript = flagVal(filtered, "--scene-script")
           const url = flagVal(filtered, "--url")
           const htmlB64 = flagVal(filtered, "--html-b64")
-          // PRD-65 Spec 7: --html accepted as a friendlier alias to
+          // Spec 7: --html accepted as a friendlier alias to
           // --html-b64; the parser b64-encodes inline HTML so callers
           // don't have to wrap shell-escaped HTML themselves.
           const htmlInline = flagVal(filtered, "--html")
           const rect = flagVal(filtered, "--rect")
           const timeout = flagInt(filtered, "--timeout-seconds")
-          // PRD-65 Spec 7: --duration / --duration-ms aliases for the
+          // Spec 7: --duration / --duration-ms aliases for the
           // existing --timeout-seconds. The bridge auto-dismisses after
           // the timeout regardless of mode.
           const durationMs = flagInt(filtered, "--duration-ms")
@@ -971,7 +1503,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
           if (sceneScript) action.scene_script = sceneScript
           if (url) action.url = url
           if (htmlB64) action.html_b64 = htmlB64
-          // PRD-65 Spec 7: forward inline --html as html_b64 (b64-encoded)
+          // Spec 7: forward inline --html as html_b64 (b64-encoded)
           // so the bridge has a single source HTML field. Buffer.from is
           // already imported into Bun's globals.
           let resolvedHtmlB64: string | undefined = htmlB64
@@ -980,7 +1512,7 @@ export function parseMacosCommand(filtered: string[]): Action | null {
             action.html_b64 = resolvedHtmlB64
           }
 
-          // PRD-65 Spec 7: unify --duration-ms / --duration / --timeout-seconds
+          // Spec 7: unify --duration-ms / --duration / --timeout-seconds
           // into the bridge's single `timeout_seconds` action field
           // (OverlayDomain only reads timeout_seconds today, see
           // OverlayDomain.swift:114). --duration-ms wins, then --duration
@@ -1058,9 +1590,9 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       }
     }
 
-    // ── PRD-66 — Personal data + distribution + document surfaces ──
+    // ── Personal data + distribution + document surfaces ──
     // Each branch maps `interceptor macos <domain> <verb> [...]` to a
-    // `macos_<domain>` action with `sub` carrying the verb (PRD-63 invariant).
+    // `macos_<domain>` action with `sub` carrying the verb (invariant).
 
     case "pdf": {
       const verb = filtered[2]
@@ -1356,10 +1888,115 @@ export function parseMacosCommand(filtered: string[]): Action | null {
       return action
     }
 
-    default:
+    default: {
+      // Extension Fabric: an installed extension may declare this
+      // prefix as a `macos <prefix> <cmd>` verb → route to its bridge domain as
+      // `macos_<prefix>_<cmd>` (mirrors vm's hyphen-normalized type encoding).
+      if (extensionPrefixes && sub && extensionPrefixes.has(sub)) {
+        return buildExtensionVerbAction(filtered, sub)
+      }
       console.error(`error: unknown macos subcommand '${sub}'. Run 'interceptor help' for usage.`)
       process.exit(1)
+    }
   }
+}
+
+/**
+ * Build a generic extension verb action: `macos <prefix> <cmd> [args] [--flags]`
+ * → `{ type: macos_<prefix>_<cmd>, sub: <cmd>, args, flags }`. The extension's
+ * bridge handler receives the verb (via the Router's `command`) plus this action;
+ * the core stays capability-blind (it knows the routing shape, not the behavior).
+ */
+function buildExtensionVerbAction(filtered: string[], prefix: string): Action | null {
+  const verb = filtered[2]
+  if (!verb || verb.startsWith("--")) {
+    console.error(`error: interceptor macos ${prefix} requires a subcommand (e.g. interceptor macos ${prefix} <cmd>)`)
+    process.exit(1)
+  }
+  const rest = filtered.slice(3)
+  const args: string[] = []
+  const flags: Record<string, string | boolean> = {}
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]
+    if (a.startsWith("--")) {
+      const key = a.slice(2)
+      const next = rest[i + 1]
+      if (next !== undefined && !next.startsWith("--")) { flags[key] = next; i++ }
+      else flags[key] = true
+    } else {
+      args.push(a)
+    }
+  }
+  return { type: extensionActionType(prefix, verb), sub: verb, args, flags }
+}
+
+function parseScriptRunAction(
+  filtered: string[],
+  type: string,
+  options: { allowStructuredIntent?: boolean } = {}
+): Action {
+  const action: Action = { type }
+  const script = flagVal(filtered, "--script")
+  const jxa = flagVal(filtered, "--jxa")
+  const javascriptAlias = flagVal(filtered, "--javascript")
+  const jsc = flagVal(filtered, "--jsc")
+  const jscHost = optionalFlagVal(filtered, "--jsc-host", "all")
+  const jscUnsafeNative = filtered.includes("--jsc-unsafe-native")
+  const bundleId = flagVal(filtered, "--bundle")
+  const intent = flagVal(filtered, "--intent")
+  const target = flagVal(filtered, "--target")
+  const params = flagVal(filtered, "--params")
+  const argsRaw = flagVal(filtered, "--args")
+  const jxaSource = jxa ?? javascriptAlias
+  const scriptInputs = [
+    script !== undefined ? "--script" : undefined,
+    jxaSource !== undefined ? "--jxa" : undefined,
+    jsc !== undefined ? "--jsc" : undefined,
+  ].filter(Boolean)
+
+  if (jxa !== undefined && javascriptAlias !== undefined) {
+    console.error("error: use only one of --jxa or deprecated --javascript")
+    process.exit(1)
+  }
+  if (scriptInputs.length > 1) {
+    console.error(`error: choose exactly one script source flag (${scriptInputs.join(", ")})`)
+    process.exit(1)
+  }
+
+  if (script !== undefined) action.script = script
+  if (jxaSource !== undefined) action.jxa = jxaSource
+  if (jsc !== undefined) action.jsc = jsc
+  if (jscHost !== undefined || jscUnsafeNative) action.jscHost = jscHost ?? "all"
+  if (bundleId !== undefined) action.bundleId = bundleId
+  if (intent !== undefined) action.intent = intent
+  if (target !== undefined) action.target = target
+  if (params !== undefined) {
+    try { action.parameters = JSON.parse(params) }
+    catch { console.error("error: --params must be JSON"); process.exit(1) }
+  }
+  if (argsRaw !== undefined) {
+    try { action.args = JSON.parse(argsRaw) }
+    catch {
+      // Allow space-separated raw form
+      action.args = argsRaw.split(" ").filter(Boolean)
+    }
+  }
+
+  if (options.allowStructuredIntent) {
+    if (!script && !jxaSource && !jsc && !bundleId) {
+      console.error("error: macos intent dispatch requires one of --script, --jxa, --jsc, or --bundle")
+      process.exit(1)
+    }
+  } else if (!script && !jxaSource && !jsc) {
+    console.error("error: macos script run requires one of --script, --jxa, or --jsc")
+    process.exit(1)
+  }
+  if ((jscHost !== undefined || jscUnsafeNative) && jsc === undefined) {
+    console.error("error: --jsc-host/--jsc-unsafe-native require --jsc")
+    process.exit(1)
+  }
+
+  return action
 }
 
 // ── Flag helpers ──
@@ -1368,6 +2005,14 @@ function flagVal(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag)
   if (idx === -1 || !args[idx + 1]) return undefined
   return args[idx + 1]
+}
+
+function optionalFlagVal(args: string[], flag: string, defaultValue: string): string | undefined {
+  const idx = args.indexOf(flag)
+  if (idx === -1) return undefined
+  const next = args[idx + 1]
+  if (!next || next.startsWith("--")) return defaultValue
+  return next
 }
 
 function flagInt(args: string[], flag: string): number | undefined {
