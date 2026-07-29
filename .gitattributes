@@ -1,0 +1,18 @@
+# Normalize line endings so a Windows checkout doesn't show phantom
+# whole-file diffs. Without this, `core.autocrlf=false` (common on Windows dev
+# machines) makes git byte-compare a CRLF worktree against LF index blobs, and
+# every affected file reads as fully modified. That state was latent across 278
+# tracked files here — most stayed hidden only because git's stat cache had not
+# re-read them.
+#
+# `text=auto` lets git detect text vs binary per file, so the 26 binary blobs
+# (PNGs, JPGs, and daemon/ios/service-clients.ts) keep their exact bytes.
+* text=auto eol=lf
+
+# scripts/install.ps1 is committed with CRLF and must stay that way. Windows
+# PowerShell 5.1 is the only interpreter guaranteed present on a fresh Windows
+# box, and this file is BOM-less UTF-8 with non-ASCII content, so its bytes are
+# already delicate — see the note in scripts/install.ps1 about needing pwsh.
+# `-text` means "no conversion in either direction": git stores and checks out
+# the bytes verbatim, leaving the existing CRLF index blob untouched.
+scripts/install.ps1 -text
