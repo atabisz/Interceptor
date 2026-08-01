@@ -42,6 +42,7 @@ This document describes the live architecture as of the current monitor, CSP-fal
 
 - The primary repo install path builds `dist/interceptor`, `daemon/interceptor-daemon`, and `extension/dist/`, then runs `scripts/install.sh --brave --profile <profile>`.
 - `scripts/install.sh` writes native messaging host manifests for Chrome and Brave, then launches Brave with `--load-extension=extension/dist`. If Brave is already running, the script prompts before quitting and relaunching it.
+- **On Windows the equivalent is `scripts/install.ps1`** (`pwsh -File scripts\install.ps1 -Browser edge -ProfileName Default`). Same three steps, different registration mechanism: instead of dropping a manifest file into a per-browser directory, it generates `daemon/.generated/com.interceptor.host.json` and points `HKCU:\Software\{Google\Chrome,BraveSoftware\Brave-Browser,Microsoft\Edge}\NativeMessagingHosts\com.interceptor.host` at it — **one key per browser**, so a browser that was never passed to the script has no host registered. It then preflights `extensions.ui.developer_mode` in the target profile's `Preferences` JSON (Chromium silently drops `--load-extension` when Dev mode is off, producing a dormant install that reports success), launches the browser, and probes `interceptor status --verbose` for `extension: reachable` for up to 8s. `-Full` is rejected: the Swift bridge is macOS-only, so `mode: browser-only` is the only reachable Windows mode. Packaged Windows installs go through `scripts/installer/interceptor.iss` (Inno Setup) instead, which targets `%LOCALAPPDATA%\Programs\Interceptor` rather than the repo tree.
 - Google Chrome branded desktop builds ignore `--load-extension`; the Chrome CLI path installs native messaging metadata, but the unpacked extension must be loaded manually from `chrome://extensions`.
 - Safari ships as the separate notarized `Interceptor-Safari-<version>.pkg` containing app. Opening the app once registers its appex; the user then enables Interceptor in Safari Settings through Safari's protected user-presence gate. Until that approval, Safari does not start the worker and no `safari` context exists. Its stable daemon context is `safari` after connection.
 - `interceptor macos trust` is a permission snapshot for native macOS automation. Browser runtime health should be checked through `interceptor status`, which confirms daemon, extension, and browser bridge state.
@@ -540,7 +541,7 @@ Recent major additions reflected in this document:
 - per-tab CORS-clearance session DNR rule scoped to subresource fetches during a capture
 - in-SW `OffscreenCanvas` stitching for `--pixel --full` so multi-MB responses no longer round-trip through the offscreen document
 - automatic WebSocket routing for `screenshot` CLI invocations
-- CLI-first Brave install path through `scripts/install.sh --brave --profile <profile>`
+- CLI-first Brave install path through `scripts/install.sh --brave --profile <profile>` (Windows: `scripts/install.ps1`, registry-based native-messaging registration)
 - frame-targeted `read --include-frames` with subtree refs preserved end-to-end
 - canvas observer summaries that filter `log` and `objects` by DOM canvas index
 - document-scoped monitor sessions with child-tab handoff and focus-follow
