@@ -317,18 +317,22 @@ Windows has two install paths, and they are for different people:
 | **`Interceptor-<version>-windows-x64.exe`** (Inno Setup, built by `.github/workflows/windows-installer.yml` from `scripts/installer/interceptor.iss`) | You just want to run Interceptor | `%LOCALAPPDATA%\Programs\Interceptor` |
 | **`scripts\install.ps1`** | You are building from a source tree and want the daemon/extension wired to your checkout | Your repo working directory |
 
-The installer registers the native-messaging keys, manages user PATH, ships the skill packs, and runs `interceptor skills adopt`, but leaves Developer mode and loading the extension to you (see `scripts/installer/post-install.txt`). `install.ps1` does those last two steps and then verifies the result:
+The installer registers the native-messaging keys, manages user PATH, ships the skill packs, and runs `interceptor skills adopt`, but leaves Developer mode and loading the extension to you (see `scripts/installer/post-install.txt`). `install.ps1` is a developer helper rather than a second installer: it wires a built checkout to your browsers and prints those same manual steps.
+
+Build with the **default host target**. On a Windows host that is what writes the two paths `install.ps1` reads, `dist\interceptor.exe` and `daemon\interceptor-daemon.exe`. The `--target=windows-x64` / `--target=windows-arm64` targets are for release payloads and stage into `dist\windows\<arch>\` instead, so `install.ps1` will not find a daemon after one of those (`--target=windows` is no longer a valid target at all).
 
 ```powershell
 bun install
-bash scripts/build.sh --target=windows
+bash scripts/build.sh
 
 pwsh -File scripts\install.ps1 -Browser edge -Profiles              # list profiles first
 pwsh -File scripts\install.ps1 -Browser edge -ProfileName Default   # install + verify
 pwsh -File scripts\install.ps1 -Browser both -DryRun                # print steps, change nothing
 ```
 
-It generates the native-messaging manifest pointing at `daemon\interceptor-daemon.exe`, writes the `HKCU:\Software\...\NativeMessagingHosts\com.interceptor.host` key for each target browser, preflights `extensions.ui.developer_mode` in the chosen profile (auto-enabling it when the browser is closed, since Chromium silently drops `--load-extension` otherwise), launches with `--load-extension`, then polls `interceptor status --verbose` for `extension: reachable` for up to 8 seconds.
+It generates the native-messaging manifest pointing at `daemon\interceptor-daemon.exe`, then snapshots and writes the `HKCU:\Software\...\NativeMessagingHosts\com.interceptor.host` key for Chrome, Brave and Edge — always all three, because Brave resolves the Google Chrome key as well as its own — restoring the snapshot if any write fails, and finally prints manual **Load unpacked** instructions for the chosen browser. It requires PowerShell 7 (`#requires -Version 7`).
+
+Four things it deliberately does not do, because none of them is truthful on current Windows: edit browser Preferences or enable Developer mode, launch a browser with `--load-extension` (Chrome 137 removed the switch), quit or restart a running browser, or assert that a given browser and profile can reach the extension. An earlier version of this script did the first and third, and the 0.23.18 merge replaced it with upstream's version, which does not.
 
 Flags: `-Browser chrome|brave|edge|both`, `-ProfileName <dir>` (alias `-Profile`), `-Profiles`, `-SkipExtension`, `-BrowserOnly`, `-DryRun`. `-Full` is rejected — the Swift bridge is macOS-only, so browser-only is the only mode on Windows.
 
@@ -400,7 +404,7 @@ Then remove the unpacked extension from the browser's extensions page. Developer
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `interceptor open <url>` returns `error: timeout: no response for 'tab_create' after 15s` | Browser extension is not loaded — most often because **Developer mode is off** in the target profile. Chromium silently drops `--load-extension` when Dev mode is off. | Open `brave://extensions/` or `chrome://extensions/`, toggle Developer mode ON. Quit the browser fully (on Windows closing every window is not enough — the process lingers; use `taskkill /IM brave.exe /F`, or `msedge.exe` / `chrome.exe`). Re-run `bash scripts/install.sh` — on Windows `pwsh -File scripts\install.ps1` — which preflights Dev mode and re-launches. |
+| `interceptor open <url>` returns `error: timeout: no response for 'tab_create' after 15s` | Browser extension is not loaded — most often because **Developer mode is off** in the target profile. Chromium silently drops `--load-extension` when Dev mode is off. | Open `brave://extensions/` or `chrome://extensions/`, toggle Developer mode ON. Quit the browser fully (on Windows closing every window is not enough — the process lingers; use `taskkill /IM brave.exe /F`, or `msedge.exe` / `chrome.exe`). Re-run `bash scripts/install.sh`, which preflights Dev mode and re-launches. On Windows toggle Dev mode yourself and re-load the unpacked extension — `scripts\install.ps1` only registers the native-messaging host and prints the steps. |
 | `interceptor status --verbose` says `extension: not reachable` | Same as above, or extension is registered but the Interceptor extension was disabled in the browser. | Open the extensions page, confirm Interceptor (ID `hkjbaciefhhgekldhncknbjkofbpenng`) is present and enabled. If missing, click **Load unpacked** and select `extension/dist/`. |
 | Chrome's extension error page shows `A preload for ... is found, but is not used because the request credentials mode does not match` attributed to `inject-net.js` | A page-level Chromium preload warning was attributed to Interceptor because the passive network shim calls through to the page's original `fetch()` there. The warning is not the same as an Interceptor connection failure. | Treat it as a site warning unless commands fail. If Interceptor commands fail, check the `extension: not reachable` row above. |
 | `chrome://extensions/` reports the extension as version `0.10.0` while `interceptor --version` reports a higher version | Extension manifest drift fixed in this release — rebuild from current source: `bash scripts/build.sh` then re-run `scripts/install.sh` (Windows: `scripts\install.ps1`). | Restart the browser after re-loading the extension so Chromium picks up the bumped manifest. |
