@@ -9,10 +9,15 @@
 # (PNGs, JPGs, and daemon/ios/service-clients.ts) keep their exact bytes.
 * text=auto eol=lf
 
-# scripts/install.ps1 is committed with CRLF and must stay that way. Windows
-# PowerShell 5.1 is the only interpreter guaranteed present on a fresh Windows
-# box, and this file is BOM-less UTF-8 with non-ASCII content, so its bytes are
-# already delicate — see the note in scripts/install.ps1 about needing pwsh.
-# `-text` means "no conversion in either direction": git stores and checks out
-# the bytes verbatim, leaving the existing CRLF index blob untouched.
-scripts/install.ps1 -text
+# scripts/install.ps1 used to carry `-text` here, exempting it from the rule
+# above. The reason was that its blob was committed with CRLF and `-text` ("no
+# conversion in either direction") kept those bytes untouched. That reason is
+# gone: the 0.23.18 upstream merge replaced the file with upstream's production
+# installer lane, whose blob is LF, so there is no CRLF blob left to preserve and
+# the exemption now only weakens things — under `-text` a CRLF-saving editor
+# would commit CRLF, while `text=auto eol=lf` normalizes it. The delicate part of
+# this file was never its line endings anyway: it is BOM-less UTF-8 with
+# non-ASCII content, and the `text` attribute does not touch bytes other than
+# EOLs. Dropping the exemption is a no-op on the current tree (blob and worktree
+# are already LF) and it stops a future upstream merge of this file from
+# conflicting on line endings alone.
