@@ -83,11 +83,15 @@ Two core installers ship per release, plus an optional Safari add-on. Pick the c
 
 Both download from the same [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page. Start with **Browser** unless you know you need native macOS commands — you can always upgrade to Full later via `interceptor upgrade --full`.
 
+**Updating:** run `interceptor update` — it fires a user-initiated update check and immediately shows the update prompt when a new version exists (`interceptor update status` shows the feed and schedule). Full installs also auto-check in the background via Sparkle.
+
+**Windows (browser-only):** a signed per-user installer (`Interceptor-Browser-<version>-windows-{x64,arm64}.exe`, Windows 11 24H2+) is in preparation — see [docs/windows-install.md](docs/windows-install.md) for the install, silent-install, upgrade, and uninstall contract. Windows extension acquisition is store-based (Chrome Web Store for Chrome/Brave, Edge Add-ons for Edge); the installer never edits browser profiles or force-loads an unpacked extension. Until the signed installer ships, Windows developers can build from source with `scripts/install.ps1` (PowerShell 7, source checkout).
+
 ### Install steps
 
 1. Download the matching `.pkg` from Releases.
 2. Double-click it. Walk through the installer (admin password required once).
-3. *(Full pkg only)* Open **System Settings → Privacy & Security**. The first time you run `interceptor macos *`, macOS will prompt for **Accessibility**, **Screen Recording**, and **Apple Events** access for `interceptor-bridge` — allow each. The Browser pkg never triggers these prompts.
+3. *(Full pkg only)* Open **System Settings → Privacy & Security**. The first time you run `interceptor macos *`, macOS will prompt for **Accessibility**, **Screen Recording**, and **Apple Events** access for `interceptor-bridge` — allow each. The Browser pkg never triggers these prompts. If Accessibility is missing, AX verbs (`tree`, `find`, `click`, …) fail with an actionable error and non-zero exit — run `interceptor macos trust --walkthrough` to fix. Note for source builds: an ad-hoc-signed dev bridge loses its TCC grants on every rebuild (the System Settings row can stay visibly on without applying) — remove the stale row (−) and re-grant, or use the signed pkg; `interceptor macos trust` reports the running binary's signing status.
 4. *(Safari add-on only)* Install `Interceptor-Safari-<version>.pkg`, open **InterceptorSafari** once, then enable **Interceptor** in **Safari → Settings → Extensions** and grant website access.
 5. Open a terminal:
 
@@ -241,6 +245,7 @@ Safari reuses the portable DOM/content engine and the same command envelope. API
 - **Canvas camera apps**: pan/zoom WebGL viewers via dispatched `MouseEvent`/`WheelEvent`, anchor lat/lng overlays via Web Mercator projection, restyle the rendered viewport with CSS filters. See [`use-cases/interaction-skills/canvas-camera-overlays.md`](use-cases/interaction-skills/canvas-camera-overlays.md) and [`use-cases/interaction-skills/webgl-camera-control.md`](use-cases/interaction-skills/webgl-camera-control.md).
 - **Native client-side export capture**: intercept any webapp's "export as PNG/PDF/SVG" by patching `URL.createObjectURL` and suppressing the auto-download. No clipboard hop, no Save dialog. See [`use-cases/interaction-skills/blob-export-capture.md`](use-cases/interaction-skills/blob-export-capture.md).
 - **Non-CDP architecture**: avoid the debugger-protocol footprint that separate automated browsers depend on.
+- **Unbranded page-world footprint**: the MAIN-world scripts key their install guards, canvas observer, and Trusted-Types policies with opaque `Symbol.for()` keys rather than vendor-named globals, so a page can't fingerprint the extension with a one-line `window`-key scan. Hardening, not invisibility — `Object.getOwnPropertySymbols(window)` still lists them.
 
 ## Browser Install
 
@@ -255,7 +260,7 @@ The recommended install path for end users is the signed `.pkg` documented in [I
   - **macOS:** `brew install --cask brave-browser`
   - **Windows:** `winget install Brave.Brave` (or `choco install brave`)
   - **Linux:** `sudo snap install brave` or `flatpak install flathub com.brave.Browser`. For native package-manager installs (apt/dnf/zypper/AUR), see the [official Linux guide](https://brave.com/linux/).
-- **Developer mode enabled** in the target Brave / Chrome profile. `--load-extension` is silently dropped by Chromium when Dev mode is off, leaving a dormant install with no error. `scripts/install.sh` (macOS/Linux) and `scripts/install.ps1` (Windows) both preflight this and offer to flip it for you (browser-closed only) or fail loudly with remediation steps. To enable manually: open `brave://extensions/` (or `chrome://extensions/`) and toggle Developer mode in the top-right.
+- **Developer mode enabled** in the target Brave / Chrome profile. `--load-extension` is silently dropped by Chromium when Dev mode is off, leaving a dormant install with no error. `scripts/install.sh` (macOS/Linux) preflights this and offers to flip it for you (browser-closed only) or fail loudly with remediation steps. To enable manually: open `brave://extensions/` (or `chrome://extensions/`) and toggle Developer mode in the top-right. On Windows, `scripts/install.ps1` registers the native-messaging host and prints **Load unpacked** instructions instead — current branded Chrome ignores `--load-extension` on Windows, and the script never edits browser profiles.
 - Xcode command line tools (only required if you want to build the macOS bridge)
 
 #### Two install modes
@@ -424,6 +429,8 @@ The legacy individual commands (`interceptor tab new`, `interceptor tree`, `inte
 
 **Focus Model (Background-First Contract)** — Interceptor never steals focus from the tab you're working in. `interceptor open <url>` and `interceptor tab new <url>` create their tabs in the **background** by default — the tab you had active stays active. Only four browser verbs intentionally move focus: `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>`. The reuse path preserves the reused tab's existing focus state; add `--activate` to bring it forward. All other operations (`click`, `type`, `read`, `screenshot`, `net`, `scene`, `monitor`, etc.) work against the target tab without touching whichever tab you're looking at. This mirrors the macOS surface's same background-first contract — see `AGENTS.md` "Background First (Browser + macOS)" for the full inventory.
 
+**Tab Lifecycle Policy** — Interceptor cleans up after itself. Two behaviors, both set from the extension popup (the popup is the only writer): **(1) Named-group reuse (default on):** `interceptor open <url> --group <label>` navigates that group's most-recent tab instead of opening a new one — address-bar semantics, so a 40-step automation leaves one tab instead of forty. Applies to **named groups only**: in the shared default group, "most recent tab" could be another agent's, so ungrouped `open` always creates (explicit `--reuse` still opts in anywhere; `--no-reuse` forces a new tab; `tab new` is the ⌘T verb and always creates). **(2) Idle group close (default 10 min):** a managed tab group that no command has touched for the configured minutes is closed automatically (0 disables). Safety guards: only Interceptor-managed groups are ever touched, and never the focused window's active tab, a pinned tab, an audible tab, or a window's last tab. Every sweep is logged (extension storage `tabLifecycleSweepLog` + service-worker console), and closed tabs are restorable with ⌘⇧T / `interceptor session restore`. Agents observe the resolved policy via `interceptor status --verbose` or the `status` action's `tabLifecycle` field.
+
 **Named Contexts** — When two browser profiles (or Chrome + Brave) both connect to the same daemon, the daemon tracks each extension as a separate named context. Each profile's extension auto-generates a stable UUID on first run (stored in `chrome.storage.local`). Run `interceptor contexts` to list connected IDs, then pass `--context <id>` to route a command to a specific profile. Without `--context`, a command succeeds only when exactly one context is connected — the daemon errors (fail-fast) when zero or multiple contexts are present. Primary use case: cross-account security testing where you need Account A and Account B active simultaneously. If two profiles are configured with the same context ID, the second profile is rejected and the extension shows a red `!` badge; open that profile's Interceptor popup, choose a unique Context ID, and it will re-register without needing an extension reload.
 
 **Passive Network** — `fetch()` and `XMLHttpRequest` traffic on every page is captured automatically. SSE streams are exposed with `interceptor sse log`. WebSocket, Beacon, and BroadcastChannel activity is captured as page communication with `interceptor net page-comm log`; use `interceptor net monitor on --reload` when you need sockets opened during page startup. No debugger, no infobanner.
@@ -449,7 +456,8 @@ interceptor open "https://example.com" --tree-only   # Skip text
 interceptor open "https://example.com" --text-only   # Skip tree
 interceptor open "https://example.com" --full        # Full text (no 2000-char limit)
 interceptor open "https://example.com" --no-wait     # Don't wait for load
-interceptor open "https://example.com" --reuse        # Reuse the most recent Interceptor-group tab (long automation: avoids tab accumulation)
+interceptor open "https://example.com" --reuse        # Reuse the most recent managed tab (long automation: avoids tab accumulation)
+interceptor open "https://example.com" --no-reuse     # Force a new tab (overrides the named-group reuse default)
 interceptor open "https://example.com" --reuse --activate  # Reuse the tab and bring it to the foreground
 interceptor read                              # Tree + text for current page
 interceptor read e5                           # Tree + text for element subtree
@@ -490,6 +498,8 @@ interceptor state                            # Full DOM tree + scroll + focused 
 interceptor click e5                         # Click element (synthetic; default — userActivation override + __interceptor_trust marker handle most isTrusted gates)
 interceptor click e5 --trusted               # FALLBACK, macOS only — OS-level CGEvent click (only when synthetic input is observed to fail)
 interceptor click e5 --at 10,20             # Click at offset within element
+interceptor click --selector "button span" --nth 4   # Click by CSS selector (0-based --nth matches query output; quote selectors with spaces)
+interceptor query "button span"              # Elements matching a CSS selector — each carries a clickable e<ref>, so any verb can act on it
 interceptor type e3 "hello"                  # Type into element (synthetic; default)
 interceptor type e3 "more" --append          # Append without clearing
 interceptor type "textbox:Search" "query"    # Type using semantic selector (role:name)

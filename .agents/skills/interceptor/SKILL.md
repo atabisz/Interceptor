@@ -26,6 +26,7 @@ Use this as the routing skill before loading a surface-specific skill.
 ## Core Rules
 
 - Browser commands operate inside the cyan `interceptor` tab group. Do not use `--any-tab` unless the user explicitly authorizes acting outside that group.
+- For browser work, pick a stable `--group <label>` (agent name or session id) and close it with `interceptor group close <label>` when done — a named group isolates you from sibling agents, makes `open` reuse your most-recent tab instead of accumulating new ones, and is auto-closed by the extension if left idle (default 10 min).
 - `interceptor open <url>` and `interceptor tab new <url>` create background tabs by default. Only `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>` intentionally move browser focus.
 - The macOS surface is background-first by default. Only `interceptor macos app activate <app>` and `interceptor macos open <app> --activate` intentionally move focus.
 - If multiple browser profiles are connected, run `interceptor contexts` and pass `--context <id>`.
@@ -34,6 +35,7 @@ Use this as the routing skill before loading a surface-specific skill.
 - The zero-CDP browser rule governs the user's real Chrome/Brave/Safari web session. For owned Electron apps, `interceptor macos cdp` and `interceptor macos cdp app` are intentional app-control surfaces.
 - For native app runtime internals, use `interceptor macos runtime` after checking `interceptor status`; public Full installs may require operator-supplied runtime agent dylibs/signing identity before `macos runtime enable`.
 - If an already-loaded unpacked extension behaves stale after a package update, reload it from `chrome://extensions` or `brave://extensions`, or run `interceptor reload` once the extension is reachable.
+- `interceptor daemon stop` and `interceptor skills unadopt` are install/maintenance verbs. The daemon is shared by every agent on the machine — never stop it during normal automation; the next browser command respawns it, but every connected agent's in-flight work is dropped.
 
 ## Load A Surface Skill
 

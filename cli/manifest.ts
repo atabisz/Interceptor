@@ -32,7 +32,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   // ── compound (agent-optimized) ──────────────────────────────────────────────
   {
     name: "open", surface: "browser",
-    usage: "interceptor open <url> [--tree-only|--text-only] [--markdown] [--full] [--reuse] [--activate] [--no-wait] [--timeout <ms>]",
+    usage: "interceptor open <url> [--tree-only|--text-only] [--markdown] [--full] [--reuse|--no-reuse] [--activate] [--no-wait] [--timeout <ms>]",
     summary: "Open URL in a background tab, wait for stability, return a11y tree + page text",
     returns: "tree: a11y tree (interactive elements + e<n> refs). text: document.body.innerText (visible rendered text), capped at 8,000 chars unless --full (200K). --markdown swaps text for a structure-preserving markdown render.",
     flags: [
@@ -40,7 +40,8 @@ export const COMMAND_SPECS: CommandSpec[] = [
       { name: "--text-only", description: "skip tree" },
       { name: "--markdown", description: "render text as markdown (headings/bold/lists/tables preserved)" },
       { name: "--full", description: "lift the 8K text cap (up to 200K)" },
-      { name: "--reuse", description: "navigate the most recent managed tab instead of opening a new one" },
+      { name: "--reuse", description: "navigate the most recent managed tab instead of opening a new one (the DEFAULT for --group calls, per the extension's tab-lifecycle policy)" },
+      { name: "--no-reuse", description: "force a new tab (overrides the named-group reuse default)" },
       { name: "--activate", description: "foreground the tab (default is background-first)" },
       { name: "--no-wait", description: "return immediately after tab creation" },
       { name: "--timeout", value: "<ms>", description: "wait-stable timeout (default 5000)" },
@@ -70,7 +71,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
     returns: "Updated a11y tree + '--- diff ---' of what changed. 'ok (page navigated…)' when the action triggered navigation.",
     flags: [
       { name: "--keys", value: "<combo>", description: "send a keyboard shortcut instead (e.g. Enter, cmd+shift+p)" },
-      { name: "--trusted", description: "HID-sourced input — page sees isTrusted: true" },
+      { name: "--trusted", description: "HID-sourced input — page sees isTrusted: true; requires the target tab active in the OS-focused window (refuses otherwise, never moves focus)" },
       { name: "--append", description: "type without clearing the field first" },
       { name: "--no-read", description: "skip the post-action tree read" },
     ],
@@ -126,13 +127,13 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "links", surface: "browser", usage: "interceptor links", summary: "All links on the page", returns: "Array of {text, href}." },
   { name: "images", surface: "browser", usage: "interceptor images", summary: "All images", returns: "Array of {alt, src}." },
   { name: "forms", surface: "browser", usage: "interceptor forms", summary: "All forms and fields", returns: "Form structure with field names/types/values." },
-  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Matching elements with attributes." },
+  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Matching elements with attributes and clickable e<ref>s." },
   { name: "exists", surface: "browser", usage: "interceptor exists <css-selector>", summary: "Does a selector match?", returns: "Boolean." },
   { name: "count", surface: "browser", usage: "interceptor count <css-selector>", summary: "How many elements match", returns: "Number." },
   { name: "attr", surface: "browser", usage: "interceptor attr e<ref> <name> | attr set e<ref> <name> <value>", summary: "Get/set an attribute", returns: "Attribute value." },
   { name: "style", surface: "browser", usage: "interceptor style e<ref> <property> | style inject --css \"<rules>\" | style remove <handle>", summary: "Computed style / stylesheet injection", returns: "Computed value, or an injection handle." },
   // ── actions ─────────────────────────────────────────────────────────────────
-  { name: "click", surface: "browser", usage: "interceptor click e<ref>", summary: "Click an element", returns: "ok / error." },
+  { name: "click", surface: "browser", usage: "interceptor click e<ref> | --selector <css> [--nth N]", summary: "Click an element by a11y ref, index, or CSS selector", returns: "ok / error." },
   { name: "type", surface: "browser", usage: "interceptor type e<ref> <text…>", summary: "Type into a field", returns: "ok / error." },
   { name: "select", surface: "browser", usage: "interceptor select e<ref> <value>", summary: "Select an option", returns: "ok / error." },
   { name: "keys", surface: "browser", usage: "interceptor keys <combo>", summary: "Send a keyboard shortcut", returns: "ok / error." },
@@ -150,6 +151,13 @@ export const COMMAND_SPECS: CommandSpec[] = [
   // ── tabs / network / capture / data ─────────────────────────────────────────
   { name: "tabs", surface: "browser", usage: "interceptor tabs", summary: "List managed tabs", returns: "Tab list (id, url, title)." },
   { name: "tab", surface: "browser", usage: "interceptor tab new|close|activate|reload […]", summary: "Tab lifecycle", returns: "ok / tab info." },
+  {
+    name: "update", surface: "local",
+    usage: "interceptor update [status]",
+    summary: "Update Interceptor itself — fires a user-initiated Sparkle update check (full install only)",
+    returns: "check: confirmation the update alert was fired + feed URL. status: feed, lastCheck, automaticChecks, checkInterval, canCheckForUpdates, sessionInProgress.",
+    example: "interceptor update",
+  },
   { name: "network", surface: "browser", usage: "interceptor net [--filter <pattern>] [--limit <n>] [--format har|json|pcapng --out <path>]", summary: "Passive network log", returns: "Recent requests (method, url, status, type); exportable to HAR/pcapng." },
   { name: "headers", surface: "browser", usage: "interceptor headers [--filter <pattern>]", summary: "Request headers seen", returns: "Header sets per request." },
   { name: "screenshot", surface: "browser", usage: "interceptor screenshot [e<ref>] [--save] [--format png|jpeg|webp] [--quality <n>]", summary: "Screenshot page/element", returns: "Image (saved to disk with --save; path on stderr)." },
@@ -163,10 +171,16 @@ export const COMMAND_SPECS: CommandSpec[] = [
   // ── local (no daemon) ───────────────────────────────────────────────────────
   {
     name: "skills", surface: "local",
-    usage: "interceptor skills [list|status|show <name>|adopt [names…] [--into claude,codex,agents] [--all] [--force]]",
-    summary: "List installed skill packs and link them into AI runtimes (Claude Code, Codex, ~/.agents)",
-    returns: "Adoption state per runtime; adopt creates symlinks (junctions on Windows) that stay current across updates.",
+    usage: "interceptor skills [list|status|show <name>|adopt …|unadopt [names…] [--into targets] [--all] --owned-root <path>]",
+    summary: "List installed skill packs, link them into AI runtimes, or remove only installer-owned links",
+    returns: "Adoption state per runtime; adopt creates links; unadopt returns per-target removed/missing/foreign/not-link/error results and never deletes a real directory.",
     example: "interceptor skills adopt --into claude",
+  },
+  {
+    name: "daemon", surface: "local",
+    usage: "interceptor daemon stop [--reason installer|manual] [--timeout 10000]",
+    summary: "Stop the current-user daemon through an authenticated local control frame without auto-spawning",
+    returns: "Text or JSON indicating stopped/alreadyStopped and the verified PID; shutdown tokens are never rendered.",
   },
   {
     name: "manifest", surface: "local",

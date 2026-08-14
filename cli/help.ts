@@ -6,6 +6,27 @@
 import { COMMAND_SPECS } from "./manifest"
 
 const COMMAND_HELP: Record<string, string> = {
+  update: [
+    "interceptor update — update Interceptor itself",
+    "",
+    "  interceptor update             macOS: user-initiated Sparkle check — surfaces the update alert immediately",
+    "  interceptor update status      macOS: Sparkle state — feed URL, last check, automatic-check schedule",
+    "",
+    "Notes:",
+    "  - macOS: requires the full install (the updater lives in the bridge app); browser-only",
+    "    installs get 'interceptor upgrade --full' guidance instead. The check always shows a",
+    "    visible prompt when an update exists — no waiting on the scheduled-check cadence.",
+    "  - Windows: updates ship as a signed installer — this command prints the Releases link",
+    "    (run the newer architecture-matched Setup; downgrades are refused).",
+  ].join("\n"),
+  daemon: [
+    "interceptor daemon — local daemon lifecycle control",
+    "",
+    "  interceptor daemon stop [--reason installer|manual] [--timeout 10000]",
+    "",
+    "The stop command never auto-starts a daemon. It authenticates with the current-user lock token,",
+    "waits for the locked PID to exit and both loopback ports to close, and never prints the token.",
+  ].join("\n"),
   save: [
     "interceptor save — write page-produced bytes to disk (no downloads shelf, Save dialog, clipboard, or CDP)",
     "",
@@ -131,7 +152,8 @@ const MAP_UPGRADE = `macOS + iPhone control are NOT enabled on this browser-only
   interceptor upgrade --full     Add native macOS + iPhone control (macOS host only)`
 
 const MAP_FOOTER = `LOCAL (no browser needed):
-  status · init · skills (adopt packs into Claude Code / Codex / ~/.agents) · manifest · research · upgrade · help
+  status · init · daemon stop · skills (adopt packs into Claude Code / Codex / ~/.agents) · manifest · research · upgrade · help
+  update — update Interceptor itself (fires the Sparkle update check; 'update status' shows the schedule)
 
 GLOBAL FLAGS (any command, any position — flag order never changes meaning):
   --json  --context <id>  --tab <id>  --group <label>  --frame <id>  --all-surfaces
@@ -169,8 +191,10 @@ Compound (agent-optimized):
   interceptor open <url> --full              Full text (200K cap) instead of the 8000-char summary
   interceptor open <url> --timeout <ms>      Override wait-stable timeout (default 5000)
   interceptor open <url> --no-wait           Return immediately after tab creation
-  interceptor open <url> --reuse             Navigate the most recent Interceptor-group tab instead of opening a new one (cleans up long automation runs)
+  interceptor open <url> --reuse             Navigate the most recent managed tab instead of opening a new one (cleans up long automation runs)
+  interceptor open <url> --no-reuse          Force a new tab (overrides the named-group reuse default)
   interceptor open <url> --reuse --activate  Navigate the reused tab and bring it to the foreground
+                                             With --group <label>, open reuses that group's most-recent tab BY DEFAULT (policy: extension popup)
   interceptor read                           Tree + text for active tab
   interceptor read <ref>                     Tree + text for element subtree
   interceptor read --tree-only               Skip text
@@ -185,7 +209,8 @@ Compound (agent-optimized):
   interceptor style remove <handle>          Remove a previously injected stylesheet
   interceptor act <ref>                      Click + wait + return updated tree + diff
   interceptor act <ref> "value"              Type into field + wait + return updated tree
-  interceptor act <ref> --trusted            Use HID-sourced trusted input (page sees isTrusted: true)
+  interceptor act <ref> --trusted            HID-sourced trusted input (isTrusted: true); requires the target tab
+                                             active in the OS-focused window — refuses otherwise, never moves focus
   interceptor act <ref> --keys "Enter"       Send keyboard shortcut instead
   interceptor act <ref> --no-read            Skip post-action tree read
   interceptor inspect                        Tree + text + network log + headers
@@ -217,6 +242,7 @@ State:
 
 Actions:
   interceptor click <index|ref>              Click element (e.g. interceptor click e5)
+  interceptor click --selector "<css>" [--nth N]  Click by CSS selector (0-based --nth matches query output; quote selectors with spaces)
   interceptor click <index> --at X,Y        Click at coordinates on element
   interceptor dblclick <index> --at X,Y     Double-click at coordinates
   interceptor rightclick <index> --at X,Y   Right-click at coordinates
@@ -242,8 +268,9 @@ Navigation:
 
 Tabs:
   interceptor tabs                           List all tabs
-  interceptor tab new [url]                  Open new tab in background (default)
+  interceptor tab new [url]                  Open new tab in background (default; always creates — the ⌘T verb)
   interceptor tab new [url] --activate       Open new tab and foreground it (explicit opt-in)
+  interceptor tab new [url] --reuse          Navigate the group's most-recent tab instead of creating
   interceptor tab close [id]                 Close tab
   interceptor tab switch <id>                Switch to tab (explicit focus move)
   interceptor window new [url]               Open a new browser window
@@ -403,6 +430,8 @@ Meta:
   interceptor diagnose                       Post-failure snapshot: daemon binary, all contexts, tabs, elements, monitor
   interceptor diagnose --context <id>        Probe a specific browser context only
   interceptor diagnose --json                Same snapshot as JSON
+  interceptor daemon stop [--reason manual] [--timeout 10000]
+                                             Authenticated local stop; never auto-spawns the daemon
   interceptor help [<command>|--all]         Concise help / one command's contract / the full reference
   interceptor manifest                       Machine-readable capability manifest (verbs, flags, returns, skills)
   interceptor skills list                    Skill packs shipped with this install + adoption state
@@ -410,6 +439,8 @@ Meta:
   interceptor skills show <name>             One skill's purpose + which text verb returns what
   interceptor skills adopt [names…] [--into claude,codex,agents] [--all] [--force]
                                              Symlink skill packs into AI runtimes (junctions on Windows)
+  interceptor skills unadopt [names…] [--into claude,codex,agents] [--all] --owned-root <path>
+                                             Remove only links proven to target the owned installed skill root
 
 Branding:
   interceptor brand tab-group --title <label> [--color <color>]
@@ -604,6 +635,8 @@ macOS Bridge (full install only):
   interceptor macos contacts status|request|containers|groups|list|contact|me|find|create|update|delete|vcard|import-vcard|current-token|changes
   interceptor macos contacts find "<query>" | --email <addr> | --phone <num>
   interceptor macos photos status|request|albums|album|assets|asset|export|export-video|export-live|thumbnail|favorite|hide|delete|add-to-album|remove-from-album|import|import-video|current-token|changes
+  interceptor macos photos export <id> --out <path> [--size N] [--format jpeg|png]   Originals are HEIC; --format transcodes
+  interceptor macos photos thumbnail <id> [--size N] [--out <path>]                  --out writes a file; without it, returns a base64 dataUrl
   interceptor macos location status|request|request-temporary-accuracy|current|monitor|significant|visits|heading|geocode|reverse|distance|postal-geocode
   interceptor macos location current                                              (one-shot CLLocationManager.requestLocation)
   interceptor macos location reverse <lat,lng>

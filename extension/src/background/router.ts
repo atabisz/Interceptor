@@ -129,7 +129,7 @@ export async function routeAction(
   // Default: forward to content script
   const contentResult = await sendToContentScript(
     tabId, action, action.frameId as number | undefined
-  ) as { success: boolean; error?: string; data?: unknown; warning?: string }
+  ) as { success: boolean; error?: string; data?: unknown; warning?: string; refId?: string }
 
   const shouldSceneEscalate =
     action.type === "scene_click" &&
@@ -137,8 +137,11 @@ export async function routeAction(
     ((action.os === true) || contentResult.warning?.includes("no DOM change")) &&
     activeTransport !== "none"
 
+  // click_selector escalates through the same path: the content handler
+  // reports the clicked element's refId, which os_click resolves to screen
+  // coordinates exactly like a ref-targeted click.
   const shouldClickEscalate =
-    action.type === "click" &&
+    (action.type === "click" || action.type === "click_selector") &&
     contentResult.success &&
     contentResult.warning?.includes("no DOM change") &&
     activeTransport !== "none"
@@ -151,6 +154,7 @@ export async function routeAction(
     const osResult = await handleOsInputActions({
       ...action,
       type: "os_click",
+      ref: contentResult.refId ?? action.ref,
       x: resolvedAt?.x ?? action.x,
       y: resolvedAt?.y ?? action.y
     }, tabId)
@@ -177,7 +181,10 @@ export async function routeAction(
           reason: action.os === true
             ? "trusted scene click failed"
             : "synthetic produced no DOM change, os_click failed",
-          suggestion: "verify element is interactive and Chrome window is visible"
+          os_error: osResult.error,
+          suggestion: (typeof osResult.data === "object" && osResult.data &&
+            (osResult.data as { hint?: string }).hint) ||
+            "verify element is interactive and Chrome window is visible"
         }
       }
     }

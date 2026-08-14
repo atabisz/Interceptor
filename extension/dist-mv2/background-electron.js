@@ -277,6 +277,32 @@ function shouldRetryContentScript(error) {
     return false;
   return error.includes("Receiving end does not exist") || error.includes("Could not establish connection") || error.includes("disconnected port") || error.includes("message channel is closed") || error.includes("no response from content script");
 }
+var INPUT_ACTIONS = new Set([
+  "click",
+  "click_selector",
+  "click_at",
+  "dblclick",
+  "rightclick",
+  "drag",
+  "input_text",
+  "send_keys",
+  "select_option",
+  "check",
+  "file_upload",
+  "file_upload_chunk",
+  "find_and_click",
+  "find_and_type",
+  "find_and_check",
+  "scene_click",
+  "scene_dblclick",
+  "scene_select",
+  "scene_insert"
+]);
+function isResponseLoss(error) {
+  if (!error)
+    return false;
+  return error.includes("message channel is closed") || error.includes("disconnected port") || error.includes("no response from content script");
+}
 
 // extension/src/background/content-bridge.ts
 async function injectContentScript(tabId, frameId) {
@@ -289,7 +315,7 @@ async function injectContentScript(tabId, frameId) {
     return { success: false, error: err.message };
   }
 }
-var NAVIGATION_CAPABLE_ACTIONS = new Set(["click", "click_at", "dblclick", "find_and_click"]);
+var NAVIGATION_CAPABLE_ACTIONS = new Set(["click", "click_at", "dblclick", "find_and_click", "click_selector"]);
 async function sendToContentScriptOnce(tabId, action, frameId) {
   const watchesNavigation = NAVIGATION_CAPABLE_ACTIONS.has(action.type);
   let initialUrl;
@@ -359,6 +385,23 @@ async function sendToContentScript(tabId, action, frameId) {
   const first = await sendToContentScriptOnce(tabId, action, frameId);
   if (first.success || !shouldRetryContentScript(first.error))
     return first;
+  if (INPUT_ACTIONS.has(action.type) && isResponseLoss(first.error)) {
+    let navigating = false;
+    try {
+      navigating = (await chrome.tabs.get(tabId)).status === "loading";
+    } catch {}
+    if (navigating) {
+      return {
+        success: true,
+        data: `${action.type} delivered; the page began navigating before the reply arrived`,
+        warning: "reply channel closed during navigation — re-read page state to confirm the outcome"
+      };
+    }
+    return {
+      success: false,
+      error: `${action.type} was delivered but the reply channel closed (${first.error}) — not auto-retried to avoid firing it twice; re-read page state to confirm the outcome, then retry deliberately`
+    };
+  }
   await new Promise((resolve) => setTimeout(resolve, 250));
   const retryWithoutInject = await sendToContentScriptOnce(tabId, action, frameId);
   if (retryWithoutInject.success)
@@ -552,16 +595,51 @@ async function cdpAttachActDetach(tabId, method, params) {
 }
 
 // extension/src/background/capabilities/os-input.ts
+var FOREGROUND_HINT = "trusted OS input needs the target tab visible in the OS-focused window — " + "`interceptor tab switch <id>` foregrounds it (explicit focus-moving opt-in), " + "or drop --trusted for background-safe synthetic input";
+async function requireForegroundTab(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) {
+    return { ok: false, result: { success: false, error: `tab ${tabId} not found` } };
+  }
+  const win = await chrome.windows.get(tab.windowId).catch(() => null);
+  if (!win) {
+    return { ok: false, result: { success: false, error: `window ${tab.windowId} not found for tab ${tabId}` } };
+  }
+  if (win.state === "minimized") {
+    return { ok: false, result: {
+      success: false,
+      error: `window ${tab.windowId} is minimized — trusted OS input needs on-screen pixels to hit`,
+      data: { hint: FOREGROUND_HINT, windowState: win.state }
+    } };
+  }
+  if (!tab.active) {
+    return { ok: false, result: {
+      success: false,
+      error: `tab ${tabId} is not the active tab of window ${tab.windowId} — a trusted OS event would hit the window's visible tab instead`,
+      data: { hint: FOREGROUND_HINT }
+    } };
+  }
+  if (!win.focused) {
+    return { ok: false, result: {
+      success: false,
+      error: `window ${tab.windowId} is not the OS-focused window — trusted OS events are routed by the OS to whatever is frontmost, not to the target tab`,
+      data: { hint: FOREGROUND_HINT }
+    } };
+  }
+  return { ok: true, windowBounds: {
+    left: win.left || 0,
+    top: win.top || 0,
+    width: win.width || 0,
+    height: win.height || 0
+  } };
+}
 async function handleOsInputActions(action, tabId) {
   switch (action.type) {
     case "os_click": {
-      const win = await chrome.windows.getCurrent();
-      const windowBounds = {
-        left: win.left || 0,
-        top: win.top || 0,
-        width: win.width || 0,
-        height: win.height || 0
-      };
+      const fg = await requireForegroundTab(tabId);
+      if (!fg.ok)
+        return fg.result;
+      const windowBounds = fg.windowBounds;
       let pageX = action.x;
       let pageY = action.y;
       if ((action.index !== undefined || action.ref) && (pageX === undefined || pageY === undefined)) {
@@ -593,9 +671,16 @@ async function handleOsInputActions(action, tabId) {
         }
       };
     }
-    case "os_key":
+    case "os_key": {
+      const fg = await requireForegroundTab(tabId);
+      if (!fg.ok)
+        return fg.result;
       return { success: true, data: { method: "os_event", key: action.key, modifiers: action.modifiers || [] } };
+    }
     case "os_type": {
+      const fg = await requireForegroundTab(tabId);
+      if (!fg.ok)
+        return fg.result;
       if (action.index !== undefined || action.ref) {
         await sendToContentScript(tabId, { type: "focus", index: action.index, ref: action.ref });
         await new Promise((r) => setTimeout(r, 50));
@@ -603,13 +688,10 @@ async function handleOsInputActions(action, tabId) {
       return { success: true, data: { method: "os_event", text: action.text } };
     }
     case "os_move": {
-      const win = await chrome.windows.getCurrent();
-      const windowBounds = {
-        left: win.left || 0,
-        top: win.top || 0,
-        width: win.width || 0,
-        height: win.height || 0
-      };
+      const fg = await requireForegroundTab(tabId);
+      if (!fg.ok)
+        return fg.result;
+      const windowBounds = fg.windowBounds;
       const chromeUiHeight = action.chromeUiHeight || 88 + (debuggerAttached.has(tabId) ? 35 : 0);
       return {
         success: true,
@@ -1275,30 +1357,65 @@ async function handleCaptureStreamActions(action, tabId) {
   return { success: false, error: `unknown capture action: ${action.type}` };
 }
 
+// extension/src/inject-keys.ts
+var IK_NET = "z9n0";
+var IK_CANVAS = "z9c0";
+var IK_WS = "z9w0";
+var IK_BROADCAST = "z9b0";
+var IK_BEACON = "z9k0";
+var IK_TT_POLICY = "z9t0";
+var IK_SINK_TT_POLICY = "z9t1";
+var IK_CANVAS_OBSERVER = "z9o0";
+var IK_CANVAS_WRAPPED = "z9r0";
+var IK_GETCTX_WRAPPED = "z9r1";
+var K_NET = Symbol.for(IK_NET);
+var K_CANVAS = Symbol.for(IK_CANVAS);
+var K_WS = Symbol.for(IK_WS);
+var K_BROADCAST = Symbol.for(IK_BROADCAST);
+var K_BEACON = Symbol.for(IK_BEACON);
+var K_TT_POLICY = Symbol.for(IK_TT_POLICY);
+var K_CANVAS_OBSERVER = Symbol.for(IK_CANVAS_OBSERVER);
+var K_CANVAS_WRAPPED = Symbol.for(IK_CANVAS_WRAPPED);
+var K_GETCTX_WRAPPED = Symbol.for(IK_GETCTX_WRAPPED);
+var TT_POLICY_NAME = "tt-e";
+var SINK_TT_POLICY_NAME = "tt-s";
+
 // extension/src/background/capabilities/canvas.ts
-function normalizeCanvasLogKind(kind) {
-  return String(kind || "").trim();
-}
-function summarizeCanvasKinds(entries) {
-  const out = {};
-  for (const entry of entries) {
-    const kind = normalizeCanvasLogKind(entry.kind);
-    if (!kind)
-      continue;
-    out[kind] = (out[kind] || 0) + 1;
-  }
-  return out;
-}
 async function executeInMainWorld(tabId, func, args = []) {
+  const mapped = args.map((arg) => arg === undefined ? null : arg);
+  if (chrome.userScripts && typeof chrome.userScripts.execute === "function") {
+    try {
+      const argsLiteral = "[" + args.map((a) => a === undefined ? "undefined" : JSON.stringify(a)).join(",") + "]";
+      const code = `(${func.toString()}).apply(null, ${argsLiteral})`;
+      const results2 = await chrome.userScripts.execute({
+        target: { tabId },
+        world: "MAIN",
+        js: [{ code }]
+      });
+      const first = results2?.[0];
+      if (first && !first.error)
+        return first.result;
+    } catch {}
+  }
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    args: args.map((arg) => arg === undefined ? null : arg),
+    args: mapped,
     func
   });
   return results[0]?.result;
 }
-function hostCanvasSignals(limit = 20) {
+function hostCanvasSignals(limit = 20, obsKey) {
+  function summarizeCanvasKinds(entries) {
+    const out = {};
+    for (const entry of entries) {
+      const kind = String(entry.kind || "").trim();
+      if (!kind)
+        continue;
+      out[kind] = (out[kind] || 0) + 1;
+    }
+    return out;
+  }
   const canvases = Array.from(document.querySelectorAll("canvas"));
   const max = Number.isFinite(limit) && limit > 0 ? limit : 20;
   const safeSlice = (arr) => arr.slice(0, max);
@@ -1339,7 +1456,7 @@ function hostCanvasSignals(limit = 20) {
       keys: value && typeof value === "object" ? Object.keys(value).slice(0, 12) : undefined
     }];
   }));
-  const observer = window.__interceptorCanvasObserver || null;
+  const observer = (obsKey ? window[Symbol.for(obsKey)] : null) || null;
   const excalidrawScene = parseLocalStorageJson("excalidraw");
   const docsSemanticMirror = !!docsTextboxSummary.exists;
   const observerReasons = Array.isArray(observer?.partialCoverageReasons) ? observer.partialCoverageReasons.slice() : [];
@@ -1437,7 +1554,7 @@ function canvasAccessibleText(canvasIndex) {
     canvasCount: canvases.length
   };
 }
-function canvasObserverSummary(limit = 100, kinds, canvasIndex) {
+function canvasObserverSummary(limit = 100, kinds, canvasIndex, obsKey) {
   function normalize(kind) {
     return String(kind || "").trim();
   }
@@ -1452,7 +1569,7 @@ function canvasObserverSummary(limit = 100, kinds, canvasIndex) {
     return out;
   }
   function resolveCanvasId(observer2, canvasIndex2) {
-    if (canvasIndex2 === undefined)
+    if (canvasIndex2 === undefined || canvasIndex2 === null)
       return;
     const canvases = Array.isArray(observer2?.canvases) ? observer2.canvases.slice() : [];
     const ordered = canvases.sort((a, b) => {
@@ -1465,7 +1582,7 @@ function canvasObserverSummary(limit = 100, kinds, canvasIndex) {
     const canvasId2 = ordered[canvasIndex2]?.canvasId;
     return typeof canvasId2 === "string" && canvasId2 ? canvasId2 : null;
   }
-  const observer = window.__interceptorCanvasObserver || null;
+  const observer = (obsKey ? window[Symbol.for(obsKey)] : null) || null;
   if (!observer || !Array.isArray(observer.log)) {
     return {
       installed: false,
@@ -1493,12 +1610,12 @@ function canvasObserverSummary(limit = 100, kinds, canvasIndex) {
     entries: bounded
   };
 }
-function canvasObserverObjectsSummary(limit = 100, kind, canvasIndex) {
+function canvasObserverObjectsSummary(limit = 100, kind, canvasIndex, obsKey) {
   function normalize(value) {
     return String(value || "").trim();
   }
   function resolveCanvasId(observer2, canvasIndex2) {
-    if (canvasIndex2 === undefined)
+    if (canvasIndex2 === undefined || canvasIndex2 === null)
       return;
     const canvases = Array.isArray(observer2?.canvases) ? observer2.canvases.slice() : [];
     const ordered = canvases.sort((a, b) => {
@@ -1511,7 +1628,7 @@ function canvasObserverObjectsSummary(limit = 100, kind, canvasIndex) {
     const canvasId2 = ordered[canvasIndex2]?.canvasId;
     return typeof canvasId2 === "string" && canvasId2 ? canvasId2 : null;
   }
-  const observer = window.__interceptorCanvasObserver || null;
+  const observer = (obsKey ? window[Symbol.for(obsKey)] : null) || null;
   if (!observer || !Array.isArray(observer.objects)) {
     return {
       installed: false,
@@ -1651,7 +1768,7 @@ async function handleCanvasActions(action, tabId) {
     }
     case "canvas_status": {
       const list = await executeInMainWorld(tabId, walkCanvasElements);
-      const host = await executeInMainWorld(tabId, hostCanvasSignals, [action.limit]);
+      const host = await executeInMainWorld(tabId, hostCanvasSignals, [action.limit, IK_CANVAS_OBSERVER]);
       return {
         success: true,
         data: {
@@ -1665,11 +1782,11 @@ async function handleCanvasActions(action, tabId) {
       return { success: true, data };
     }
     case "canvas_log": {
-      const data = await executeInMainWorld(tabId, canvasObserverSummary, [action.limit, action.kinds, action.canvasIndex]);
+      const data = await executeInMainWorld(tabId, canvasObserverSummary, [action.limit, action.kinds, action.canvasIndex, IK_CANVAS_OBSERVER]);
       return { success: true, data };
     }
     case "canvas_objects": {
-      const data = await executeInMainWorld(tabId, canvasObserverObjectsSummary, [action.limit, action.kind, action.canvasIndex]);
+      const data = await executeInMainWorld(tabId, canvasObserverObjectsSummary, [action.limit, action.kind, action.canvasIndex, IK_CANVAS_OBSERVER]);
       return { success: true, data };
     }
     case "canvas_routes": {
@@ -1806,11 +1923,63 @@ async function handleCanvasActions(action, tabId) {
   return { success: false, error: `unknown canvas action: ${action.type}` };
 }
 
+// extension/src/background/tab-lifecycle.ts
+var DEFAULT_TAB_LIFECYCLE = { reuse: true, idleCloseMinutes: 10 };
+var STORAGE_KEY = "tabLifecycle";
+var GROUP_LAST_SEEN_PREFIX = "groupLastSeen:";
+function normalizeTabLifecycle(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const reuse = typeof obj.reuse === "boolean" ? obj.reuse : DEFAULT_TAB_LIFECYCLE.reuse;
+  let idle = DEFAULT_TAB_LIFECYCLE.idleCloseMinutes;
+  if (typeof obj.idleCloseMinutes === "number" && Number.isFinite(obj.idleCloseMinutes)) {
+    idle = Math.max(0, Math.round(obj.idleCloseMinutes));
+  }
+  return { reuse, idleCloseMinutes: idle };
+}
+function policyMayDecideReuse(action) {
+  return action.reuse === undefined && action.reusePolicy === true && typeof action.group === "string" && action.group.length > 0;
+}
+async function readArea(area) {
+  try {
+    const storageArea = chrome.storage[area];
+    if (!storageArea || typeof storageArea.get !== "function")
+      return;
+    const stored = await storageArea.get(STORAGE_KEY);
+    const raw = stored?.[STORAGE_KEY];
+    if (raw === undefined || raw === null)
+      return;
+    return normalizeTabLifecycle(raw);
+  } catch {
+    return;
+  }
+}
+async function resolveTabLifecycle() {
+  const managed = await readArea("managed");
+  if (managed)
+    return { policy: managed, source: "managed" };
+  const local = await readArea("local");
+  if (local)
+    return { policy: local, source: "local" };
+  return { policy: { ...DEFAULT_TAB_LIFECYCLE }, source: "default" };
+}
+function sessionArea3() {
+  const storage = chrome.storage;
+  return storage.session ?? chrome.storage.local;
+}
+function stampKey(label) {
+  return `${GROUP_LAST_SEEN_PREFIX}${label}`;
+}
+function recordGroupActivity(label) {
+  try {
+    sessionArea3().set({ [stampKey(label ?? "")]: Date.now() }).catch(() => {});
+  } catch {}
+}
+
 // extension/src/background/capabilities/tabs.ts
 function activeTabKey(group) {
   return group ? `activeTabId:${group}` : "activeTabId";
 }
-function sessionArea3() {
+function sessionArea4() {
   const storage = chrome.storage;
   return storage.session ?? chrome.storage.local;
 }
@@ -1843,7 +2012,15 @@ async function handleTabActions(action, tabId) {
       if (group && !GROUP_LABEL_RE.test(group)) {
         return { success: false, error: `invalid group label '${group}' — must match [A-Za-z0-9_-]{1,32}` };
       }
-      if (action.reuse) {
+      let reuseWanted = action.reuse === true;
+      if (!reuseWanted && policyMayDecideReuse(action)) {
+        try {
+          reuseWanted = (await resolveTabLifecycle()).policy.reuse;
+        } catch {
+          reuseWanted = false;
+        }
+      }
+      if (reuseWanted) {
         const groupId = group ? await ensureNamedGroup(group) : await ensureInterceptorGroup();
         if (groupId !== -1) {
           const groupTabs = await chrome.tabs.query({ groupId });
@@ -1858,7 +2035,7 @@ async function handleTabActions(action, tabId) {
                   updateProps.active = true;
                 const updated = await chrome.tabs.update(candidate.id, updateProps);
                 await waitForTabLoad(candidate.id);
-                await sessionArea3().set({ [activeTabKey(group)]: candidate.id });
+                await sessionArea4().set({ [activeTabKey(group)]: candidate.id });
                 return {
                   success: true,
                   data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, group, reused: true }
@@ -1877,7 +2054,7 @@ async function handleTabActions(action, tabId) {
       });
       if (newTab.id) {
         const groupId = group ? await addTabToNamedGroup(newTab.id, group, action.groupColor) : await addTabToInterceptorGroup(newTab.id);
-        await sessionArea3().set({ [activeTabKey(group)]: newTab.id });
+        await sessionArea4().set({ [activeTabKey(group)]: newTab.id });
         const data = { tabId: newTab.id, url: newTab.url, groupId, group, reused: false };
         const groupWarning = groupWarningFor(groupId, hasTabGroupApi());
         if (groupWarning)
@@ -1890,10 +2067,10 @@ async function handleTabActions(action, tabId) {
       const closedId = action.tabId || tabId;
       await chrome.tabs.remove(closedId);
       const keys = ["activeTabId", typeof action.group === "string" ? activeTabKey(action.group) : null].filter((k) => !!k);
-      const stored = await sessionArea3().get(keys);
+      const stored = await sessionArea4().get(keys);
       for (const key of keys) {
         if (stored[key] === closedId)
-          await sessionArea3().remove(key);
+          await sessionArea4().remove(key);
       }
       return { success: true };
     }
@@ -2481,8 +2658,9 @@ async function executeEval(tabId, world, code) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world,
-    args: [code],
-    func: async (c) => {
+    args: [code, IK_TT_POLICY, TT_POLICY_NAME],
+    func: async (c, ttKey, ttName) => {
+      const TT = Symbol.for(ttKey);
       function clone(v) {
         if (v === null || v === undefined)
           return v;
@@ -2505,21 +2683,21 @@ async function executeEval(tabId, world, code) {
         const w = window;
         let source = c;
         if (w.trustedTypes) {
-          if (!w.__interceptor_tt_policy) {
+          if (!w[TT]) {
             try {
-              w.__interceptor_tt_policy = w.trustedTypes.createPolicy("interceptor-eval", {
+              w[TT] = w.trustedTypes.createPolicy(ttName, {
                 createScript: (s) => s
               });
             } catch {
               try {
-                w.__interceptor_tt_policy = w.trustedTypes.createPolicy("interceptor-eval-" + Date.now(), {
+                w[TT] = w.trustedTypes.createPolicy(ttName + "-" + Date.now(), {
                   createScript: (s) => s
                 });
               } catch {}
             }
           }
-          if (w.__interceptor_tt_policy) {
-            source = w.__interceptor_tt_policy.createScript(c);
+          if (w[TT]) {
+            source = w[TT].createScript(c);
           }
         }
         let r = (0, eval)(source);
@@ -2623,8 +2801,9 @@ async function executeNormalize(tabId, world, code) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world,
-    args: [code],
-    func: async (sourceCode) => {
+    args: [code, IK_SINK_TT_POLICY, SINK_TT_POLICY_NAME],
+    func: async (sourceCode, ttKey, ttName) => {
+      const TT = Symbol.for(ttKey);
       async function normalize(value) {
         if (value && typeof value.then === "function") {
           value = await value;
@@ -2699,12 +2878,12 @@ async function executeNormalize(tabId, world, code) {
         const w = window;
         let evalSource = sourceCode;
         if (w.trustedTypes) {
-          if (!w.__interceptor_sink_tt_policy) {
-            w.__interceptor_sink_tt_policy = w.trustedTypes.createPolicy("interceptor-binary-sink", {
+          if (!w[TT]) {
+            w[TT] = w.trustedTypes.createPolicy(ttName, {
               createScript: (s) => s
             });
           }
-          evalSource = w.__interceptor_sink_tt_policy.createScript(sourceCode);
+          evalSource = w[TT].createScript(sourceCode);
         }
         const value = (0, eval)(evalSource);
         return { success: true, data: await normalize(value) };
@@ -3146,8 +3325,21 @@ async function handleFrameActions(action, tabId) {
 // extension/src/background/capabilities/meta.ts
 async function handleMetaActions(action, tabId) {
   switch (action.type) {
-    case "status":
-      return { success: true, data: { connected: true, version: chrome.runtime.getManifest().version } };
+    case "status": {
+      let tabLifecycle;
+      try {
+        const resolved = await resolveTabLifecycle();
+        tabLifecycle = { ...resolved.policy, source: resolved.source };
+      } catch {}
+      return {
+        success: true,
+        data: {
+          connected: true,
+          version: chrome.runtime.getManifest().version,
+          ...tabLifecycle ? { tabLifecycle } : {}
+        }
+      };
+    }
     case "reload_extension":
       setTimeout(() => chrome.runtime.reload(), 100);
       return { success: true, data: "reloading in 100ms" };
@@ -4434,13 +4626,14 @@ async function routeAction(action, tabId) {
     return handlePowerIdleActions(action);
   const contentResult = await sendToContentScript(tabId, action, action.frameId);
   const shouldSceneEscalate = action.type === "scene_click" && contentResult.success && (action.os === true || contentResult.warning?.includes("no DOM change")) && activeTransport !== "none";
-  const shouldClickEscalate = action.type === "click" && contentResult.success && contentResult.warning?.includes("no DOM change") && activeTransport !== "none";
+  const shouldClickEscalate = (action.type === "click" || action.type === "click_selector") && contentResult.success && contentResult.warning?.includes("no DOM change") && activeTransport !== "none";
   if (shouldClickEscalate || shouldSceneEscalate) {
     const resolvedAt = typeof contentResult.data === "object" && contentResult.data ? contentResult.data.at : undefined;
     console.log(`auto-escalating ${action.type} to OS-level input`);
     const osResult = await handleOsInputActions({
       ...action,
       type: "os_click",
+      ref: contentResult.refId ?? action.ref,
       x: resolvedAt?.x ?? action.x,
       y: resolvedAt?.y ?? action.y
     }, tabId);
@@ -4465,7 +4658,8 @@ async function routeAction(action, tabId) {
         diagnostics: {
           layers_tried: ["synthetic", "os_click"],
           reason: action.os === true ? "trusted scene click failed" : "synthetic produced no DOM change, os_click failed",
-          suggestion: "verify element is interactive and Chrome window is visible"
+          os_error: osResult.error,
+          suggestion: typeof osResult.data === "object" && osResult.data && osResult.data.hint || "verify element is interactive and Chrome window is visible"
         }
       }
     };
@@ -4608,6 +4802,10 @@ async function handleDaemonMessage(msg) {
     fail(`invalid group label '${groupLabel}' — must match [A-Za-z0-9_-]{1,32}`);
     return;
   }
+  if (groupLabel)
+    recordGroupActivity(groupLabel);
+  else if (needsTab(action.type) || action.type === "tab_create")
+    recordGroupActivity("");
   if (!tabId && needsTab(action.type)) {
     tabId = await getActiveTabId(groupLabel);
     if (tabId && groupLabel) {
