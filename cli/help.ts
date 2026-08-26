@@ -113,7 +113,8 @@ needed. Go deeper on any verb:
 const MAP_BROWSER = `BROWSER — a signed-in Chrome/Brave profile, background tabs by default:
   Compound   open <url> · read [ref] · act <ref> ["text"] · inspect     one-call open / read / act / debug
   Read text  text (visible innerText) · text --markdown (keeps headings/tables) · html <ref> (raw markup)
-  Structure  tree (a11y refs to act on) · find "<name>" (elements by name) · search "<q>" (full-text) · state · diff
+  Structure  tree (a11y refs) · find "<q>" (current-page text + elements) · state · diff
+  Web        websearch "<q>" (configured default provider → managed background tab + page read)
   Extract    table · links · images · forms · query <css> · exists · count · attr · style      structured JSON
   Act        act <ref> · click · type · select · focus · hover · drag · dblclick · rightclick · check · keys · scroll
   Navigate   navigate <url> · back · forward · scroll · wait <ms> · wait-stable
@@ -158,6 +159,7 @@ const MAP_FOOTER = `LOCAL (no browser needed):
 GLOBAL FLAGS (any command, any position — flag order never changes meaning):
   --json  --context <id>  --tab <id>  --group <label>  --frame <id>  --all-surfaces
   e.g. 'open --text-only <url>' ≡ 'open <url> --text-only'
+  unknown flags are rejected (exit 1) on browser commands; INTERCEPTOR_LAX_FLAGS=1 downgrades to a warning
 
 Docs & issues: https://github.com/Hacker-Valley-Media/Interceptor`
 
@@ -232,8 +234,13 @@ State:
   interceptor tree --filter all              Include landmarks + headings
   interceptor tree --depth N --max-chars N   Limit depth and output size
   interceptor diff                           Changes since last state/tree read
-  interceptor find "query"                   Find elements by name
-  interceptor find "query" --role button     Filter by role
+  interceptor find "query"                   Find current-page text + accessible elements
+  interceptor find "query" --text-only       Return bounded rendered-text snippets only
+  interceptor find "query" --elements-only   Return actionable element refs only
+  interceptor find "query" --role button     Element-only, filtered by role
+  interceptor find "query" --include-frames  Aggregate reachable frames
+  interceptor websearch "query"              Search default provider in a managed background tab
+  interceptor search "query"                 Deprecated alias for websearch (one release)
   interceptor text                           All visible text
   interceptor text <index|ref>               Text from specific element
   interceptor text --markdown                All visible text rendered as markdown
@@ -324,6 +331,8 @@ Passive Network (always-on, no CDP):
   interceptor net log --filter <pattern>     Filter by URL substring
   interceptor net log --since <timestamp>    Entries after timestamp
   interceptor net log --limit <n>            Max entries (default 100)
+  interceptor net log --format json|har|pcapng --out <path>   Export the buffer (file is created mode 600)
+  interceptor net log --format har --out <path> --redact-auth Same, credential headers replaced with [redacted]
   interceptor net clear                      Flush passive capture buffer
   interceptor net monitor on [--reload]      Arm WebSocket/Beacon/BroadcastChannel capture
   interceptor net monitor off                Disable dynamic page-communication capture
@@ -380,7 +389,7 @@ Scene Graph (Rich Editors):
   interceptor scene profile --verbose          Include active capabilities and strategy details
   interceptor scene list                       List scene objects on the current editor surface
   interceptor scene list --type shape          Filter by type (image|shape|text|page|embed|slide)
-  interceptor scene click <id>                 Click a scene object by its scene id
+  interceptor scene click <id> [--trusted]     Click a scene object by its scene id (--trusted posts OS-level input)
   interceptor scene dblclick <id>              Double-click a scene object
   interceptor scene select <id>                Click + verify selection change
   interceptor scene hit <x> <y>                Identify the scene object at viewport coordinates
@@ -409,8 +418,8 @@ Recording (Session Monitor):
   interceptor monitor status [--all]            Show status of current/all monitor sessions
   interceptor monitor status --task <taskId>    Show task envelope status
   interceptor monitor task attach <taskId> <sid> Attach an existing source session
-  interceptor monitor task snapshot <taskId>    Snapshot source artifacts under the task root
-  interceptor monitor task quality <taskId>     Show task capture readiness gates
+  interceptor monitor task snapshot <taskId|name>  Snapshot source artifacts under the task root
+  interceptor monitor task quality <taskId|name>   Show task capture readiness gates (synthesizes a missing transcript first)
   interceptor monitor task compile-blueprint <taskId>  Enforce blueprint-readiness gate
   interceptor monitor list                      List all sessions in the event log
   interceptor monitor tail [--raw] [--current]  Live tail current session (pretty by default)
@@ -579,6 +588,7 @@ macOS Bridge (full install only):
                                   [--watch-path <path>] [--watch-paths p1,p2,...]
                                   [--log-predicate "<NSPredicate format>"]
   interceptor macos monitor stop | pause | resume | status [--sid <sid>]
+  interceptor macos monitor stop --task <taskId|name>       Stop the task envelope: snapshot + transcript + quality grade
   interceptor macos monitor tail [--sid <sid>] [--limit N] [--raw]
   interceptor macos monitor list
   interceptor macos monitor export <sid> [--plan|--json] [--limit N]

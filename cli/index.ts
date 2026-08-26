@@ -4,7 +4,7 @@ import { detectSurfaces, SURFACE_UPGRADE_HINT } from "./lib/surfaces"
 import { runSkillsCommand, maybeEmitSkillsHint } from "./commands/skills"
 import { runManifestCommand } from "./manifest"
 import { parseTabFlag, parseContextFlag, parseGroupFlag, parseGroupColorFlag } from "./parse"
-import { formatState, formatTabs, formatCookies, formatResult } from "./format"
+import { formatState, formatTabs, formatCookies, formatFind, formatResult } from "./format"
 import { sendCommand, sendCommandWs, setGlobalGroup, type DaemonResult, type DaemonResponse, type Action } from "./transport"
 import { UPLOAD_CHUNK_B64_BYTES } from "../shared/platform"
 import { chunkBase64 } from "../shared/upload"
@@ -32,7 +32,7 @@ import { parseBatchCommand } from "./commands/batch"
 import { parseMonitorCommand } from "./commands/monitor"
 import { parseSceneCommand } from "./commands/scene"
 import { parseSseCommand } from "./commands/sse"
-import { runCompoundCommand } from "./commands/compound"
+import { runCompoundCommand, webSearchQuery, webSearchTimeout } from "./commands/compound"
 import { runOverride } from "./commands/override"
 import { runMacosCommand } from "./commands/macos"
 import { runIosCommand } from "./commands/ios"
@@ -44,7 +44,7 @@ import { runExtensionsCommand } from "./commands/extensions"
 import { runDaemonCommand } from "./commands/daemon"
 import { VERSION, BUILD_SHA, BUILD_DATE } from "./version"
 import { buildFilteredArgs } from "./global-flags"
-import { normalizeArgs } from "./normalize"
+import { normalizeArgsSplit } from "./normalize"
 
 // console.log must not be used for CLI output: Bun's console.log writer
 // silently drops everything past 64 KiB at exit when stderr and stdout share
@@ -65,7 +65,7 @@ const TAB_CMDS = new Set(["tabs", "tab", "window", "frames", "session"])
 const NET_CMDS = new Set(["network", "net", "headers"])
 const SS_CMDS = new Set(["screenshot", "canvas", "capture", "ocr"])
 const DATA_CMDS = new Set(["cookies", "storage", "history", "bookmarks", "downloads", "clear", "clipboard"])
-const META_CMDS = new Set(["status", "reload", "meta", "links", "images", "forms", "info", "page_info", "query", "exists", "count", "table", "attr", "style", "events", "search", "notify", "sessions", "capabilities", "modals", "panels"])
+const META_CMDS = new Set(["status", "reload", "meta", "links", "images", "forms", "info", "page_info", "query", "exists", "count", "table", "attr", "style", "events", "notify", "sessions", "capabilities", "modals", "panels"])
 const EVAL_CMDS = new Set(["eval"])
 const SAVE_CMDS = new Set(["save"])
 const BRAND_CMDS = new Set(["brand"])
@@ -76,7 +76,7 @@ const POWER_CMDS = new Set(["keepawake", "idle"])
 const DELEGATE_CMDS = new Set(["delegate"])
 const SCENE_CMDS = new Set(["scene"])
 const SSE_CMDS = new Set(["sse"])
-const COMPOUND_CMDS = new Set(["open", "read", "act", "inspect"])
+const COMPOUND_CMDS = new Set(["open", "read", "act", "inspect", "websearch", "search"])
 const OVERRIDE_CMDS = new Set(["override"])
 const MACOS_CMDS = new Set(["macos"])
 const IOS_CMDS = new Set(["ios"])
@@ -190,8 +190,10 @@ async function main() {
   // rewrite argv to [cmd, ...positionals, ...flags] so flag
   // position never changes meaning (e.g. `open --text-only <url>` used to
   // create a tab whose URL was literally "--text-only"). macos/ios pass
-  // through untouched — see cli/normalize.ts.
-  filtered = normalizeArgs(filtered)
+  // through untouched — see cli/normalize.ts. positionalCount marks where the
+  // positional span ends so text-sweeping parsers (type) never ingest flags.
+  const normalized = normalizeArgsSplit(filtered)
+  filtered = normalized.argv
 
   // Per-command --help / -h short-circuit. `interceptor open --help` prints
   // the open-specific help block; `interceptor --help` (no command) falls
@@ -225,6 +227,18 @@ async function main() {
 
   if (!ALL_KNOWN_CMDS.has(cmd)) {
     console.error(`error: unknown command '${cmd}'. Run 'interceptor help' for usage.`)
+    process.exit(1)
+  }
+
+  // `websearch` validation happens before daemon auto-spawn so a malformed
+  // invocation has no browser or process side effects. The retained `search`
+  // alias uses the identical parser and lifecycle.
+  if ((cmd === "websearch" || cmd === "search") && !webSearchQuery(filtered)) {
+    console.error(`error: interceptor ${cmd} requires a non-empty query. Usage: interceptor ${cmd} "<query>"`)
+    process.exit(1)
+  }
+  if ((cmd === "websearch" || cmd === "search") && webSearchTimeout(filtered) === null) {
+    console.error("error: --timeout must be a non-negative integer")
     process.exit(1)
   }
 
@@ -386,7 +400,7 @@ async function main() {
   }
 
   if (STATE_CMDS.has(cmd))       action = parseStateCommand(filtered)
-  else if (ACTION_CMDS.has(cmd)) action = parseActionsCommand(filtered)
+  else if (ACTION_CMDS.has(cmd)) action = parseActionsCommand(filtered, normalized.positionalCount)
   else if (NAV_CMDS.has(cmd))    action = parseNavigationCommand(filtered)
   else if (TAB_CMDS.has(cmd))    action = await parseTabsCommand(filtered)
   else if (NET_CMDS.has(cmd))    action = parseNetworkCommand(filtered)
@@ -571,6 +585,7 @@ async function main() {
             comment: `net log buffer dump (${captures.length} entries)`,
           },
           out: action.out as string | undefined,
+          redactAuth: action.redactAuth === true,
         })
         // pcapng with --out: also report saved path. har/json with --out: same. Both go to stderr so stdout stays clean.
         if (action.out) process.stderr.write(`saved: ${action.out}\n`)
@@ -595,8 +610,22 @@ async function main() {
         console.log(formatCookies(result.data as Parameters<typeof formatCookies>[0]))
         return
       }
+      if (action.type === "find_element" || action.type === "frames_find") {
+        console.log(formatFind(result.data as Parameters<typeof formatFind>[0]))
+        return
+      }
     }
 
+    // A background router older than this CLI forwards unrecognized action
+    // types to the content script, which answers "unknown action type: <t>" —
+    // the stale-extension-snapshot symptom after a pkg install (the running
+    // browser keeps the old service worker until reloaded). Label it.
+    if (!result.success && typeof result.error === "string" && result.error.startsWith("unknown action type:")) {
+      process.stderr.write(
+        `hint: the browser may be running an older Interceptor extension snapshot than this CLI (${VERSION}). ` +
+        `Run 'interceptor reload' (or reload the extension in the browser) and retry.\n`,
+      )
+    }
     console.log(formatResult(result, jsonMode))
   } catch (err) {
     console.error(`error: ${(err as Error).message}`)

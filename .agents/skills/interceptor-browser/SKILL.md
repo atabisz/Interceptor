@@ -13,7 +13,8 @@ This installed skill is self-contained. Source checkouts also have `AGENTS.md`, 
 
 ## Core Rules
 
-- Use compound commands (`open`, `read`, `act`, `inspect`) before low-level verbs.
+- Use compound commands (`open`, `websearch`, `read`, `act`, `inspect`) before low-level verbs.
+- `websearch "<query>"` searches through the browser's configured default provider in an Interceptor-managed background tab and returns the provider page. It is not Google-specific. `find "<query>"` never navigates: it searches the current page's complete rendered-text snapshot plus accessible elements. Use `find --text-only` for passages and `find --elements-only`/`--role` for controls.
 - Browser commands operate inside managed Interceptor tab groups. Do not use `--any-tab` unless the user explicitly authorizes acting outside those groups.
 - Pick a stable `--group <label>` (your agent name or session id) at the start of browser work, or set `INTERCEPTOR_GROUP` once. A named label buys three things at once: your tabs live in their own colored group and resolution never leaves it (isolation from sibling agents), `open` reuses your group's most-recent tab instead of piling up new ones, and the idle sweeper has a clean unit to reap if you crash. `interceptor group list` shows what's running.
 - Close your group with `interceptor group close <label>` the moment the job is done — tabs you leave open are tabs the user has to close by hand. The extension auto-closes idle groups (default: after 10 minutes without a command; configurable in the extension popup), but that is the crash-safety floor, not a substitute for cleaning up.
@@ -23,6 +24,7 @@ This installed skill is self-contained. Source checkouts also have `AGENTS.md`, 
 - Safari registers as the stable context `safari`; route with `interceptor --context safari <verb>`. If it is absent, verify the notarized Interceptor Safari extension is enabled before attempting page commands. Safari's enable switch is a protected user-present action; never try to bypass its Touch ID/password gate.
 - Prefer structured reads (`read`, `tree`, `text`, `inspect`, `scene`) before screenshots. Open `references/screenshot-policy.md` before screenshot-heavy work.
 - Default to plain text output. Use `--json` only when piping into scripts or when a downstream tool needs a machine-readable contract.
+- Unknown flags are rejected (exit 1, naming the flag and command) rather than ignored, so a typo never reads as success; `screenshot` writes to disk with `--save`, not `--out`. Fix the flag instead of setting `INTERCEPTOR_LAX_FLAGS=1`.
 - If an already-loaded unpacked extension behaves stale after a package update, reload it from `chrome://extensions` or `brave://extensions`, or run `interceptor reload` once the extension is reachable.
 - Safari package updates are loaded through the containing app/appex; do not look for a Chrome-style unpacked-extension reload button.
 - Safari suspends its background worker when idle, so `--context safari` can briefly report "context 'safari' not found" between commands and then self-heal. Re-issue the command rather than treating one transient drop as failure. Note two Safari capability limits: `headers add` only modifies recognized standard headers (arbitrary `X-…` names are refused — use `override` instead), and passive `net` capture reflects genuine page traffic, not requests you originate from `eval` (its world is separate from the page's).
@@ -31,7 +33,8 @@ This installed skill is self-contained. Source checkouts also have `AGENTS.md`, 
 
 ```bash
 interceptor status                        # 1. Confirm daemon + extension are alive
-interceptor open "https://example.com"    # 2. Background tab + wait + tree + text
+interceptor websearch "example docs"      # 2a. Default provider → managed background results tab
+interceptor open "https://example.com"    # 2b. Or open a known URL → wait + tree + text
 interceptor read                          # 3. Current state (re-read after any mutation)
 interceptor act e5                        # 4. Click ref e5 (refs come from `read`)
 interceptor act e7 "example user"         # 5. Type into ref e7

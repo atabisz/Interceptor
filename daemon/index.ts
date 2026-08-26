@@ -19,8 +19,10 @@ import {
 } from "../shared/monitor-artifacts"
 import { chooseOutboundTransport, isRelayPing, relaySlotAfterClose, validateContextRouting } from "./outbound-routing"
 import { claimContextId, type ContextSocket } from "./context-registration"
-import { formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
-import { clearDaemonRuntimeFiles, clearLockFile, constantTimeTokenEquals, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, generateShutdownToken, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
+import { failPendingBridgeRequests, formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
+import { socketWriteAll, drainSocketQueue, releaseSocketQueue } from "./socket-write"
+import { cleanupOwnedRuntimeFiles, clearDaemonRuntimeFiles, constantTimeTokenEquals, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, generateShutdownToken, parseDaemonPidFile, readLockFile, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
+import { DAEMON_HEALTH_SERVICE, LEGACY_HEALTH_BODY, probeDaemonHealth } from "../shared/daemon-health"
 import { assertNoInstallMaintenance } from "../shared/install-maintenance"
 import { VERSION } from "../cli/version"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
@@ -117,7 +119,7 @@ async function spawnBridge(): Promise<boolean> {
   bridgeSpawnAttempted = true
   try {
     const layout = readBridgeRecoveryLayout()
-    const actions = getBridgeRecoveryActions(layout, existsSync)
+    const actions = getBridgeRecoveryActions(layout, existsSync, { launchAgentLoaded: isLaunchAgentBootstrapped() })
     if (actions.length === 0) {
       log("bridge binary not found — cannot auto-spawn")
       return false
@@ -167,8 +169,15 @@ async function connectBridge(): Promise<boolean> {
           bridgeBuffer = Buffer.concat([bridgeBuffer, Buffer.from(raw)])
           processBridgeBuffer()
         },
-        close() {
-          log("bridge disconnected")
+        drain(socket) {
+          // Issue #229: flush frame tails the 8 KiB unix send buffer rejected.
+          drainSocketQueue(socket as any)
+        },
+        close(socket) {
+          // Issue #222: fail in-flight requests now, not at the CLI's timeout.
+          const failed = failPendingBridgeRequests(bridgePending)
+          log(`bridge disconnected${failed ? ` (failed ${failed} in-flight request(s))` : ""}`)
+          releaseSocketQueue(socket as any)
           bridgeSocket = null as any
           bridgeConnecting = false
           // Schedule reconnect
@@ -231,7 +240,9 @@ function sendToBridge(id: string, action: Record<string, unknown>, cliSocket: { 
   header.writeUInt32LE(encoded.byteLength, 0)
   const frame = Buffer.concat([header, encoded])
   try {
-    ;(bridgeSocket as any).write(frame)
+    // Issue #229: a bare write() truncated any frame > 8 KiB and desynced the
+    // bridge's framing; queue the tail and let the drain handler finish it.
+    socketWriteAll(bridgeSocket as any, frame)
   } catch (err) {
     log(`bridge write error: ${(err as Error).message}`)
     socketWriteFramed(cliSocket, JSON.stringify({ id, result: { success: false, error: "bridge connection lost" } }))
@@ -276,7 +287,7 @@ function forwardDelegateToBridge(
     const header = Buffer.alloc(4)
     header.writeUInt32LE(encoded.byteLength, 0)
     try {
-      ;(bridgeSocket as any).write(Buffer.concat([header, encoded]))
+      socketWriteAll(bridgeSocket as any, Buffer.concat([header, encoded]))
     } catch {
       fail("bridge connection lost")
       return
@@ -475,8 +486,8 @@ try {
 // already running, the new process becomes a transparent stdio↔IPC bridge
 // instead of exiting. This prevents the "native host disconnected" error cycle
 // that occurs every ~30s due to MV3 service worker reconnects.
-async function startNativeRelay(existingPid: number): Promise<never> {
-  log(`relay mode: bridging native messaging to singleton (pid ${existingPid})`)
+async function startNativeRelay(existingPid: number | null): Promise<never> {
+  log(`relay mode: bridging native messaging to singleton (pid ${existingPid ?? "unknown, port held"})`)
 
   let singletonSocket: Bun.Socket<undefined> | null = null
 
@@ -488,12 +499,17 @@ async function startNativeRelay(existingPid: number): Promise<never> {
         const encoded = Buffer.from(reg, "utf-8")
         const header = Buffer.alloc(4)
         header.writeUInt32LE(encoded.byteLength, 0)
-        socket.write(Buffer.concat([header, encoded]))
+        socketWriteAll(socket, Buffer.concat([header, encoded]))
         log("relay: registered with singleton")
       },
       data(_socket: Bun.Socket<undefined>, raw: Buffer<ArrayBufferLike>) {
         // Singleton → stdout (Chrome)
         process.stdout.write(Buffer.from(raw))
+      },
+      drain(socket: Bun.Socket<undefined>) {
+        // Issue #229: Chrome→singleton chunks can exceed the 8 KiB unix send
+        // buffer; flush the queued tail or the singleton's framing desyncs.
+        drainSocketQueue(socket)
       },
       close() {
         log("relay: singleton disconnected — exiting")
@@ -522,7 +538,7 @@ async function startNativeRelay(existingPid: number): Promise<never> {
 
   // Chrome stdin → singleton IPC socket
   process.stdin.on("data", (chunk: Buffer) => {
-    if (singletonSocket) singletonSocket.write(chunk)
+    if (singletonSocket) socketWriteAll(singletonSocket, chunk)
   })
   process.stdin.on("end", () => {
     log("relay: stdin ended (Chrome disconnected) — exiting")
@@ -544,10 +560,16 @@ function lifecycleDeps() {
 async function bootstrapDaemonRole(): Promise<void> {
   const deps = lifecycleDeps()
   const state = readPidState(deps)
-  const decision = decideDaemonStartupRole(STANDALONE, state)
+  // The port, not the pid file, says whether a singleton is serving. Probing
+  // it also makes a live owner restore any runtime files that went missing,
+  // so a relay decided below finds the socket it needs.
+  const probe = await probeDaemonHealth(WS_PORT)
+  if (probe.state === "interceptor" && probe.healed.length) log(`singleton pid ${probe.pid} restored runtime files on probe: ${probe.healed.join(", ")}`)
+  if (probe.state !== "free") log(`singleton port ${WS_PORT} is held (${probe.state}); pid file state: ${state.status}`)
+  const decision = decideDaemonStartupRole(STANDALONE, state, probe.state !== "free")
 
   if (decision.action === "exit") {
-    log(`another daemon already running (pid ${decision.pid}) — exiting`)
+    log(`another daemon already running (pid ${decision.pid ?? "unknown, port held"}) — exiting`)
     process.exit(0)
   }
 
@@ -576,6 +598,11 @@ await bootstrapDaemonRole()
 // Losing this race is fatal: exit instead of becoming a second, extension-less singleton.
 let wsServer: ReturnType<typeof Bun.serve> | null = null
 let wsBindError: Error | null = null
+// True only after this process wins the singleton gate below: the runtime
+// files (socket, pid, lock) describe the gate winner, so only the winner may
+// write, restore, or remove them.
+let ownsRuntimeFiles = false
+let shuttingDown = false
 try {
   assertNoInstallMaintenance()
 } catch (error) {
@@ -593,6 +620,7 @@ if (singletonGate.action === "exit") {
   process.exit(singletonGate.exitCode)
 }
 log(`ws server listening on port ${WS_PORT}`)
+ownsRuntimeFiles = true
 
 // Write lock file — metadata record of this instance, read by `interceptor
 // diagnose` for binary-mismatch detection. Written only after winning the
@@ -626,7 +654,6 @@ const pendingRequests = new Map<string, {
 }>()
 
 const socketBuffers = new Map<object, Buffer>()
-const socketWriteQueues = new Map<object, Buffer[]>()
 
 const LARGE_PAYLOAD_THRESHOLD = 16 * 1024
 const MAX_RESPONSE_CHARS = 50000
@@ -663,49 +690,16 @@ function socketWriteFramed(socket: { write: (data: Buffer | string) => number },
       sink.write(header)
       sink.write(encoded)
       const frame = sink.end() as Uint8Array
-      const wrote = socket.write(Buffer.from(frame))
-      if (wrote < frame.byteLength) {
-        const remainder = Buffer.from(frame.subarray(wrote))
-        const queue = socketWriteQueues.get(socket) || []
-        queue.push(remainder)
-        socketWriteQueues.set(socket, queue)
-      }
+      socketWriteAll(socket, Buffer.from(frame))
     } else {
       const header = Buffer.alloc(4)
       header.writeUInt32LE(encoded.byteLength, 0)
-      const frame = Buffer.concat([header, encoded])
-      const wrote = socket.write(frame)
-      if (wrote < frame.byteLength) {
-        const remainder = frame.subarray(wrote)
-        const queue = socketWriteQueues.get(socket) || []
-        queue.push(Buffer.from(remainder))
-        socketWriteQueues.set(socket, queue)
-      }
+      socketWriteAll(socket, Buffer.concat([header, encoded]))
     }
     return true
   } catch (err) {
     log(`socket write error: ${(err as Error).message}`)
     return false
-  }
-}
-
-function drainSocketQueue(socket: { write: (data: Buffer | string) => number }) {
-  const queue = socketWriteQueues.get(socket)
-  if (!queue || queue.length === 0) return
-  while (queue.length > 0) {
-    const chunk = queue[0]
-    let wrote = 0
-    try {
-      wrote = socket.write(chunk)
-    } catch (err) {
-      log(`socket drain error: ${(err as Error).message}`)
-      return
-    }
-    if (wrote < chunk.byteLength) {
-      queue[0] = chunk.subarray(wrote)
-      return
-    }
-    queue.shift()
   }
 }
 
@@ -1298,8 +1292,7 @@ async function handleOsAction(
 
 let socketServer: Bun.TCPSocketListener<undefined> | Bun.UnixSocketListener<undefined> | null = null
 
-try {
-  const socketHandlers: Bun.SocketHandler<undefined> = {
+const socketHandlers: Bun.SocketHandler<undefined> = {
       open(socket: Bun.Socket<undefined>) {
         socketBuffers.set(socket, Buffer.alloc(0))
         log("cli connected via socket")
@@ -1545,20 +1538,27 @@ try {
           }
         }
         socketBuffers.delete(socket)
-        socketWriteQueues.delete(socket)
+        releaseSocketQueue(socket)
         log("cli disconnected")
       },
       error(_socket: Bun.Socket<undefined>, err: Error) {
         log(`socket error: ${err.message}`)
       }
     }
-  if (IS_WIN) {
-    socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
-  } else {
-    // We hold the WS port (the singleton token), so any leftover socket file is ours to clear.
-    try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
-    socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
-  }
+
+function listenCliSocket(): Bun.TCPSocketListener<undefined> | Bun.UnixSocketListener<undefined> {
+  if (IS_WIN) return Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
+  // We hold the WS port (the singleton token), so any leftover socket file is ours to clear.
+  try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+  return Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
+}
+
+function writePidFile(): void {
+  writeFileSync(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
+}
+
+try {
+  socketServer = listenCliSocket()
   log(`socket listening on ${transportLabel()}`)
 } catch (err) {
   log(`socket listen failed: ${(err as Error).message}`)
@@ -1566,15 +1566,70 @@ try {
   process.exit(1)
 }
 
-Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
+// Synchronous so no reader ever sees a truncated pid file (the "invalid" branch).
+writePidFile()
 log(`pid file written: ${process.pid}`)
+
+// Restore whichever runtime files no longer describe this process. Anything
+// can remove files under /tmp (a stale-pid guess by an older build, a pkg
+// postinstall, a tmp cleaner, a user); the daemon is still the port owner, so
+// it rebuilds them instead of stranding every CLI verb on "daemon failed to
+// start". Runs on every GET /health (the CLI and a starting native host probe
+// that before deciding anything) and on the keepalive tick.
+function healRuntimeFiles(reason: string): string[] {
+  if (!ownsRuntimeFiles || shuttingDown || !socketServer) return []
+  const healed: string[] = []
+  // Each step is contained: a transient write/rename/listen failure must not
+  // turn /health into a 500 (the probe would then classify the live owner as
+  // foreign and the CLI would fail closed) or reject the keepalive loop.
+  const attempt = (name: string, fn: () => void) => {
+    try {
+      fn()
+      healed.push(name)
+    } catch (err) {
+      log(`could not restore ${name} (${reason}): ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  // The lock is derived from daemonIdentity; any drifted field (pid, port,
+  // shutdown protocol, or token) makes the CLI's authenticated readiness and
+  // `daemon stop` fail, so compare the whole identity, not only the pid.
+  let lockMatches = false
+  try {
+    const lock = readLockFile(LOCK_PATH)
+    lockMatches = !!lock
+      && lock.pid === daemonIdentity.pid
+      && lock.wsPort === daemonIdentity.wsPort
+      && lock.shutdownProtocolVersion === daemonIdentity.shutdownProtocolVersion
+      && lock.shutdownToken === daemonIdentity.shutdownToken
+  } catch {}
+  if (!lockMatches) attempt("lock", () => writeLockFile(LOCK_PATH, daemonIdentity))
+  let pidOnDisk: number | null = null
+  try { pidOnDisk = parseDaemonPidFile(readFileSync(PID_PATH, "utf-8")) } catch {}
+  if (pidOnDisk !== process.pid) attempt("pid", writePidFile)
+  if (!IS_WIN && !existsSync(SOCKET_PATH)) {
+    // Stop the orphaned listener first (without closing its in-flight
+    // connections), then listen anew. Newer Bun releases unlink the listener's
+    // socket path on stop(), which would delete a freshly created file if the
+    // new listener came first; the path is already gone here, so stopping
+    // first is safe on every Bun.
+    attempt("socket", () => {
+      try { socketServer!.stop() } catch {}
+      socketServer = listenCliSocket()
+    })
+  }
+  if (healed.length) log(`restored runtime files (${reason}): ${healed.join(", ")}`)
+  return healed
+}
 
 function startWsServer(): ReturnType<typeof Bun.serve> {
   return Bun.serve<undefined>({
     port: WS_PORT,
     fetch(req, server) {
       if (server.upgrade(req, {})) return
-      return new Response("interceptor daemon", { status: 200 })
+      if (new URL(req.url).pathname === "/health") {
+        return Response.json({ service: DAEMON_HEALTH_SERVICE, pid: process.pid, version: VERSION, wsPort: WS_PORT, healed: healRuntimeFiles("health probe") })
+      }
+      return new Response(LEGACY_HEALTH_BODY, { status: 200 })
     },
     websocket: {
       // Bun's default maxPayloadLength is 16 MiB and the server responds to a
@@ -1831,8 +1886,6 @@ function startWsServer(): ReturnType<typeof Bun.serve> {
   })
 }
 
-let shuttingDown = false
-
 function gracefulShutdown(signal: string) {
   if (shuttingDown) return
   shuttingDown = true
@@ -1849,18 +1902,14 @@ function gracefulShutdown(signal: string) {
     socketServer = null
   }
   if (wsServer) wsServer.stop(true)
-  try { unlinkSync(SOCKET_PATH) } catch {}
-  try { unlinkSync(PID_PATH) } catch {}
-  try { clearLockFile(LOCK_PATH) } catch {}
+  cleanupOwnedRuntimeFiles(lifecycleDeps(), ownsRuntimeFiles)
   log("shutdown complete")
   process.exit(0)
 }
 
 process.on("exit", (code) => {
   log(`exiting with code ${code}`)
-  try { unlinkSync(SOCKET_PATH) } catch {}
-  try { unlinkSync(PID_PATH) } catch {}
-  try { clearLockFile(LOCK_PATH) } catch {}
+  cleanupOwnedRuntimeFiles(lifecycleDeps(), ownsRuntimeFiles)
 })
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
 process.on("SIGINT", () => gracefulShutdown("SIGINT"))
@@ -1878,6 +1927,7 @@ process.on("unhandledRejection", (reason) => {
 async function keepAliveForever() {
   while (true) {
     await Bun.sleep(10_000)
+    try { healRuntimeFiles("keepalive tick") } catch (err) { log(`keepalive heal failed: ${err instanceof Error ? err.message : String(err)}`) }
   }
 }
 keepAliveForever()

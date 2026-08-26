@@ -83,9 +83,9 @@ Two core installers ship per release, plus an optional Safari add-on. Pick the c
 
 Both download from the same [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page. Start with **Browser** unless you know you need native macOS commands — you can always upgrade to Full later via `interceptor upgrade --full`.
 
-**Updating:** run `interceptor update` — it fires a user-initiated update check and immediately shows the update prompt when a new version exists (`interceptor update status` shows the feed and schedule). Full installs also auto-check in the background via Sparkle.
+**Updating:** run `interceptor update` — it fires a user-initiated update check and immediately shows the update prompt when a new version exists (`interceptor update status` shows the feed and schedule). Full installs also auto-check in the background via Sparkle. An agent can drive the prompt like any other window (`interceptor macos read --app interceptor-bridge`, then `interceptor macos act <ref>` on **Install Update**); the final install step always asks for an administrator password, which a person must enter.
 
-**Windows (browser-only):** a signed per-user installer (`Interceptor-Browser-<version>-windows-{x64,arm64}.exe`, Windows 11 24H2+) is in preparation — see [docs/windows-install.md](docs/windows-install.md) for the install, silent-install, upgrade, and uninstall contract. Windows extension acquisition is store-based (Chrome Web Store for Chrome/Brave, Edge Add-ons for Edge); the installer never edits browser profiles or force-loads an unpacked extension. Until the signed installer ships, Windows developers can build from source with `scripts/install.ps1` (PowerShell 7, source checkout).
+**Windows (browser-only):** a signed per-user installer (`Interceptor-Browser-<version>-windows-{x64,arm64}.exe`, Windows 11 24H2+) is attached to each [release](https://github.com/Hacker-Valley-Media/Interceptor/releases) — see [docs/windows-install.md](docs/windows-install.md) for the install, silent-install, upgrade, and uninstall contract. Windows extension acquisition is store-based (Chrome Web Store for Chrome/Brave, Edge Add-ons for Edge); the installer never edits browser profiles or force-loads an unpacked extension. Windows developers can also build from source with `scripts/install.ps1` (PowerShell 7, source checkout).
 
 ### Install steps
 
@@ -405,6 +405,7 @@ Then remove the unpacked extension from the browser's extensions page. Developer
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `interceptor open <url>` returns `error: timeout: no response for 'tab_create' after 15s` | Browser extension is not loaded — most often because **Developer mode is off** in the target profile. Chromium silently drops `--load-extension` when Dev mode is off. | Open `brave://extensions/` or `chrome://extensions/`, toggle Developer mode ON. Quit the browser fully (on Windows closing every window is not enough — the process lingers; use `taskkill /IM brave.exe /F`, or `msedge.exe` / `chrome.exe`). Re-run `bash scripts/install.sh`, which preflights Dev mode and re-launches. On Windows toggle Dev mode yourself and re-load the unpacked extension — `scripts\install.ps1` only registers the native-messaging host and prints the steps. |
+| A timeout whose message says `A browser context is connected, so the extension is reachable` | The daemon still holds a live extension connection, so the request itself timed out — usually an oversized or slow response (for `net log`, too many full bodies in one reply). | Narrow the request: `net log --limit 20`, `--since <ts>` to page incrementally, or `--filter <host>`. The extension also budgets `net log` replies to 8 MiB of bodies; entries past the budget come back with `truncated: true` and an empty body. |
 | `interceptor status --verbose` says `extension: not reachable` | Same as above, or extension is registered but the Interceptor extension was disabled in the browser. | Open the extensions page, confirm Interceptor (ID `hkjbaciefhhgekldhncknbjkofbpenng`) is present and enabled. If missing, click **Load unpacked** and select `extension/dist/`. |
 | Chrome's extension error page shows `A preload for ... is found, but is not used because the request credentials mode does not match` attributed to `inject-net.js` | A page-level Chromium preload warning was attributed to Interceptor because the passive network shim calls through to the page's original `fetch()` there. The warning is not the same as an Interceptor connection failure. | Treat it as a site warning unless commands fail. If Interceptor commands fail, check the `extension: not reachable` row above. |
 | `chrome://extensions/` reports the extension as version `0.10.0` while `interceptor --version` reports a higher version | Extension manifest drift fixed in this release — rebuild from current source: `bash scripts/build.sh` then re-run `scripts/install.sh` (Windows: `scripts\install.ps1`). | Restart the browser after re-loading the extension so Chromium picks up the bumped manifest. |
@@ -491,8 +492,11 @@ interceptor tree --depth 5                   # Limit tree depth
 interceptor text                             # All visible text
 interceptor text e5                          # Text from specific element
 interceptor html e5                          # HTML of specific element
-interceptor find "Submit"                    # Find elements by name
-interceptor find "Submit" --role button      # Filter by ARIA role
+interceptor websearch "browser automation"   # Default provider → managed background results tab + page read
+interceptor find "contract clause"           # Current-page rendered snippets + accessible elements
+interceptor find "contract clause" --text-only # Passage snippets only (scans beyond normal 8K read output)
+interceptor find "Submit" --elements-only    # Accessible controls + actionable refs only
+interceptor find "Submit" --role button      # Element-only, filtered by ARIA role
 interceptor diff                             # What changed since last tree read
 interceptor state                            # Full DOM tree + scroll + focused element
 ```
@@ -560,7 +564,10 @@ interceptor net log --limit 50              # Max entries (default 100)
 interceptor net clear                        # Flush buffer
 interceptor net headers                      # Captured request headers (CSRF, auth tokens)
 interceptor net headers --filter api         # Filter by URL
+interceptor net log --format json --out api.json          # Export json | har | pcapng (file is created mode 600)
+interceptor net log --format har --out api.har --redact-auth   # Same, credential headers replaced with [redacted]
 ```
+Exports keep the captured request and response headers by default — the auth token is usually the point of the capture — and are written owner-only (`0600`). Pass `--redact-auth` when the file will be shared: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-CSRF-Token`, `X-API-Key`, and any `token` / `secret` / `session` header become `[redacted]`.
 
 ### Network — Request Overrides (rewrite before send)
 Modify outgoing requests at the JavaScript level. No CDP, no debugger.
@@ -730,6 +737,9 @@ interceptor capabilities                     # Check available input layers
 | `--trusted` | **macOS only.** FALLBACK: use OS-level CGEvent when synthetic input is observed to fail; a stub on Windows (see [platform capability matrix](#platform-capability-matrix)). Default to synthetic — the pre-load `userActivation` override + `__interceptor_trust` event marker satisfy most `isTrusted` checks. `--os` is a deprecated alias. |
 | `--frame <id>` | Target specific iframe |
 | `--changes` | Include DOM diff in response |
+| `--flag=value`, `--` | `--flag=value` is accepted everywhere; `--` ends flag parsing so a positional may begin with `--` |
+
+Flags are order-independent on browser commands, and **unknown flags are rejected** (exit 1, naming the flag and the command) instead of being ignored — a typo such as `screenshot --out shot.png` no longer looks like a success (`screenshot` writes to disk with `--save`). `INTERCEPTOR_LAX_FLAGS=1` downgrades the rejection to a one-line warning for legacy scripts. `interceptor macos *` and `interceptor ios *` keep their verb-first parsing and are not strict.
 
 ## Browser Recipes
 
@@ -1089,6 +1099,8 @@ interceptor macos monitor export <sid> --json                    # raw NDJSON
 ```
 
 Sessions live at `${INTERCEPTOR_MONITOR_SESSIONS_DIR:-/tmp/interceptor-monitor-sessions}/<sid>/` with `events.jsonl`, `session.json`, optionally `frames/`. Records auto-stop after 24h and rotate `events.jsonl` at 100 MiB.
+
+**Task envelopes and speech.** `--task "<name>"` wraps the session in a task that every `interceptor monitor task *` verb (`snapshot`, `quality`, `diagnose`) accepts by that name or by its generated `task-<id>`. End it with `interceptor macos monitor stop --task <taskId|name>`: that epilogue snapshots the sources, synthesizes the transcript, and grades blueprint readiness. `stop --sid <sid>` ends only the session and prints the owning task plus the two commands that finish it, and `monitor task quality` synthesizes a missing transcript itself before grading. With `--include speech`, live recognition emits throttled partials (`isFinal: false`, at most one per second) and an utterance-final `speech_segment` (`isFinal: true`, with text) at each boundary — recognition metadata, ~3 s of silence, the periodic task restart, or stop — because buffer-based `SFSpeechRecognizer` never finalizes on its own.
 
 Permissions:
 
