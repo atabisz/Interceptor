@@ -60,8 +60,22 @@ export function constantTimeTokenEquals(actual: unknown, expected: string): bool
   return timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"))
 }
 
+// Windows system binaries are resolved absolutely, never through PATH. A shell like
+// Git Bash puts its own coreutils `whoami.exe` ahead of System32's, and that one rejects
+// `/user` ("extra operand") — which killed the daemon after its WS listener had already
+// bound, surfacing as a port-shaped `daemon failed to start`. Deliberately no bare-name
+// fallback: PATH-resolving the tool that restricts the lock file's ACL is a hijack
+// surface, and the lock file carries the shutdown token. `||` not `??` so an empty
+// SystemRoot falls through rather than building `\System32\...`.
+// scripts/installer/interceptor.iss pins {sys}\whoami.exe, {sys}\icacls.exe and
+// {sys}\netstat.exe the same way; this keeps the daemon on that convention.
+function systemBinary(name: string): string {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows"
+  return `${root}\\System32\\${name}`
+}
+
 function currentWindowsSid(): string {
-  const result = spawnSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf-8", windowsHide: true })
+  const result = spawnSync(systemBinary("whoami.exe"), ["/user", "/fo", "csv", "/nh"], { encoding: "utf-8", windowsHide: true })
   if (result.status !== 0) throw new Error("cannot resolve the current Windows SID for lock-file ACL")
   const match = result.stdout.match(/S-1-(?:\d+-)+\d+/i)
   if (!match) throw new Error("whoami did not return a Windows SID")
@@ -74,7 +88,7 @@ function restrictFileToCurrentUser(path: string): void {
     return
   }
   const sid = currentWindowsSid()
-  const result = spawnSync("icacls.exe", [path, "/inheritance:r", "/grant:r", `*${sid}:(F)`], {
+  const result = spawnSync(systemBinary("icacls.exe"), [path, "/inheritance:r", "/grant:r", `*${sid}:(F)`], {
     encoding: "utf-8",
     windowsHide: true,
   })
