@@ -14,6 +14,135 @@ var __export = (target, all) => {
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 
+// extension/src/content/sensitive.ts
+function markSensitive(el) {
+  sensitiveElements.add(el);
+}
+function isSensitive(el) {
+  for (let node = el;node; node = node.parentElement || node.getRootNode().host || null) {
+    if (node.tagName === "INPUT" && node.type === "password")
+      markSensitive(node);
+    if (sensitiveElements.has(node))
+      return true;
+  }
+  return false;
+}
+function safeValue(el) {
+  const value = el.value || "";
+  const sensitive = isSensitive(el);
+  return value && sensitive ? SECURE_MASK : value;
+}
+function redactSensitiveText(text, root) {
+  for (const el of [root, ...Array.from(root.querySelectorAll("*"))]) {
+    if (!isSensitive(el))
+      continue;
+    for (const value of [el.textContent, el.innerText]) {
+      if (value)
+        text = text.replaceAll(value, SECURE_MASK);
+    }
+  }
+  return text;
+}
+function hiddenByStyle(el) {
+  const style = getComputedStyle(el);
+  return style.display === "none" || style.visibility === "hidden";
+}
+function walkRenderedText(root) {
+  const parts = [];
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? "");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE)
+      return;
+    const el = node;
+    if (NON_RENDERED_TAGS.has(el.tagName) || hiddenByStyle(el))
+      return;
+    for (const child of Array.from(el.childNodes))
+      walk(child);
+  };
+  walk(root);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+function renderedText(el) {
+  const rendered = el.innerText;
+  if (rendered && rendered.trim())
+    return rendered;
+  return walkRenderedText(el);
+}
+function safeText(el, rendered = false) {
+  const text = rendered ? renderedText(el) : el.textContent || "";
+  if (isSensitive(el))
+    return text ? SECURE_MASK : "";
+  return redactSensitiveText(text, el);
+}
+function safeHtml(el) {
+  const clone = el.cloneNode(true);
+  const originals = [el, ...Array.from(el.querySelectorAll("*"))];
+  const copies = [clone, ...Array.from(clone.querySelectorAll("*"))];
+  for (let i = 0;i < originals.length; i++) {
+    const original = originals[i], copy = copies[i];
+    if (!isSensitive(original))
+      continue;
+    if (copy.hasAttribute("value"))
+      copy.setAttribute("value", copy.getAttribute("value") ? SECURE_MASK : "");
+    if (original.tagName !== "INPUT" && (original.textContent || original.value))
+      copy.textContent = SECURE_MASK;
+  }
+  return clone.outerHTML;
+}
+var globals, sensitiveElements, SECURE_MASK = "***SECURE***", NON_RENDERED_TAGS;
+var init_sensitive = __esm(() => {
+  globals = globalThis;
+  sensitiveElements = globals.__interceptor_sensitiveElements ??= new WeakSet;
+  NON_RENDERED_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+});
+
+// extension/src/content/ref-registry.ts
+function getOrAssignRef(el) {
+  const existing = elementToRef.get(el);
+  if (existing) {
+    const ref = refRegistry.get(existing);
+    const live = ref?.deref();
+    if (live === el)
+      return existing;
+    if (!live) {
+      refRegistry.set(existing, new WeakRef(el));
+      return existing;
+    }
+    refRegistry.set(existing, new WeakRef(el));
+    return existing;
+  }
+  const refId = `e${refIdCounter.value++}`;
+  refRegistry.set(refId, new WeakRef(el));
+  elementToRef.set(el, refId);
+  return refId;
+}
+function resolveRef(refId) {
+  const bare = /^\[(e\d+)(?:\]|\|)/.exec(refId)?.[1] ?? refId;
+  const ref = refRegistry.get(bare);
+  if (!ref)
+    return null;
+  const el = ref.deref();
+  return el && el.isConnected ? el : null;
+}
+function pruneStaleRefs() {
+  for (const [id, ref] of refRegistry) {
+    const el = ref.deref();
+    if (!el || !el.isConnected)
+      refRegistry.delete(id);
+  }
+}
+var g, refRegistry, elementToRef, refMetadata, refIdCounter;
+var init_ref_registry = __esm(() => {
+  g = globalThis;
+  refRegistry = g.__interceptor_refRegistry ?? (g.__interceptor_refRegistry = new Map);
+  elementToRef = g.__interceptor_elementToRef ?? (g.__interceptor_elementToRef = new WeakMap);
+  refMetadata = g.__interceptor_refMetadata ?? (g.__interceptor_refMetadata = new Map);
+  refIdCounter = g.__interceptor_nextRefId ?? (g.__interceptor_nextRefId = { value: 1 });
+});
+
 // extension/src/content/element-tree.ts
 function buildSelector(el) {
   if (el.id)
@@ -49,7 +178,7 @@ function getRelevantAttrs(el) {
   if (tag === "a") {
     const href = el.getAttribute("href");
     if (href)
-      attrs.push(`href="${href.slice(0, 60)}"`);
+      attrs.push(`href="${href.length > TREE_HREF_CHARS ? `${href.slice(0, TREE_HREF_CHARS)}…` : href}"`);
   }
   if (tag === "input") {
     const type = el.getAttribute("type");
@@ -58,7 +187,7 @@ function getRelevantAttrs(el) {
     const placeholder = el.getAttribute("placeholder");
     if (placeholder)
       attrs.push(`placeholder="${placeholder}"`);
-    const value = el.value;
+    const value = safeValue(el);
     if (value)
       attrs.push(`value="${value.slice(0, 40)}"`);
     if (el.checked)
@@ -67,7 +196,7 @@ function getRelevantAttrs(el) {
       attrs.push("disabled");
   }
   if (tag === "select" || tag === "textarea") {
-    const value = el.value;
+    const value = safeValue(el);
     if (value)
       attrs.push(`value="${value.slice(0, 40)}"`);
   }
@@ -122,15 +251,16 @@ function getStyleBundle(el) {
 }
 function buildElementTree(elements) {
   return elements.map((e) => {
-    const role = getEffectiveRole(e.element);
-    const name = e.text ? ` "${e.text}"` : "";
+    const shown = displayRoleName(e.element, getEffectiveRole(e.element) || e.tag, e.text || "");
+    const name = shown.name ? ` "${shown.name}"` : "";
     const attrStr = e.attrs ? ` ${e.attrs}` : "";
-    return `[${e.refId}] ${role || e.tag}${name}${attrStr}`;
+    return `[${e.refId}] ${shown.role}${name}${attrStr}`;
   }).join(`
 `);
 }
-var STYLE_BUNDLE_PROPS;
+var TREE_HREF_CHARS = 300, STYLE_BUNDLE_PROPS;
 var init_element_tree = __esm(() => {
+  init_sensitive();
   init_a11y_tree();
   STYLE_BUNDLE_PROPS = [
     "display",
@@ -142,6 +272,105 @@ var init_element_tree = __esm(() => {
     "cursor",
     "opacity"
   ];
+});
+
+// extension/src/content/element-discovery.ts
+function getShadowRoot(el) {
+  if (el.shadowRoot)
+    return el.shadowRoot;
+  try {
+    if (typeof chrome !== "undefined" && chrome.dom?.openOrClosedShadowRoot) {
+      return chrome.dom.openOrClosedShadowRoot(el);
+    }
+  } catch {}
+  return null;
+}
+function walkWithShadow(root, callback) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  let node = walker.nextNode();
+  while (node) {
+    const el = node;
+    callback(el);
+    const shadow = getShadowRoot(el);
+    if (shadow)
+      walkWithShadow(shadow, callback);
+    node = walker.nextNode();
+  }
+}
+function isVisible(el, style = getComputedStyle(el)) {
+  if (style.visibility === "hidden" || style.display === "none")
+    return false;
+  const pos = style.position;
+  if (pos !== "fixed" && pos !== "sticky") {
+    if (!el.offsetParent && el.tagName !== "BODY")
+      return false;
+  }
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0)
+    return false;
+  return true;
+}
+function isInteractive(el, tags, roles, style = getComputedStyle(el)) {
+  if (tags.has(el.tagName))
+    return true;
+  const role = el.getAttribute("role");
+  if (role && roles.has(role))
+    return true;
+  if (el.hasAttribute("onclick"))
+    return true;
+  if (el.getAttribute("contenteditable") === "true")
+    return true;
+  if (el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1")
+    return true;
+  if (el.namespaceURI === "http://www.w3.org/2000/svg") {
+    const svgTag = el.tagName.toLowerCase();
+    if (svgTag === "a" && (el.hasAttribute("href") || el.getAttributeNS("http://www.w3.org/1999/xlink", "href")))
+      return true;
+    if (el.hasAttribute("onclick") || el.hasAttribute("tabindex"))
+      return true;
+    if (role && roles.has(role))
+      return true;
+    if (style.cursor === "pointer")
+      return true;
+  }
+  if (style.cursor === "pointer" && el.tagName !== "BODY" && el.tagName !== "HTML") {
+    const parent = el.parentElement;
+    const parentCursor = parent ? getComputedStyle(parent).cursor : null;
+    if (hasOwnPointerCursor(style.cursor, parentCursor))
+      return true;
+  }
+  return false;
+}
+function getInteractiveElements() {
+  selectorMap.clear();
+  nextIndex = 0;
+  pruneStaleRefs();
+  const results = [];
+  walkWithShadow(document.body, (el) => {
+    const style = getComputedStyle(el);
+    if (isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES, style) && isVisible(el, style)) {
+      const idx = nextIndex++;
+      const selector = buildSelector(el);
+      selectorMap.set(idx, selector);
+      const refId = getOrAssignRef(el);
+      const tag = el.tagName.toLowerCase();
+      const text = getAccessibleName(el);
+      const attrs = getRelevantAttrs(el);
+      refMetadata.set(refId, { role: getEffectiveRole(el, style), name: text, tag, value: safeValue(el).slice(0, 40) });
+      results.push({ index: idx, refId, element: el, selector, tag, text, attrs });
+    }
+  });
+  return results;
+}
+var selectorMap, nextIndex = 0, INTERACTIVE_TAGS, INTERACTIVE_ROLES;
+var init_element_discovery = __esm(() => {
+  init_ref_registry();
+  init_a11y_tree();
+  init_element_tree();
+  init_sensitive();
+  selectorMap = new Map;
+  INTERACTIVE_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "DETAILS", "SUMMARY"]);
+  INTERACTIVE_ROLES = new Set(["button", "link", "tab", "menuitem", "checkbox", "radio", "switch", "textbox", "combobox", "listbox", "option", "slider"]);
 });
 
 // extension/src/content/a11y-tree.ts
@@ -242,6 +471,19 @@ function getEffectiveRole(el, style) {
   }
   return "";
 }
+function lineName(name) {
+  return name.replace(/\s+/g, " ").trim();
+}
+function displayRoleName(el, role, name) {
+  if (el.tagName === "INPUT") {
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (BUTTON_INPUT_TYPES.has(type)) {
+      const fallback = type === "reset" ? "Reset" : type === "button" ? "" : "Submit";
+      return { role: "button", name: lineName(name || el.value || el.getAttribute("alt") || fallback) };
+    }
+  }
+  return { role, name: lineName(name) };
+}
 function getAccessibleName(el) {
   const ariaLabel = el.getAttribute("aria-label");
   if (ariaLabel && ariaLabel.trim())
@@ -275,7 +517,7 @@ function getAccessibleName(el) {
   const title = el.getAttribute("title");
   if (title && title.trim())
     return title.trim();
-  return (el.textContent || "").trim().slice(0, 80);
+  return safeText(el).trim().slice(0, 80);
 }
 function compactAttrClause(attrs) {
   if (!attrs)
@@ -309,8 +551,9 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
     const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES, style ?? undefined);
     const prefix = compact ? ">".repeat(d) : "  ".repeat(d);
     if (selfVisible && isLandmark && !isInteractiveEl) {
-      const name = getAccessibleName(el);
-      const hasName = !!name && name !== (el.textContent || "").trim().slice(0, 80);
+      const rawName = getAccessibleName(el);
+      const hasName = !!rawName && rawName !== (el.textContent || "").trim().slice(0, 80);
+      const name = lineName(rawName);
       if (compact) {
         lines.push(`${prefix}${role || tag}${hasName ? `|${name}` : ""}`);
       } else {
@@ -319,7 +562,7 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
       }
     }
     if (selfVisible && isHeading && filter === "all") {
-      const name = getAccessibleName(el);
+      const name = lineName(getAccessibleName(el));
       if (compact) {
         lines.push(`${prefix}heading|${name}`);
       } else {
@@ -328,7 +571,8 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
     }
     if (selfVisible && isInteractiveEl) {
       const refId = getOrAssignRef(el);
-      const name = getAccessibleName(el);
+      const shown = displayRoleName(el, role || tag, getAccessibleName(el));
+      const name = shown.name;
       const attrs = getRelevantAttrs(el);
       const styleBundle = includeStyle ? getStyleBundle(el) : "";
       const uploadable = isUploadTarget(el);
@@ -337,13 +581,13 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
         const attrClause = compactAttrClause(attrs);
         const styleClause = styleBundle ? `|style={${styleBundle}}` : "";
         const uploadClause = uploadable ? "|upload" : "";
-        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}${uploadClause}]`);
+        lines.push(`${prefix}[${refId}|${shown.role}${nameClause}${attrClause}${styleClause}${uploadClause}]`);
       } else {
         const nameStr = name ? ` "${name}"` : "";
         const attrStr = attrs ? ` ${attrs}` : "";
         const styleStr = styleBundle ? ` style="${styleBundle}"` : "";
         const uploadStr = uploadable ? ` upload="interceptor upload ${refId} <path>"` : "";
-        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}${uploadStr}`);
+        lines.push(`${prefix}[${refId}] ${shown.role}${nameStr}${attrStr}${styleStr}${uploadStr}`);
       }
     }
     const shadow = getShadowRoot(el);
@@ -362,228 +606,64 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
   return lines.join(`
 `);
 }
-var LANDMARK_ROLES, LANDMARK_TAGS;
+var LANDMARK_ROLES, LANDMARK_TAGS, BUTTON_INPUT_TYPES;
 var init_a11y_tree = __esm(() => {
+  init_sensitive();
   init_element_discovery();
   init_ref_registry();
   init_element_tree();
   LANDMARK_ROLES = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
   LANDMARK_TAGS = new Set(["NAV", "MAIN", "ASIDE", "HEADER", "FOOTER", "FORM", "SECTION"]);
-});
-
-// extension/src/content/element-discovery.ts
-function getShadowRoot(el) {
-  if (el.shadowRoot)
-    return el.shadowRoot;
-  try {
-    if (typeof chrome !== "undefined" && chrome.dom?.openOrClosedShadowRoot) {
-      return chrome.dom.openOrClosedShadowRoot(el);
-    }
-  } catch {}
-  return null;
-}
-function walkWithShadow(root, callback) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-  let node = walker.nextNode();
-  while (node) {
-    const el = node;
-    callback(el);
-    const shadow = getShadowRoot(el);
-    if (shadow)
-      walkWithShadow(shadow, callback);
-    node = walker.nextNode();
-  }
-}
-function isVisible(el, style = getComputedStyle(el)) {
-  if (style.visibility === "hidden" || style.display === "none")
-    return false;
-  const pos = style.position;
-  if (pos !== "fixed" && pos !== "sticky") {
-    if (!el.offsetParent && el.tagName !== "BODY")
-      return false;
-  }
-  const rect = el.getBoundingClientRect();
-  if (rect.width === 0 && rect.height === 0)
-    return false;
-  return true;
-}
-function isInteractive(el, tags, roles, style = getComputedStyle(el)) {
-  if (tags.has(el.tagName))
-    return true;
-  const role = el.getAttribute("role");
-  if (role && roles.has(role))
-    return true;
-  if (el.hasAttribute("onclick"))
-    return true;
-  if (el.getAttribute("contenteditable") === "true")
-    return true;
-  if (el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1")
-    return true;
-  if (el.namespaceURI === "http://www.w3.org/2000/svg") {
-    const svgTag = el.tagName.toLowerCase();
-    if (svgTag === "a" && (el.hasAttribute("href") || el.getAttributeNS("http://www.w3.org/1999/xlink", "href")))
-      return true;
-    if (el.hasAttribute("onclick") || el.hasAttribute("tabindex"))
-      return true;
-    if (role && roles.has(role))
-      return true;
-    if (style.cursor === "pointer")
-      return true;
-  }
-  if (style.cursor === "pointer" && el.tagName !== "BODY" && el.tagName !== "HTML") {
-    const parent = el.parentElement;
-    const parentCursor = parent ? getComputedStyle(parent).cursor : null;
-    if (hasOwnPointerCursor(style.cursor, parentCursor))
-      return true;
-  }
-  return false;
-}
-function getInteractiveElements() {
-  selectorMap.clear();
-  nextIndex = 0;
-  pruneStaleRefs();
-  const results = [];
-  walkWithShadow(document.body, (el) => {
-    const style = getComputedStyle(el);
-    if (isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES, style) && isVisible(el, style)) {
-      const idx = nextIndex++;
-      const selector = buildSelector(el);
-      selectorMap.set(idx, selector);
-      const refId = getOrAssignRef(el);
-      const tag = el.tagName.toLowerCase();
-      const text = getAccessibleName(el);
-      const attrs = getRelevantAttrs(el);
-      refMetadata.set(refId, { role: getEffectiveRole(el, style), name: text, tag, value: (el.value || "").slice(0, 40) });
-      results.push({ index: idx, refId, element: el, selector, tag, text, attrs });
-    }
-  });
-  return results;
-}
-var selectorMap, nextIndex = 0, INTERACTIVE_TAGS, INTERACTIVE_ROLES;
-var init_element_discovery = __esm(() => {
-  init_ref_registry();
-  init_a11y_tree();
-  init_element_tree();
-  selectorMap = new Map;
-  INTERACTIVE_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "DETAILS", "SUMMARY"]);
-  INTERACTIVE_ROLES = new Set(["button", "link", "tab", "menuitem", "checkbox", "radio", "switch", "textbox", "combobox", "listbox", "option", "slider"]);
-});
-
-// extension/src/content/semantic-match.ts
-function findBestMatch(name, role, text) {
-  const query = (name || text || "").toLowerCase();
-  const targetRole = (role || "").toLowerCase();
-  const isTextPseudoRole = targetRole === "text";
-  let best = null;
-  for (const [refId, weakRef] of refRegistry) {
-    const el = weakRef.deref();
-    if (!el || !el.isConnected || !isVisible(el))
-      continue;
-    const elRole = getEffectiveRole(el).toLowerCase();
-    const elName = getAccessibleName(el).toLowerCase();
-    let score = 0;
-    if (targetRole && !isTextPseudoRole && elRole !== targetRole)
-      continue;
-    if (targetRole && !isTextPseudoRole && elRole === targetRole)
-      score += 50;
-    if (query) {
-      if (elName === query)
-        score += 100;
-      else if (elName.includes(query))
-        score += 60;
-      const id = el.getAttribute("id")?.toLowerCase();
-      if (id?.includes(query))
-        score += 50;
-      const placeholder = el.getAttribute("placeholder")?.toLowerCase();
-      if (placeholder?.includes(query))
-        score += 40;
-      if (isTextPseudoRole) {
-        const elText = (el.textContent || "").trim().toLowerCase();
-        if (elText === query)
-          score += 80;
-        else if (elText.includes(query))
-          score += 50;
-      }
-    }
-    if (score >= 30 && (!best || score > best.score)) {
-      best = { refId, role: getEffectiveRole(el), name: getAccessibleName(el), score, element: el };
-    }
-  }
-  return best;
-}
-var init_semantic_match = __esm(() => {
-  init_ref_registry();
-  init_element_discovery();
-  init_a11y_tree();
-});
-
-// extension/src/content/ref-registry.ts
-function getStaleWarning() {
-  return staleWarning;
-}
-function clearStaleWarning() {
-  staleWarning = null;
-}
-function getOrAssignRef(el) {
-  const existing = elementToRef.get(el);
-  if (existing) {
-    const ref = refRegistry.get(existing);
-    const live = ref?.deref();
-    if (live === el)
-      return existing;
-    if (!live) {
-      refRegistry.set(existing, new WeakRef(el));
-      return existing;
-    }
-    refRegistry.set(existing, new WeakRef(el));
-    return existing;
-  }
-  const refId = `e${refIdCounter.value++}`;
-  refRegistry.set(refId, new WeakRef(el));
-  elementToRef.set(el, refId);
-  return refId;
-}
-function resolveRef(refId) {
-  const ref = refRegistry.get(refId);
-  if (ref) {
-    const el = ref.deref();
-    if (el && el.isConnected)
-      return el;
-  }
-  const meta = refMetadata.get(refId);
-  if (meta) {
-    const match = findBestMatch(meta.name, meta.role);
-    if (match && match.score >= 70) {
-      staleWarning = `stale ref ${refId} re-resolved to ${match.refId} (${match.role} '${match.name}', score: ${match.score})`;
-      return match.element;
-    }
-  }
-  return null;
-}
-function pruneStaleRefs() {
-  for (const [id, ref] of refRegistry) {
-    const el = ref.deref();
-    if (!el || !el.isConnected)
-      refRegistry.delete(id);
-  }
-}
-var g, refRegistry, elementToRef, refMetadata, refIdCounter, staleWarning = null;
-var init_ref_registry = __esm(() => {
-  init_semantic_match();
-  g = globalThis;
-  refRegistry = g.__interceptor_refRegistry ?? (g.__interceptor_refRegistry = new Map);
-  elementToRef = g.__interceptor_elementToRef ?? (g.__interceptor_elementToRef = new WeakMap);
-  refMetadata = g.__interceptor_refMetadata ?? (g.__interceptor_refMetadata = new Map);
-  refIdCounter = g.__interceptor_nextRefId ?? (g.__interceptor_nextRefId = { value: 1 });
+  BUTTON_INPUT_TYPES = new Set(["submit", "button", "reset", "image"]);
 });
 
 // extension/src/content/snapshot-diff.ts
 var exports_snapshot_diff = {};
 __export(exports_snapshot_diff, {
+  visibleTextLines: () => visibleTextLines,
+  lastTextLines: () => lastTextLines,
   lastSnapshot: () => lastSnapshot,
+  computeTextDiff: () => computeTextDiff,
   computeSnapshotDiff: () => computeSnapshotDiff,
   cacheSnapshot: () => cacheSnapshot
 });
+function visibleTextLines() {
+  if (!document.body)
+    return [];
+  const lines = [];
+  for (const raw of safeText(document.body, true).split(`
+`)) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (!line)
+      continue;
+    lines.push(line.length > TEXT_LINE_CHARS ? `${line.slice(0, TEXT_LINE_CHARS)}…` : line);
+    if (lines.length >= TEXT_LINE_CAP)
+      break;
+  }
+  return lines;
+}
+function computeTextDiff() {
+  if (lastTextLines === null)
+    return null;
+  const current = visibleTextLines();
+  const count = new Map;
+  for (const line of lastTextLines)
+    count.set(line, (count.get(line) ?? 0) + 1);
+  const added = [];
+  for (const line of current) {
+    const n = count.get(line) ?? 0;
+    if (n > 0)
+      count.set(line, n - 1);
+    else
+      added.push(line);
+  }
+  const removed = [];
+  for (const [line, n] of count)
+    for (let i = 0;i < n; i++)
+      removed.push(line);
+  lastTextLines = current;
+  return { textAdded: added.slice(0, TEXT_DIFF_CAP), textRemoved: removed.slice(0, TEXT_DIFF_CAP), textAddedTotal: added.length, textRemovedTotal: removed.length };
+}
 function cacheSnapshot() {
   const entries = [];
   for (const [refId, weakRef] of refRegistry) {
@@ -594,11 +674,12 @@ function cacheSnapshot() {
       refId,
       role: getEffectiveRole(el),
       name: getAccessibleName(el),
-      value: (el.value || "").slice(0, 40),
+      value: safeValue(el).slice(0, 40),
       states: getRelevantAttrs(el)
     });
   }
   lastSnapshot = entries;
+  lastTextLines = visibleTextLines();
 }
 function computeSnapshotDiff() {
   if (lastSnapshot.length === 0) {
@@ -614,7 +695,7 @@ function computeSnapshotDiff() {
       refId,
       role: getEffectiveRole(el),
       name: getAccessibleName(el),
-      value: (el.value || "").slice(0, 40),
+      value: safeValue(el).slice(0, 40),
       states: getRelevantAttrs(el)
     });
   }
@@ -641,15 +722,91 @@ function computeSnapshotDiff() {
   return { success: true, data: changes.length ? changes.join(`
 `) : "no changes" };
 }
-var lastSnapshot;
+var lastSnapshot, lastTextLines = null, TEXT_LINE_CAP = 4000, TEXT_LINE_CHARS = 200, TEXT_DIFF_CAP = 200;
 var init_snapshot_diff = __esm(() => {
+  init_sensitive();
   init_ref_registry();
   init_a11y_tree();
   init_element_tree();
   lastSnapshot = [];
 });
 
+// extension/src/content/deep-query.ts
+function collectRoots(root = document) {
+  const roots = [root];
+  for (let i = 0;i < roots.length && roots.length < MAX_ROOTS; i++) {
+    const current = roots[i];
+    let hosts;
+    try {
+      hosts = Array.from(current.querySelectorAll("*"));
+    } catch {
+      continue;
+    }
+    for (const host of hosts) {
+      const shadow = getShadowRoot(host);
+      if (shadow) {
+        roots.push(shadow);
+        if (roots.length >= MAX_ROOTS)
+          break;
+      }
+    }
+  }
+  return roots;
+}
+function queryAllDeep(selector, root = document) {
+  const direct = Array.from(root.querySelectorAll(selector));
+  const roots = collectRoots(root);
+  if (roots.length === 1)
+    return direct;
+  const seen = new Set(direct);
+  const out = [...direct];
+  for (let i = 1;i < roots.length; i++) {
+    let matches;
+    try {
+      matches = Array.from(roots[i].querySelectorAll(selector));
+    } catch {
+      continue;
+    }
+    for (const el of matches) {
+      if (seen.has(el))
+        continue;
+      seen.add(el);
+      out.push(el);
+    }
+  }
+  return out;
+}
+function queryOneDeep(selector, root = document) {
+  const direct = root.querySelector(selector);
+  if (direct)
+    return direct;
+  const roots = collectRoots(root);
+  for (let i = 1;i < roots.length; i++) {
+    let match;
+    try {
+      match = roots[i].querySelector(selector);
+    } catch {
+      continue;
+    }
+    if (match)
+      return match;
+  }
+  return null;
+}
+var MAX_ROOTS = 2000;
+var init_deep_query = __esm(() => {
+  init_element_discovery();
+});
+
 // extension/src/content/input-simulation.ts
+function staleElementError(action, verb) {
+  const label = String(action.ref ?? action.index ?? "unknown");
+  return {
+    success: false,
+    error: `stale element [${label}] — it is no longer in the DOM, so nothing was ${verb}. Run 'interceptor read' for fresh refs.`,
+    delivered: false
+  };
+}
 function resolveElement(indexOrRef, ref) {
   if (ref) {
     return resolveRef(ref);
@@ -665,6 +822,12 @@ function resolveElement(indexOrRef, ref) {
   if (!isVisible(el))
     return null;
   return el;
+}
+function resolveElementOrSelector(action) {
+  const el = resolveElement(action.index, action.ref);
+  if (el)
+    return el;
+  return action.selector ? queryOneDeep(String(action.selector)) : null;
 }
 function scrollIntoViewIfNeeded(el) {
   const rect = el.getBoundingClientRect();
@@ -718,20 +881,45 @@ function getKeyCode(key) {
     return `Key${key.toUpperCase()}`;
   return KEY_CODES[key] || `Key${key.toUpperCase()}`;
 }
+function getLegacyKeyCode(key) {
+  const named = LEGACY_KEY_CODES[key];
+  if (named !== undefined)
+    return named;
+  if (key.length !== 1)
+    return 0;
+  return key.toUpperCase().charCodeAt(0);
+}
+function withLegacyCodes(event, keyCode, charCode) {
+  for (const [name, value] of [["keyCode", keyCode], ["which", keyCode], ["charCode", charCode]]) {
+    try {
+      Object.defineProperty(event, name, { get: () => value, configurable: true });
+    } catch {}
+  }
+  return event;
+}
+function producesKeypress(key) {
+  return key === "Enter" || key === "Space" || key.length === 1;
+}
 function dispatchKeySequence(target, combo) {
   const parts = combo.split("+");
-  const key = parts[parts.length - 1];
   const modifiers = {
     ctrlKey: parts.includes("Control"),
     shiftKey: parts.includes("Shift"),
     altKey: parts.includes("Alt"),
     metaKey: parts.includes("Meta")
   };
+  const raw = parts[parts.length - 1];
+  const key = modifiers.shiftKey && /^[a-z]$/.test(raw) ? raw.toUpperCase() : raw;
   const code = getKeyCode(key);
-  const keyOpts = { key, code, bubbles: true, cancelable: true, ...modifiers };
-  target.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
-  target.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
-  target.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+  const legacy = getLegacyKeyCode(key);
+  const base = { key, code, bubbles: true, cancelable: true, ...modifiers };
+  const fire = (type, keyCode, charCode) => target.dispatchEvent(withLegacyCodes(new KeyboardEvent(type, { ...base, keyCode, charCode, which: charCode || keyCode }), keyCode, charCode));
+  const notCancelled = fire("keydown", legacy, 0);
+  if (notCancelled && producesKeypress(key)) {
+    const charCode = key === "Enter" ? 13 : key === "Space" ? 32 : key.charCodeAt(0);
+    fire("keypress", charCode, charCode);
+  }
+  fire("keyup", legacy, 0);
 }
 function waitForMutation(timeoutMs) {
   return new Promise((resolve) => {
@@ -755,24 +943,30 @@ function waitForMutation(timeoutMs) {
 }
 function waitForElement(selector, timeout) {
   return new Promise((resolve) => {
-    const existing = document.querySelector(selector);
+    const existing = queryOneDeep(selector);
     if (existing) {
       resolve(existing);
       return;
     }
-    const timer = setTimeout(() => {
+    let done = false;
+    const finish = (el) => {
+      if (done)
+        return;
+      done = true;
+      clearTimeout(timer);
+      clearInterval(poll);
       observer.disconnect();
-      resolve(null);
-    }, timeout);
-    const observer = new MutationObserver(() => {
-      const el = document.querySelector(selector);
-      if (el) {
-        clearTimeout(timer);
-        observer.disconnect();
-        resolve(el);
-      }
-    });
+      resolve(el);
+    };
+    const check = () => {
+      const el = queryOneDeep(selector);
+      if (el)
+        finish(el);
+    };
+    const timer = setTimeout(() => finish(null), timeout);
+    const observer = new MutationObserver(check);
     observer.observe(document.body, { childList: true, subtree: true });
+    const poll = setInterval(check, 250);
   });
 }
 function waitForDomStable(debounceMs = 200, timeoutMs = 5000) {
@@ -804,11 +998,12 @@ function waitForDomStable(debounceMs = 200, timeoutMs = 5000) {
     }, debounceMs);
   });
 }
-var KEY_CODES;
+var KEY_CODES, LEGACY_KEY_CODES;
 var init_input_simulation = __esm(() => {
   init_ref_registry();
   init_element_discovery();
   init_element_discovery();
+  init_deep_query();
   KEY_CODES = {
     Enter: "Enter",
     Tab: "Tab",
@@ -836,6 +1031,39 @@ var init_input_simulation = __esm(() => {
     F10: "F10",
     F11: "F11",
     F12: "F12"
+  };
+  LEGACY_KEY_CODES = {
+    Backspace: 8,
+    Tab: 9,
+    Enter: 13,
+    Shift: 16,
+    Control: 17,
+    Alt: 18,
+    Escape: 27,
+    Space: 32,
+    " ": 32,
+    PageUp: 33,
+    PageDown: 34,
+    End: 35,
+    Home: 36,
+    ArrowLeft: 37,
+    ArrowUp: 38,
+    ArrowRight: 39,
+    ArrowDown: 40,
+    Delete: 46,
+    Meta: 91,
+    F1: 112,
+    F2: 113,
+    F3: 114,
+    F4: 115,
+    F5: 116,
+    F6: 117,
+    F7: 118,
+    F8: 119,
+    F9: 120,
+    F10: 121,
+    F11: 122,
+    F12: 123
   };
 });
 
@@ -1154,6 +1382,7 @@ window.addEventListener("beforeunload", () => {
 });
 
 // extension/src/content/monitor.ts
+init_sensitive();
 init_ref_registry();
 init_a11y_tree();
 var armed = false;
@@ -1230,6 +1459,8 @@ function describeTarget(target) {
   return out;
 }
 function isPasswordLike(el) {
+  if (isSensitive(el))
+    return true;
   if (!(el instanceof HTMLInputElement))
     return false;
   const type = (el.type || "").toLowerCase();
@@ -1244,6 +1475,8 @@ function isPasswordLike(el) {
   return false;
 }
 function maskedValue(el) {
+  if (isSensitive(el))
+    return SECURE_MASK;
   const len = (el.value || "").length;
   return `***${len}***`;
 }
@@ -1268,7 +1501,7 @@ function shouldPersistBody(contentType, body) {
     return true;
   return false;
 }
-function redactSensitiveText(text) {
+function redactSensitiveText2(text) {
   return text.replace(/("?(authorization|cookie|set-cookie|access[_-]?token|refresh[_-]?token|csrf|session(id)?|jwt)"?\s*[:=]\s*"?)([^"\s,&}]+)/gi, "$1[REDACTED]").replace(/\beyJ[A-Za-z0-9._-]{20,}\b/g, "[REDACTED_JWT]");
 }
 function buildBodyPreview(contentType, body) {
@@ -1276,7 +1509,7 @@ function buildBodyPreview(contentType, body) {
     return null;
   if (!persistBodiesAlways && !shouldPersistBody(contentType, body))
     return null;
-  const redacted = redactSensitiveText(body);
+  const redacted = redactSensitiveText2(body);
   const truncated = redacted.length > netBodyCap;
   const preview = truncated ? redacted.slice(0, netBodyCap) : redacted;
   return { preview, bytes: body.length, truncated };
@@ -1316,7 +1549,9 @@ function handleInput(e) {
       return;
     const info = describeTarget(target);
     let v = "";
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    if (isSensitive(target)) {
+      v = SECURE_MASK;
+    } else if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       if (target instanceof HTMLInputElement && isPasswordLike(target)) {
         v = maskedValue(target);
       } else {
@@ -1343,7 +1578,9 @@ function handleChange(e) {
       return;
     const info = describeTarget(target);
     let v = "";
-    if (target instanceof HTMLInputElement) {
+    if (isSensitive(target)) {
+      v = SECURE_MASK;
+    } else if (target instanceof HTMLInputElement) {
       if (isPasswordLike(target)) {
         v = maskedValue(target);
       } else if (target.type === "checkbox" || target.type === "radio") {
@@ -1743,12 +1980,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // extension/src/content.ts
-init_ref_registry();
 init_snapshot_diff();
 init_ref_registry();
 init_a11y_tree();
 
 // extension/src/content/state.ts
+init_sensitive();
 init_element_discovery();
 init_element_tree();
 init_ref_registry();
@@ -1778,7 +2015,7 @@ function getPageState(full = false) {
     timestamp: Date.now()
   };
   if (full) {
-    state.staticText = document.body.innerText.slice(0, 5000);
+    state.staticText = safeText(document.body, true).slice(0, 5000);
   }
   cacheSnapshot();
   return { success: true, data: state };
@@ -1790,15 +2027,17 @@ init_input_simulation();
 // extension/src/content/actions/click.ts
 init_input_simulation();
 init_ref_registry();
+init_deep_query();
 init_a11y_tree();
 async function handleClick(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "clicked");
   scrollIntoViewIfNeeded(el);
+  const mutation = waitForMutation(200);
   dispatchClickSequence(el, action.x, action.y);
   const clickMsg = `clicked [${action.ref || action.index}]${action.x !== undefined ? ` at (${action.x},${action.y})` : ""}`;
-  const mutated = await waitForMutation(200);
+  const mutated = await mutation;
   if (!mutated) {
     return { success: true, data: clickMsg, warning: "no DOM change after click — if the site requires trusted events, try: interceptor click --trusted " + (action.ref || action.index) };
   }
@@ -1810,7 +2049,7 @@ async function handleClickSelector(action) {
     return { success: false, error: "click_selector: no selector given" };
   let matches;
   try {
-    matches = document.querySelectorAll(selector);
+    matches = queryAllDeep(selector);
   } catch {
     return { success: false, error: `click_selector: invalid CSS selector ${JSON.stringify(selector)}` };
   }
@@ -1823,9 +2062,10 @@ async function handleClickSelector(action) {
     };
   }
   scrollIntoViewIfNeeded(el);
+  const mutation = waitForMutation(200);
   dispatchClickSequence(el, action.x, action.y);
   const clickedRef = getOrAssignRef(el);
-  const mutated = await waitForMutation(200);
+  const mutated = await mutation;
   const msg = `clicked ${clickedRef} — ${selector}[${nth}] of ${matches.length}`;
   if (!mutated) {
     return { success: true, data: msg, refId: clickedRef, warning: `no DOM change after click — if the site requires trusted events, try: interceptor click --trusted ${clickedRef}` };
@@ -1835,7 +2075,7 @@ async function handleClickSelector(action) {
 async function handleDblclick(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "double-clicked");
   scrollIntoViewIfNeeded(el);
   dispatchClickSequence(el, action.x, action.y);
   const rect = el.getBoundingClientRect();
@@ -1847,7 +2087,7 @@ async function handleDblclick(action) {
 async function handleRightclick(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "right-clicked");
   scrollIntoViewIfNeeded(el);
   const rect = el.getBoundingClientRect();
   const x = action.x !== undefined ? rect.left + action.x : rect.left + rect.width / 2;
@@ -1898,10 +2138,18 @@ async function handleWhatAt(action) {
 init_input_simulation();
 init_element_discovery();
 init_ref_registry();
+init_sensitive();
 async function handleInputText(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "typed");
+  if (el.tagName === "SELECT") {
+    if (action.sensitive === true)
+      return { success: false, error: "credential delivery requires a text field" };
+    return handleSelectOption({ ...action, value: action.text });
+  }
+  if (action.sensitive === true || isSensitive(el))
+    markSensitive(el);
   el.focus();
   const text = action.text;
   const tag = el.tagName;
@@ -1927,6 +2175,15 @@ async function handleInputText(action) {
     if (action.clear) {
       document.execCommand("selectAll", false);
       document.execCommand("delete", false);
+    } else {
+      const selection = window.getSelection();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
     }
     document.execCommand("insertText", false, text);
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1936,7 +2193,7 @@ async function handleInputText(action) {
   if (shadowRoot) {
     const innerInput = shadowRoot.querySelector("input, textarea, [contenteditable='true']");
     if (innerInput) {
-      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear });
+      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear, sensitive: action.sensitive });
     }
   }
   const role = el.getAttribute("role");
@@ -1950,18 +2207,68 @@ async function handleInputText(action) {
   }
   return { success: false, error: `element is <${tag.toLowerCase()}${isContentEditable ? " contenteditable" : ""}> — unsupported input type` };
 }
+async function handleSubmitForm(action) {
+  const el = resolveElement(action.index, action.ref);
+  if (!el)
+    return staleElementError(action, "submitted");
+  const form = el.form ?? el.closest("form");
+  if (!form) {
+    return { success: false, error: "this element is not inside a form, so there is nothing to submit; click the page's search or submit button instead (or use --keys Enter --trusted)" };
+  }
+  const submitter = Array.from(form.ownerDocument.querySelectorAll("button, input[type=submit], input[type=image]")).find((e) => e.form === form && (e.type === "submit" || e.type === "image"));
+  if (submitter?.matches(":disabled")) {
+    return { success: false, error: "the form's submit button is disabled, so Enter would not submit it; read the page for what it is waiting on" };
+  }
+  if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity()) {
+    const invalid = Array.from(form.elements).find((e) => e.validity && !e.validity.valid);
+    return { success: false, error: `the form did not pass its own validation${invalid ? `: ${invalid.validationMessage || "a field is invalid"}` : ""}` };
+  }
+  if (submitter)
+    submitter.click();
+  else if (typeof form.requestSubmit === "function")
+    form.requestSubmit();
+  else
+    form.submit();
+  return { success: true, data: { submitted: true, action: form.getAttribute("action") ?? "", method: (form.getAttribute("method") || "get").toLowerCase(), submitter: submitter ? (submitter.value || submitter.textContent || "").trim() : null } };
+}
 async function handleSelectOption(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
-  el.value = action.value;
+    return staleElementError(action, "selected");
+  if (el.tagName !== "SELECT")
+    return { success: false, error: "select requires a native <select>; use click/read for a custom dropdown" };
+  if (typeof action.value !== "string")
+    return { success: false, error: "select requires an option value or label" };
+  if (el.matches(":disabled") || el.getAttribute("aria-disabled") === "true")
+    return { success: false, error: "select is disabled" };
+  const options = Array.from(el.options);
+  const exact = options.find((option2) => option2.value === action.value);
+  const labels = exact ? [] : options.filter((option2) => option2.label === action.value);
+  const option = exact || (labels.length === 1 ? labels[0] : undefined);
+  if (!option)
+    return {
+      success: false,
+      error: (labels.length > 1 ? "option label is ambiguous; use its exact value" : "no matching option; use an exact value or unique label") + `. Available options: ${JSON.stringify(options.slice(0, 30).map((o) => ({ value: o.value.slice(0, 160), label: o.label.slice(0, 160) })))}${options.length > 30 ? " (first 30)" : ""}`,
+      data: { options: options.slice(0, 30).map((o) => ({ value: o.value.slice(0, 160), label: o.label.slice(0, 160), disabled: o.matches(":disabled") })), total: options.length, truncated: options.length > 30 }
+    };
+  if (option.matches(":disabled"))
+    return { success: false, error: "option or its optgroup is disabled" };
+  if (el.selectedOptions.length === 1 && el.selectedOptions[0] === option) {
+    return { success: true, data: { value: option.value, label: option.label, changed: false } };
+  }
+  el.selectedIndex = options.indexOf(option);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
-  return { success: true };
+  await Promise.resolve();
+  if (!el.isConnected || el.selectedOptions.length !== 1 || el.selectedOptions[0] !== option) {
+    return { success: false, error: "page did not retain the selected option; read the dropdown before retrying" };
+  }
+  return { success: true, data: { value: option.value, label: option.label, changed: true } };
 }
 async function handleCheck(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "toggled");
   const target = action.checked !== undefined ? !!action.checked : !el.checked;
   if (el.checked !== target) {
     el.checked = target;
@@ -1999,7 +2306,7 @@ async function handleScrollAbsolute(action) {
 async function handleScrollTo(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "scrolled to");
   el.scrollIntoView({ block: "center", behavior: "instant" });
   return { success: true };
 }
@@ -2036,13 +2343,75 @@ async function handleWaitStable(action) {
   const stableResult = await waitForDomStable(debounceMs, timeoutMs);
   return { success: true, data: stableResult };
 }
+var quietObserver = null;
+var lastMutation = 0;
+var mutations = 0;
+function handleDomQuiet(action) {
+  if (action.stop) {
+    quietObserver?.disconnect();
+    quietObserver = null;
+    return { success: true };
+  }
+  if (!quietObserver) {
+    mutations = 0;
+    lastMutation = performance.now();
+    quietObserver = new MutationObserver((records) => {
+      mutations += records.length;
+      lastMutation = performance.now();
+    });
+    quietObserver.observe(document.body ?? document.documentElement, { childList: true, subtree: true, attributes: true });
+  }
+  return { success: true, data: { quietMs: performance.now() - lastMutation, mutations } };
+}
+
+// extension/src/content/actions/input-watch.ts
+init_element_discovery();
+var WATCHED = ["pointerdown", "mousedown", "mouseup", "click", "keydown", "beforeinput", "input"];
+var FRAME_TAGS = new Set(["IFRAME", "FRAME", "FENCEDFRAME", "OBJECT", "EMBED"]);
+var seen = [];
+var disarm2 = null;
+function targetOf(x, y) {
+  const inRoot = (root) => x !== undefined && y !== undefined ? root.elementFromPoint(x, y) : root.activeElement;
+  let el = inRoot(document);
+  for (let root = el && getShadowRoot(el);root; root = el && getShadowRoot(el)) {
+    const inner = inRoot(root);
+    if (!inner || inner === el)
+      break;
+    el = inner;
+  }
+  return el;
+}
+function handleInputWatch(action) {
+  disarm2?.();
+  const target = targetOf(action.x, action.y);
+  if (!target || FRAME_TAGS.has(target.tagName))
+    return { success: true, data: { armed: false } };
+  const events = seen = [];
+  const note = (e) => {
+    if (e.isTrusted)
+      events.push(e.type);
+  };
+  for (const type of WATCHED)
+    window.addEventListener(type, note, true);
+  const timer = setTimeout(() => disarm2?.(), 1e4);
+  disarm2 = () => {
+    clearTimeout(timer);
+    for (const type of WATCHED)
+      window.removeEventListener(type, note, true);
+    disarm2 = null;
+  };
+  return { success: true, data: { armed: true } };
+}
+function handleInputWatchRead() {
+  return { success: true, data: { ...disarm2 ? { events: [...seen] } : {}, hidden: document.visibilityState === "hidden" } };
+}
 
 // extension/src/content/actions/drag.ts
 init_input_simulation();
 async function handleDrag(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "dragged");
   scrollIntoViewIfNeeded(el);
   const dragRect = el.getBoundingClientRect();
   const fromX = dragRect.left + action.fromX;
@@ -2308,7 +2677,7 @@ init_input_simulation();
 async function handleHover(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+    return staleElementError(action, "hovered");
   const hoverFromX = action.fromX;
   const hoverFromY = action.fromY;
   if (hoverFromX !== undefined && hoverFromY !== undefined) {
@@ -2338,11 +2707,30 @@ async function handleHover(action) {
 init_input_simulation();
 init_ref_registry();
 init_a11y_tree();
+init_sensitive();
+init_element_discovery();
 async function handleFocus(action) {
-  const el = resolveElement(action.index, action.ref);
+  const focusedSensitive = action.focused === true && action.sensitive === true;
+  const el = focusedSensitive ? document.activeElement : resolveElement(action.index, action.ref);
   if (!el)
-    return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
-  el.focus();
+    return staleElementError(action, "focused");
+  if (action.sensitive === true) {
+    if (el === document.body || el === document.documentElement)
+      return { success: false, error: "no focused credential field" };
+  }
+  if (!focusedSensitive)
+    el.focus();
+  if (action.sensitive === true) {
+    let active = document.activeElement;
+    let focused = active === el;
+    while (active && getShadowRoot(active)?.activeElement) {
+      active = getShadowRoot(active).activeElement;
+      focused ||= active === el;
+    }
+    if (!focused)
+      return { success: false, error: "credential target did not receive focus; nothing typed" };
+    markSensitive(focusedSensitive ? active : el);
+  }
   return { success: true };
 }
 async function handleBlur(_action) {
@@ -2374,10 +2762,12 @@ async function handleGetFocus(_action) {
 }
 
 // extension/src/content/data/extract.ts
+init_sensitive();
 init_input_simulation();
 
 // extension/src/content/data/markdown-extract.ts
 init_element_discovery();
+init_sensitive();
 var SKIP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "META", "LINK", "TITLE"]);
 var BLOCK_TAGS = new Set(["P", "DIV", "SECTION", "ARTICLE", "HEADER", "FOOTER", "MAIN", "ASIDE", "NAV", "FORM", "FIELDSET", "DETAILS", "SUMMARY", "FIGURE", "FIGCAPTION", "ADDRESS", "DD", "DT", "DL"]);
 function renderMarkdown(root) {
@@ -2399,6 +2789,8 @@ function walkNode(node) {
     return "";
   if (!isVisible(el) && tag !== "BODY")
     return "";
+  if (isSensitive(el))
+    return el.textContent ? SECURE_MASK : "";
   switch (tag) {
     case "H1":
     case "H2":
@@ -2453,8 +2845,8 @@ ${content}
     }
     case "CODE": {
       if (el.closest("pre"))
-        return el.textContent || "";
-      const c = (el.textContent || "").trim();
+        return safeText(el);
+      const c = safeText(el).trim();
       return c ? `\`${c}\`` : "";
     }
     case "A": {
@@ -2490,13 +2882,15 @@ ${content}
   return out;
 }
 function inlineChildren(el) {
+  if (isSensitive(el))
+    return el.textContent ? SECURE_MASK : "";
   let out = "";
   for (const child of el.childNodes)
     out += walkNode(child);
   return out.replace(/\s+/g, " ").trim();
 }
 function renderPre(el) {
-  const code = (el.textContent || "").replace(/^\n+|\n+$/g, "");
+  const code = safeText(el).replace(/^\n+|\n+$/g, "");
   if (!code)
     return "";
   const codeEl = el.querySelector("code");
@@ -2554,6 +2948,8 @@ ${items.join(`
 function renderListItem(el, kind, index, indent) {
   const pad = "  ".repeat(indent);
   const bullet = kind === "ul" ? "-" : `${index}.`;
+  if (isSensitive(el))
+    return el.textContent ? `${pad}${bullet} ${SECURE_MASK}` : "";
   let mainLine = "";
   const nested = [];
   for (const child of el.childNodes) {
@@ -2656,10 +3052,10 @@ async function handleExtractText(action) {
       const label = String(action.ref ?? action.index ?? "unknown");
       return { success: false, error: `stale element [${label}] — run interceptor state to refresh` };
     }
-    const raw = (el.textContent || "").trim();
+    const raw = safeText(el).trim();
     return { success: true, data: withTruncationMarker(raw, Math.min(maxChars, ELEMENT_MAX_CHARS)) };
   }
-  return { success: true, data: withTruncationMarker(document.body.innerText, maxChars) };
+  return { success: true, data: withTruncationMarker(safeText(document.body, true), maxChars) };
 }
 async function handleExtractMarkdown(action) {
   const maxChars = typeof action.maxChars === "number" && action.maxChars > 0 ? action.maxChars : DEFAULT_TEXT_MAX_CHARS;
@@ -2681,83 +3077,89 @@ async function handleExtractHtml(action) {
       const label = String(action.ref ?? action.index ?? "unknown");
       return { success: false, error: `stale element [${label}] — run interceptor state to refresh` };
     }
-    return { success: true, data: withTruncationMarker(el.outerHTML, Math.min(maxChars, ELEMENT_MAX_CHARS)) };
+    return { success: true, data: withTruncationMarker(safeHtml(el), Math.min(maxChars, ELEMENT_MAX_CHARS)) };
   }
-  return { success: true, data: withTruncationMarker(document.documentElement.outerHTML, maxChars) };
+  return { success: true, data: withTruncationMarker(safeHtml(document.documentElement), maxChars) };
 }
 
 // extension/src/content/data/query.ts
+init_sensitive();
 init_input_simulation();
 init_ref_registry();
+init_deep_query();
 async function handleQuery(action) {
   const selector = action.selector;
-  const els = document.querySelectorAll(selector);
+  const els = queryAllDeep(selector);
+  const elements = els.slice(0, 20).map((el, i) => ({
+    index: i,
+    ref: getOrAssignRef(el),
+    tag: el.tagName.toLowerCase(),
+    text: safeText(el).trim().slice(0, 80),
+    id: el.id || undefined,
+    classes: el.className || undefined
+  }));
   return {
     success: true,
     data: {
       count: els.length,
-      elements: Array.from(els).slice(0, 20).map((el, i) => ({
-        index: i,
-        ref: getOrAssignRef(el),
-        tag: el.tagName.toLowerCase(),
-        text: (el.textContent || "").trim().slice(0, 80),
-        id: el.id || undefined,
-        classes: el.className || undefined
-      }))
+      returned: elements.length,
+      truncated: elements.length < els.length,
+      elements
     }
   };
 }
 async function handleQueryOne(action) {
-  const el = document.querySelector(action.selector);
+  const el = queryOneDeep(action.selector);
   if (!el)
     return { success: false, error: `no element matching: ${action.selector}` };
   return {
     success: true,
     data: {
       tag: el.tagName.toLowerCase(),
-      text: (el.textContent || "").trim().slice(0, 200),
-      html: el.outerHTML.slice(0, 500),
+      text: safeText(el).trim().slice(0, 200),
+      html: safeHtml(el).slice(0, 500),
       id: el.id || undefined,
       rect: el.getBoundingClientRect()
     }
   };
 }
 async function handleExists(action) {
-  const el = document.querySelector(action.selector);
+  const el = queryOneDeep(action.selector);
   return { success: true, data: !!el };
 }
 async function handleCount(action) {
-  const els = document.querySelectorAll(action.selector);
+  const els = queryAllDeep(action.selector);
   return { success: true, data: els.length };
 }
 async function handleTableData(action) {
-  const table = action.index !== undefined ? resolveElement(action.index, action.ref) : document.querySelector(action.selector || "table");
+  const table = action.index !== undefined ? resolveElement(action.index, action.ref) : queryOneDeep(String(action.selector || "table"));
   if (!table)
     return { success: false, error: "table not found" };
   const rows = [];
   table.querySelectorAll("tr").forEach((tr) => {
     const cells = [];
-    tr.querySelectorAll("td, th").forEach((cell) => cells.push((cell.textContent || "").trim()));
+    tr.querySelectorAll("td, th").forEach((cell) => cells.push(safeText(cell).trim()));
     rows.push(cells);
   });
   return { success: true, data: rows };
 }
 async function handleAttrGet(action) {
-  const el = resolveElement(action.index, action.ref) || document.querySelector(action.selector);
+  const el = resolveElementOrSelector(action);
   if (!el)
     return { success: false, error: "element not found" };
   const name = action.name;
-  return { success: true, data: el.getAttribute(name) };
+  const value = el.getAttribute(name);
+  return { success: true, data: name.toLowerCase() === "value" && value && isSensitive(el) ? SECURE_MASK : value };
 }
 async function handleAttrSet(action) {
-  const el = resolveElement(action.index, action.ref) || document.querySelector(action.selector);
+  const el = resolveElementOrSelector(action);
   if (!el)
     return { success: false, error: "element not found" };
   el.setAttribute(action.name, action.value);
   return { success: true };
 }
 async function handleStyleGet(action) {
-  const el = resolveElement(action.index, action.ref) || document.querySelector(action.selector);
+  const el = resolveElementOrSelector(action);
   if (!el)
     return { success: false, error: "element not found" };
   const computed = getComputedStyle(el);
@@ -2772,6 +3174,7 @@ async function handleStyleGet(action) {
 }
 
 // extension/src/content/data/forms.ts
+init_sensitive();
 async function handleForms(_action) {
   const forms = document.querySelectorAll("form");
   return {
@@ -2785,7 +3188,7 @@ async function handleForms(_action) {
         tag: el.tagName.toLowerCase(),
         type: el.type,
         name: el.name,
-        value: el.value?.slice(0, 40),
+        value: safeValue(el).slice(0, 40),
         placeholder: el.placeholder
       }))
     }))
@@ -2896,12 +3299,49 @@ async function handleSelectionSet(action) {
 init_input_simulation();
 init_element_discovery();
 init_a11y_tree();
+init_deep_query();
+function frameHost(frameId, url) {
+  const frames = queryAllDeep("iframe, frame");
+  const getFrameId = chrome.runtime.getFrameId;
+  if (typeof getFrameId === "function") {
+    const exact = frames.find((f) => {
+      try {
+        return getFrameId(f) === frameId;
+      } catch {
+        return false;
+      }
+    });
+    if (exact)
+      return exact;
+  }
+  const bySrc = typeof url === "string" ? frames.filter((f) => f.src === url) : [];
+  return bySrc.length === 1 ? bySrc[0] : null;
+}
 async function handleRect(action) {
-  const el = resolveElement(action.index, action.ref) || document.querySelector(action.selector);
+  const host = typeof action.hostOfFrame === "number";
+  const el = host ? frameHost(action.hostOfFrame, action.hostUrl) : resolveElementOrSelector(action);
   if (!el)
-    return { success: false, error: "element not found" };
-  const r = el.getBoundingClientRect();
-  return { success: true, data: { top: r.top, left: r.left, width: r.width, height: r.height, bottom: r.bottom, right: r.right } };
+    return { success: false, error: host ? "iframe not found" : "element not found" };
+  const box = el.getBoundingClientRect();
+  const style = host ? getComputedStyle(el) : null;
+  const r = {
+    left: box.left + (style ? el.clientLeft + (parseFloat(style.paddingLeft) || 0) : 0),
+    top: box.top + (style ? el.clientTop + (parseFloat(style.paddingTop) || 0) : 0),
+    width: box.width,
+    height: box.height,
+    bottom: box.bottom,
+    right: box.right
+  };
+  return { success: true, data: {
+    top: r.top,
+    left: r.left,
+    width: r.width,
+    height: r.height,
+    bottom: r.bottom,
+    right: r.right,
+    viewportHeight: window.innerHeight,
+    pageHidden: document.visibilityState === "hidden"
+  } };
 }
 async function handleRegions(_action) {
   const regionElements = getInteractiveElements();
@@ -2993,19 +3433,66 @@ async function handlePanels(_action) {
   return { success: true, data: { panels } };
 }
 
+// extension/src/content/semantic-match.ts
+init_sensitive();
+init_ref_registry();
+init_element_discovery();
+init_a11y_tree();
+function findBestMatch(name, role, text) {
+  const query = (name || text || "").toLowerCase();
+  const targetRole = (role || "").toLowerCase();
+  const isTextPseudoRole = targetRole === "text";
+  let best = null;
+  for (const [refId, weakRef] of refRegistry) {
+    const el = weakRef.deref();
+    if (!el || !el.isConnected || !isVisible(el))
+      continue;
+    const elRole = getEffectiveRole(el).toLowerCase();
+    const elName = getAccessibleName(el).toLowerCase();
+    let score = 0;
+    if (targetRole && !isTextPseudoRole && elRole !== targetRole)
+      continue;
+    if (targetRole && !isTextPseudoRole && elRole === targetRole)
+      score += 50;
+    if (query) {
+      if (elName === query)
+        score += 100;
+      else if (elName.includes(query))
+        score += 60;
+      const id = el.getAttribute("id")?.toLowerCase();
+      if (id?.includes(query))
+        score += 50;
+      const placeholder = el.getAttribute("placeholder")?.toLowerCase();
+      if (placeholder?.includes(query))
+        score += 40;
+      if (isTextPseudoRole) {
+        const elText = safeText(el).trim().toLowerCase();
+        if (elText === query)
+          score += 80;
+        else if (elText.includes(query))
+          score += 50;
+      }
+    }
+    if (score >= 30 && (!best || score > best.score)) {
+      best = { refId, role: getEffectiveRole(el), name: getAccessibleName(el), score, element: el };
+    }
+  }
+  return best;
+}
+
 // extension/src/content/find.ts
-init_semantic_match();
 init_ref_registry();
 init_element_discovery();
 init_a11y_tree();
 init_input_simulation();
-function findRenderedText(renderedText, rawQuery, limit = 10, contextChars = 80) {
+init_sensitive();
+function findRenderedText(renderedText2, rawQuery, limit = 10, contextChars = 80) {
   const query = rawQuery.trim();
   const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 10;
   const matches = [];
   let total = 0;
   if (query.length > 0) {
-    const haystack = renderedText.toLowerCase();
+    const haystack = renderedText2.toLowerCase();
     const needle = query.toLowerCase();
     let from = 0;
     while (from <= haystack.length - needle.length) {
@@ -3016,14 +3503,14 @@ function findRenderedText(renderedText, rawQuery, limit = 10, contextChars = 80)
       total++;
       if (matches.length < boundedLimit) {
         const snippetStart = Math.max(0, start - contextChars);
-        const snippetEnd = Math.min(renderedText.length, end + contextChars);
+        const snippetEnd = Math.min(renderedText2.length, end + contextChars);
         const prefix = snippetStart > 0 ? "…" : "";
-        const suffix = snippetEnd < renderedText.length ? "…" : "";
+        const suffix = snippetEnd < renderedText2.length ? "…" : "";
         matches.push({
           start,
           end,
-          matchedText: renderedText.slice(start, end),
-          snippet: `${prefix}${renderedText.slice(snippetStart, snippetEnd).replace(/\s+/g, " ").trim()}${suffix}`
+          matchedText: renderedText2.slice(start, end),
+          snippet: `${prefix}${renderedText2.slice(snippetStart, snippetEnd).replace(/\s+/g, " ").trim()}${suffix}`
         });
       }
       from = end;
@@ -3033,7 +3520,7 @@ function findRenderedText(renderedText, rawQuery, limit = 10, contextChars = 80)
     total,
     returned: matches.length,
     truncated: total > matches.length,
-    scannedCharacters: renderedText.length,
+    scannedCharacters: renderedText2.length,
     scanTruncated: false,
     matches
   };
@@ -3067,7 +3554,7 @@ function findAccessibleElements(rawQuery, rawRole, limit = 10) {
       const placeholder = el.getAttribute("placeholder")?.toLowerCase();
       if (placeholder?.includes(query))
         score += 40;
-      const value = (el.value || "").toLowerCase();
+      const value = isSensitive(el) ? "" : (el.value || "").toLowerCase();
       if (value.includes(query))
         score += 30;
     }
@@ -3088,7 +3575,7 @@ async function handleFindElement(action) {
   const mode = role ? "elements" : requestedMode;
   const data = { query, mode };
   if (mode !== "elements") {
-    data.text = findRenderedText(document.body?.innerText || "", query, limit);
+    data.text = findRenderedText(document.body ? safeText(document.body, true) : "", query, limit);
   }
   if (mode !== "text") {
     data.elements = findAccessibleElements(query, role, limit);
@@ -3113,8 +3600,8 @@ async function handleFindAndType(action) {
   const match = findBestMatch(action.name, action.role, action.text);
   if (!match)
     return { success: false, error: "no matching element found (score < 30)" };
-  const typeResult = await handleInputText({ type: "input_text", ref: match.refId, text: action.inputText, clear: action.clear });
-  return { success: true, data: { matched: { ref: match.refId, role: match.role, name: match.name, score: match.score }, actionResult: typeResult } };
+  const typeResult = await handleInputText({ type: "input_text", ref: match.refId, text: action.inputText, clear: action.clear, sensitive: action.sensitive });
+  return { ...typeResult, data: { matched: { ref: match.refId, role: match.role, name: match.name, score: match.score }, actionResult: typeResult } };
 }
 async function handleFindAndCheck(action) {
   const match = findBestMatch(action.name, action.role, action.text);
@@ -3128,6 +3615,7 @@ async function handleFindAndCheck(action) {
 init_a11y_tree();
 init_element_discovery();
 init_ops();
+init_sensitive();
 var sceneRefRegistry = new Map;
 var sceneElementToId = new WeakMap;
 var sceneRefMeta = new Map;
@@ -3166,20 +3654,22 @@ function isHiddenProxyInput(el) {
   const role = el.getAttribute("role");
   return hiddenAttr === "true" || role === "application" && inputMode === "none";
 }
+function maskSensitiveText(el, text) {
+  return text && isSensitive(el) ? SECURE_MASK : text;
+}
 function readElementText(el) {
   if (!isHtmlElement(el))
     return "";
-  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
-    return (el.value || "").toString();
-  }
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA")
+    return safeValue(el);
   if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
-    return (el.textContent || "").toString();
+    return maskSensitiveText(el, (el.textContent || "").toString());
   }
   const role = el.getAttribute("role");
   if (role === "textbox" || role === "combobox" || role === "searchbox") {
-    return (el.textContent || "").toString();
+    return maskSensitiveText(el, (el.textContent || "").toString());
   }
-  return (getAccessibleName(el) || el.getAttribute("aria-label") || el.textContent || "").toString();
+  return maskSensitiveText(el, (getAccessibleName(el) || el.getAttribute("aria-label") || el.textContent || "").toString());
 }
 function visibleOrActive(el) {
   return isVisible(el) || document.activeElement === el;
@@ -3326,7 +3816,7 @@ function discoverAdaptiveSceneObjects(opts) {
     return opts?.type ? cachedDiscovery.objects.filter((o) => o.type === opts.type) : cachedDiscovery.objects;
   }
   const out = [];
-  const seen = new Set;
+  const seen2 = new Set;
   walkWithShadow(document.body, (el) => {
     const candidate = maybeClassifyCandidate(el);
     if (!candidate)
@@ -3335,9 +3825,9 @@ function discoverAdaptiveSceneObjects(opts) {
       return;
     const rect = boundingBox(candidate.el);
     const key = `${candidate.type}:${candidate.strategy}:${normalizeRect(rect)}`;
-    if (seen.has(key))
+    if (seen2.has(key))
       return;
-    seen.add(key);
+    seen2.add(key);
     const id = getOrAssignSceneId(candidate.el, candidate.type, candidate.strategy);
     out.push({
       id,
@@ -3451,10 +3941,8 @@ function readFocusedWritableText() {
   const surface = findFocusedWritableSurface();
   if (!surface)
     return null;
-  return {
-    text: surface.text,
-    length: surface.text.length
-  };
+  const text = maskSensitiveText(surface.element, surface.text);
+  return { text, length: text.length };
 }
 function setInputValue(el, text) {
   const tag = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -3529,7 +4017,7 @@ function selectedAdaptiveScene() {
       has: true,
       id,
       label: label2,
-      text: writable.text.slice(0, 200),
+      text: maskSensitiveText(writable.element, writable.text).slice(0, 200),
       extras: {
         kind: writable.kind,
         writable: true,
@@ -3748,6 +4236,7 @@ var canvaProfile = {
 
 // extension/src/content/scene/profiles/google-docs.ts
 init_ops();
+init_sensitive();
 function findTextEventTarget() {
   const iframe = document.querySelector(".docs-texteventtarget-iframe");
   if (!iframe)
@@ -3837,7 +4326,7 @@ var googleDocsProfile = {
       if (!sel || sel.rangeCount === 0)
         return { has: false };
       const range = sel.getRangeAt(0);
-      const text = range.toString();
+      const text = isSensitive(tet.textbox) && range.toString() ? SECURE_MASK : range.toString();
       return {
         has: text.length > 0,
         text: text.slice(0, 200),
@@ -3851,10 +4340,10 @@ var googleDocsProfile = {
     const tet = findTextEventTarget();
     if (!tet)
       return null;
-    const text = (tet.textbox.textContent || "").toString();
+    const text = safeText(tet.textbox);
     return {
       text,
-      html: opts?.withHtml ? tet.textbox.innerHTML : undefined,
+      html: opts?.withHtml ? safeHtml(tet.textbox) : undefined,
       length: text.length
     };
   },
@@ -3939,6 +4428,7 @@ var googleDocsProfile = {
 
 // extension/src/content/scene/profiles/google-slides.ts
 init_ops();
+init_sensitive();
 var FILMSTRIP_ID = /^filmstrip-slide-(\d+)-(gd[a-z0-9_-]+)$/i;
 function gatherSlides() {
   const all = Array.from(document.querySelectorAll('g[id^="filmstrip-slide-"]'));
@@ -4056,10 +4546,10 @@ var googleSlidesProfile = {
     if (paragraphs.length === 0) {
       const notesContainer = document.getElementById("speakernotes") || document.getElementById("speakernotes-workspace");
       if (notesContainer)
-        return (notesContainer.textContent || "").trim() || null;
+        return safeText(notesContainer).trim() || null;
       return null;
     }
-    const text = paragraphs.map((p) => (p.textContent || "").trim()).filter(Boolean).join(`
+    const text = paragraphs.map((p) => safeText(p).trim()).filter(Boolean).join(`
 `);
     return text || null;
   },
@@ -4074,7 +4564,7 @@ var googleSlidesProfile = {
       const textbox = doc.querySelector("[role=textbox]") || doc.querySelector("[contenteditable]");
       if (!textbox)
         return null;
-      const text = (textbox.textContent || "").trim();
+      const text = safeText(textbox).trim();
       return { text, length: text.length };
     } catch {
       return null;
@@ -4396,13 +4886,10 @@ async function handleCanvasAction(action) {
             data: { id, clicked: true, at: { x: cx, y: cy }, method: "synthetic" }
           };
         }
-        if (target.element)
-          clickElementCenter2(target.element);
-        else {
-          const { clickAtViewport: clickAtViewport3 } = await Promise.resolve().then(() => (init_ops(), exports_ops));
-          clickAtViewport3(cx, cy);
-        }
-        const mutated = await waitForMutation(200);
+        const click = target.element ? () => clickElementCenter2(target.element) : await Promise.resolve().then(() => (init_ops(), exports_ops)).then(({ clickAtViewport: clickAtViewport3 }) => () => clickAtViewport3(cx, cy));
+        const mutation = waitForMutation(200);
+        click();
+        const mutated = await mutation;
         const afterSelection = canvasSelected(profileOverride);
         const changed = mutated || selectionChanged(beforeSelection.data, afterSelection.data);
         return {
@@ -4447,6 +4934,7 @@ async function handleCanvasAction(action) {
 
 // extension/src/content/dom-screenshot.ts
 init_input_simulation();
+init_deep_query();
 var TRANSPARENT_1PX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==";
 var SKIP_TAGS2 = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "object", "embed"]);
 function extractUrls(cssValue) {
@@ -4635,7 +5123,7 @@ function resolveTarget(action) {
       if (!action.selector) {
         return { node: null, error: "selector mode requires selector string" };
       }
-      const el = document.querySelector(action.selector);
+      const el = queryOneDeep(action.selector);
       if (!el)
         return { node: null, error: `selector not found: ${action.selector}` };
       if (!(el instanceof HTMLElement)) {
@@ -4730,16 +5218,13 @@ if (!__interceptorContentAlreadyLoaded)
   });
 async function handleAction(action) {
   const warnDirty = getDomDirty();
-  clearStaleWarning();
   const wantChanges = !!action.changes;
   if (wantChanges)
     cacheSnapshot();
   const result = await executeAction(action);
-  const sw = getStaleWarning();
-  if (sw && result.success)
-    result.warning = sw;
-  else if (warnDirty && result.success)
-    result.warning = "DOM has changed since last state read";
+  const note = warnDirty ? "DOM has changed since last state read" : null;
+  if (note && result.success)
+    result.warning = result.warning ? `${result.warning}; ${note}` : note;
   if (wantChanges && result.success) {
     const diffResult = computeSnapshotDiff();
     if (diffResult.success)
@@ -4768,6 +5253,8 @@ async function executeAction(action) {
         return handleFileUploadChunk(action);
       case "input_text":
         return handleInputText(action);
+      case "submit_form":
+        return handleSubmitForm(action);
       case "select_option":
         return handleSelectOption(action);
       case "check":
@@ -4782,7 +5269,12 @@ async function executeAction(action) {
         return handleScrollTo(action);
       case "send_keys": {
         const keys = action.keys;
-        const target = document.activeElement || document.body;
+        const named = action.ref !== undefined || action.index !== undefined;
+        const el = named ? resolveElement(action.index, action.ref) : null;
+        if (named && !el)
+          return staleElementError(action, "sent keys to");
+        el?.focus();
+        const target = el || document.activeElement || document.body;
         dispatchKeySequence(target, keys);
         return { success: true };
       }
@@ -4853,19 +5345,18 @@ async function executeAction(action) {
         const wantsTarget = action.index !== undefined || action.ref !== undefined;
         pruneStaleRefs();
         const root = wantsTarget ? resolveElement(action.index, action.ref) : document.body;
-        if (wantsTarget && !root) {
-          const label = String(action.ref ?? action.index ?? "unknown");
-          return { success: false, error: `stale element [${label}] — run interceptor state to refresh` };
-        }
+        if (wantsTarget && !root)
+          return staleElementError(action, "read");
         const treeOutput = buildA11yTree(root || document.body, 0, maxDepth, filter, includeStyle, treeFormat);
         const truncated = treeOutput.length > maxChars ? treeOutput.slice(0, maxChars) + `
-... (truncated)` : treeOutput;
+... (tree truncated at ${maxChars} chars: pass --tree-format compact, scope with 'read e<ref>', or raise INTERCEPTOR_TREE_MAX_CHARS)` : treeOutput;
         cacheSnapshot();
         return { success: true, data: truncated };
       }
       case "diff": {
+        const textDiff = computeTextDiff() ?? {};
         if (!getDomDirty() && (await Promise.resolve().then(() => (init_snapshot_diff(), exports_snapshot_diff))).lastSnapshot.length > 0) {
-          return { success: true, data: { changes: 0, added: [], removed: [], changed: [] } };
+          return { success: true, data: { changes: 0, added: [], removed: [], changed: [], ...textDiff } };
         }
         const diffResult = computeSnapshotDiff();
         if (diffResult.success && typeof diffResult.data === "string") {
@@ -4874,7 +5365,7 @@ async function executeAction(action) {
           const added = lines.filter((l) => l.startsWith("+ "));
           const removed = lines.filter((l) => l.startsWith("- "));
           const changed = lines.filter((l) => l.startsWith("~ "));
-          return { success: true, data: { changes: lines.length, added, removed, changed, total: lines.length } };
+          return { success: true, data: { changes: lines.length, added, removed, changed, total: lines.length, ...textDiff } };
         }
         return diffResult;
       }
@@ -4922,6 +5413,12 @@ async function executeAction(action) {
         return await handleCanvasAction(action);
       case "wait_stable":
         return handleWaitStable(action);
+      case "dom_quiet":
+        return handleDomQuiet(action);
+      case "input_watch":
+        return handleInputWatch(action);
+      case "input_watch_read":
+        return handleInputWatchRead();
       case "batch": {
         const actions = action.actions;
         if (!actions || !Array.isArray(actions))

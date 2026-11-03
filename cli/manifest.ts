@@ -20,7 +20,7 @@ import { skillsStatusSummary } from "./commands/skills"
 export type FlagSpec = { name: string; value?: string; description: string }
 export type CommandSpec = {
   name: string
-  surface: "browser" | "macos" | "ios" | "local"
+  surface: "browser" | "macos" | "desktop" | "ios" | "local"
   usage: string
   summary: string
   returns: string
@@ -66,12 +66,13 @@ export const COMMAND_SPECS: CommandSpec[] = [
   },
   {
     name: "act", surface: "browser",
-    usage: "interceptor act <ref> [value…] [--keys <combo>] [--trusted] [--append] [--no-read] [--timeout <ms>]",
-    summary: "Click (no value) or type (with value) on a ref, wait, return updated tree + diff",
-    returns: "Updated a11y tree + '--- diff ---' of what changed. 'ok (page navigated…)' when the action triggered navigation.",
+    usage: "interceptor act <ref> [value…] [--submit] [--keys <combo>] [--trusted] [--append] [--no-read] [--timeout <ms>]",
+    summary: "Click (no value) or type (with value) on a ref, wait, return updated tree + what changed",
+    returns: "Updated a11y tree, then a '--- changes ---' block of plain lines: text added/removed and elements added/removed/changed since your last read of the page. --json keeps {tree, diff}; the diff gains textAdded/textRemoved.",
     flags: [
-      { name: "--keys", value: "<combo>", description: "send a keyboard shortcut instead (e.g. Enter, cmd+shift+p)" },
-      { name: "--trusted", description: "HID-sourced input — page sees isTrusted: true; requires the target tab active in the OS-focused window (refuses otherwise, never moves focus)" },
+      { name: "--keys", value: "<combo>", description: "focus the ref, then send a keyboard shortcut (e.g. Escape, cmd+shift+p); a synthetic Enter does not submit a form" },
+      { name: "--submit", description: "after typing (or alone), submit the ref's form the way Enter would (form.requestSubmit with its default button); refuses outside a form" },
+      { name: "--trusted", description: "HID-sourced input — page sees isTrusted: true; on a full install it reaches a background window, and a tab that is not showing gets a background window of its own and goes back (never moves focus); elsewhere it needs the tab active in the OS-focused window" },
       { name: "--append", description: "type without clearing the field first" },
       { name: "--no-read", description: "skip the post-action tree read" },
     ],
@@ -146,7 +147,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "links", surface: "browser", usage: "interceptor links", summary: "All links on the page", returns: "Array of {text, href}." },
   { name: "images", surface: "browser", usage: "interceptor images", summary: "All images", returns: "Array of {alt, src}." },
   { name: "forms", surface: "browser", usage: "interceptor forms", summary: "All forms and fields", returns: "Form structure with field names/types/values." },
-  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Matching elements with attributes and clickable e<ref>s." },
+  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Total count, returned count, truncation flag, and up to 20 elements with clickable e<ref>s." },
   { name: "exists", surface: "browser", usage: "interceptor exists <css-selector>", summary: "Does a selector match?", returns: "Boolean." },
   { name: "count", surface: "browser", usage: "interceptor count <css-selector>", summary: "How many elements match", returns: "Number." },
   { name: "attr", surface: "browser", usage: "interceptor attr e<ref> <name> | attr set e<ref> <name> <value>", summary: "Get/set an attribute", returns: "Attribute value." },
@@ -159,7 +160,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "scroll", surface: "browser", usage: "interceptor scroll up|down|top|bottom [--amount <px>]", summary: "Scroll the page", returns: "ok." },
   { name: "hover", surface: "browser", usage: "interceptor hover e<ref>", summary: "Hover an element", returns: "ok." },
   { name: "drag", surface: "browser", usage: "interceptor drag e<ref> [--from x,y --to x,y --steps <n>]", summary: "Drag an element or coordinates", returns: "ok." },
-  { name: "upload", surface: "browser", usage: "interceptor upload e<ref> <path> [--dropzone] [--picker]", summary: "Attach a local file to an <input type=file>, drag-and-drop dropzone, or File System Access picker (--picker). Any size — large files auto-chunk. No CDP.", returns: "ok with {method, fileName, size, verified}. method: input | dropzone-trusted | dropzone-isolated | picker-staged." },
+  { name: "upload", surface: "browser", usage: "interceptor upload e<ref> <path> [--dropzone] [--picker]", summary: "Attach a local file to an <input type=file>, drag-and-drop dropzone, or File System Access picker (--picker). Up to 100 MB — large files auto-chunk, bigger ones are refused up front. No CDP.", returns: "ok with {method, fileName, size, verified}. method: input | dropzone-trusted | dropzone-isolated | picker-staged." },
   { name: "keepawake", surface: "browser", usage: "interceptor keepawake on|off [--display]", summary: "Keep the machine awake for an unattended run (chrome.power)", returns: "ok with {on, level}." },
   { name: "idle", surface: "browser", usage: "interceptor idle state [--interval <sec>]", summary: "Query user idle state: active | idle | locked (chrome.idle)", returns: "ok with {state}." },
   { name: "delegate", surface: "browser", usage: "interceptor delegate log [--since <ms>] [--follow]", summary: "Read human→agent delegation intents (right-click menu / hotkey)", returns: "list of delegation_intent events." },
@@ -168,24 +169,35 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "wait", surface: "browser", usage: "interceptor wait <ms>", summary: "Sleep", returns: "ok." },
   { name: "wait-stable", surface: "browser", usage: "interceptor wait-stable [--ms <n>] [--timeout <ms>]", summary: "Wait for DOM stability", returns: "ok when the DOM stops mutating." },
   // ── tabs / network / capture / data ─────────────────────────────────────────
-  { name: "tabs", surface: "browser", usage: "interceptor tabs", summary: "List managed tabs", returns: "Tab list (id, url, title)." },
-  { name: "tab", surface: "browser", usage: "interceptor tab new|close|activate|reload […]", summary: "Tab lifecycle", returns: "ok / tab info." },
+  { name: "tabs", surface: "browser", usage: "interceptor tabs   (or: interceptor tab list)", summary: "List managed tabs", returns: "Tab list (id, url, title)." },
+  {
+    name: "tab", surface: "browser",
+    usage: "interceptor tab new [url] [--reuse|--no-reuse] [--activate] | tab list | tab close [id] | tab switch <id> | tab keepalive <id> [--off]",
+    summary: "Create, reuse, activate, keep rendering, or close managed tabs",
+    returns: "Tab metadata for creation, or ok / error for exact-ID lifecycle actions; keepalive returns the flag state and its limits.",
+    flags: [
+      { name: "--reuse", description: "reuse the most recent tab in the caller's managed group" },
+      { name: "--no-reuse", description: "force creation of a new managed tab" },
+      { name: "--activate", description: "activate the created or reused tab (default is background-first)" },
+      { name: "--off", description: "tab keepalive: clear the flag so the page reads its real visibility again" },
+    ],
+  },
   {
     name: "update", surface: "local",
-    usage: "interceptor update [status]",
-    summary: "Update Interceptor itself — fires a user-initiated Sparkle update check (full install only)",
-    returns: "check: confirmation the update alert was fired + feed URL. status: feed, lastCheck, automaticChecks, checkInterval, canCheckForUpdates, sessionInProgress.",
+    usage: "interceptor update [status|check]",
+    summary: "Update Interceptor itself: checks the update feed and reports its selected version or no-update result. A newer release opens the update window and installs when the user clicks Install Update (Sparkle on macOS). Full install only.",
+    returns: "check: started, concluded, outcome, phase, selected/latest version or error, and feed. status: the same observed lifecycle plus lastCheck, nextCheckAt, automaticChecks, checkInterval, canCheckForUpdates, sessionInProgress and the last install (lastInstallVersion, lastInstallOutcome, lastInstallAt).",
     example: "interceptor update",
   },
-  { name: "network", surface: "browser", usage: "interceptor net [--filter <pattern>] [--limit <n>] [--format har|json|pcapng --out <path>]", summary: "Passive network log", returns: "Recent requests (method, url, status, type); exportable to HAR/pcapng." },
+  { name: "network", surface: "browser", usage: "interceptor net [log] [--filter <pattern>] [--limit <n>] [--format har|json|pcapng --out <path>]", summary: "Passive network log (bare 'net' is 'net log')", returns: "Recent requests (method, url, status, type); exportable to HAR/pcapng." },
   { name: "headers", surface: "browser", usage: "interceptor headers [--filter <pattern>]", summary: "Request headers seen", returns: "Header sets per request." },
-  { name: "screenshot", surface: "browser", usage: "interceptor screenshot [e<ref>] [--save] [--format png|jpeg|webp] [--quality <n>]", summary: "Screenshot page/element", returns: "Image (saved to disk with --save; path on stderr)." },
-  { name: "eval", surface: "browser", usage: "interceptor eval <expr> [--main]", summary: "Evaluate JS in the page (ISOLATED world by default)", returns: "JSON-serialized expression result. Works on strict-CSP pages." },
+  { name: "screenshot", surface: "browser", usage: "interceptor screenshot [--element <ref>] [--out <path> | --save] [--format png|jpeg|webp] [--quality <n>]", summary: "Screenshot page/element", returns: "Image. --out <path> writes that file (the extension picks the format; the folder must exist); --save writes one auto-named file in the current directory. Either prints 'saved: <path>' on stderr and filePath in the result." },
+  { name: "eval", surface: "browser", usage: "interceptor eval <expr> [--main] [--frame <id>] [--no-reload]", summary: "Evaluate JS in the requested frame and world (isolated by default)", returns: "Expression result. Isolated eval needs userScripts support when extension CSP blocks eval. MAIN CSP recovery can reload the tab and returns {value,cspBypassApplied,originalError}; never switches world or frame. --no-reload refuses that reload and returns the CSP error instead. Use it on a stateful page a reload would destroy." },
   { name: "save", surface: "browser", usage: "interceptor save --out <abs-path> <expr>", summary: "Stream page-produced bytes (Blob/File/ArrayBuffer) to disk", returns: "{path, bytes, sha256} — integrity-checked." },
   { name: "cookies", surface: "browser", usage: "interceptor cookies [domain] | cookies set/delete …", summary: "Read/write cookies", returns: "Cookie list." },
   { name: "storage", surface: "browser", usage: "interceptor storage [key] | storage delete <key>", summary: "localStorage access", returns: "Values." },
   { name: "override", surface: "browser", usage: "interceptor override <sub> …", summary: "Request/response overrides", returns: "Override state." },
-  { name: "monitor", surface: "browser", usage: "interceptor monitor start|stop|status|tail|export …", summary: "Record page/network/user activity into a replayable session", returns: "Session id; export produces workflow artifacts." },
+  { name: "monitor", surface: "browser", usage: "interceptor monitor start|stop|status|tail|export … | task create <objective> | task checkpoint <id> --file <json> | task resume|verify|complete <id>", summary: "Record activity or persist task constraints, resume state and declared browser checks", returns: "Recording session id or task JSON with revision, explicit target, scoped lessons and observed check results. task complete runs fresh predicates; false, missing or stale checks exit nonzero. task verify/complete execute authored JS and require MCP arbitrary-exec allowance. Verification never reloads the page." },
   { name: "scene", surface: "browser", usage: "interceptor scene <sub> …", summary: "Scene-graph automation for canvas/rich editors", returns: "Scene nodes / action results." },
   // ── local (no daemon) ───────────────────────────────────────────────────────
   {
@@ -210,22 +222,23 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "status", surface: "local", usage: "interceptor status [--verbose]", summary: "Daemon/bridge/extension health + skills adoption", returns: "Status report." },
   {
     name: "diagnose", surface: "local",
-    usage: "interceptor diagnose [--context <id>] [--json]",
-    summary: "Post-failure snapshot: daemon binary, per-context connection state, NMH binary-mismatch detection",
-    returns: "Text report or JSON {daemon, binaryMismatches, contexts[], monitor}. Never auto-spawns the daemon; use after a command fails ('status' is the pre-flight check).",
+    usage: "interceptor diagnose [--context <id>] [--json] | interceptor diagnose extension [--fix | --prompt | --welcome] [--json]",
+    summary: "Post-failure snapshot: daemon binary, per-context connection state, NMH binary-mismatch detection, browser profiles that lose Interceptor at every start",
+    returns: "Text report or JSON {daemon, binaryMismatches, extensionProblems[], extensionBlocked[], contexts[], monitor}. Never auto-spawns the daemon; use after a command fails ('status' is the pre-flight check). 'diagnose extension' lists browser profiles where Interceptor cannot load (old-ID entry sharing a folder, old ID only, a --load-extension load that lasts one session, two copies), JSON {problems[{kind,state,browser,profile,autoFix,steps}]}. '--fix' quits and restarts each affected Brave, Vivaldi or Chromium on macOS (hidden one-time start, then the same windows); everything else gets exact steps by hand. '--welcome' (macOS, run by a first pkg install) opens a window that finds a copy already in a browser or helps add one: the Chrome Web Store in the chosen browser, Load unpacked with a local step-by-step guide, or the Safari package.",
   },
   { name: "init", surface: "local", usage: "interceptor init [--verbose]", summary: "Bootstrap the daemon and report status", returns: "Status report." },
   { name: "research", surface: "local", usage: "interceptor research [init|log|status|…]", summary: "Deep-research methodology + on-disk source ledger", returns: "Playbook guidance / ledger state." },
   { name: "upgrade", surface: "local", usage: "interceptor upgrade --full", summary: "Promote browser-only install to full computer-use mode (macOS)", returns: "Installer output." },
   // ── other surfaces (verbs enumerated via their own --help) ──────────────────
+  { name: "desktop", surface: "desktop", usage: "interceptor desktop <verb> …", summary: "Shared desktop commands backed by the host native provider", returns: "Per operation. desktop capabilities reports current provider, permissions, limits and availability." },
   { name: "macos", surface: "macos", usage: "interceptor macos <verb> … (see: interceptor help macos)", summary: "Native macOS control: AX trees, background input, windows, screenshots, Apple Events, Electron CDP, app runtime", returns: "Per-verb; background-first — only 'app activate'/'open --activate' move focus." },
-  { name: "ios", surface: "ios", usage: "interceptor ios <verb> … (see: interceptor help ios)", summary: "iPhone automation via on-device XCUITest runner over WiFi", returns: "Per-verb: element trees, taps, typing, screenshots, app lifecycle. NOTE: 'ios devices' → connected:false is the normal idle state; the runner auto-connects on the next verb. Keep the phone unlocked & awake." },
+  { name: "ios", surface: "ios", usage: "interceptor ios <verb> … (see: interceptor help ios)", summary: "iPhone automation via on-device XCUITest runner over WiFi", returns: "Per-verb: element trees, taps, typing, screenshots, app lifecycle. NOTE: 'ios devices' → connected:false means the runner is not dialed in; the next drive verb auto-connects ('ios unlock' needs it already connected). Keep the phone unlocked & awake." },
 ]
 
 export function runManifestCommand(argv: string[]): null {
   const surfaces = detectSurfaces(argv)
   const commands = COMMAND_SPECS.filter(c =>
-    c.surface === "browser" || c.surface === "local" ||
+    c.surface === "browser" || c.surface === "local" || c.surface === "desktop" ||
     (c.surface === "macos" && surfaces.macos) || (c.surface === "ios" && surfaces.ios))
   let skills: ReturnType<typeof skillsStatusSummary> | { packDir: null } = { packDir: null }
   try { skills = skillsStatusSummary() } catch {}

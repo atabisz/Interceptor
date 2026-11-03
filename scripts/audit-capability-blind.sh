@@ -21,14 +21,19 @@ note() { printf 'audit: %s\n' "$*"; }
 # every `if` went false, and the gate reported PASSED without inspecting a
 # single file. Fall back to grep so the audit actually runs everywhere.
 if command -v rg >/dev/null 2>&1; then
-  search() { rg -n "$1" "${@:2}" -S 2>/dev/null; }
-  search_glob_no_tests() { rg -n "$1" "${@:2}" --glob '!**/*.test.ts' -S 2>/dev/null; }
+  search() { rg -n "$1" "${@:2}" --glob '!**/graphify-out/**' -S 2>/dev/null; }
+  search_glob_no_tests() {
+    rg -n "$1" "${@:2}" --glob '!**/*.test.ts' --glob '!**/graphify-out/**' -S 2>/dev/null
+  }
 else
   # grep -E is POSIX-portable; smart-case is approximated with -i, and the
-  # test-file exclusion mirrors rg's --glob '!**/*.test.ts'.
-  search() { grep -rEn --binary-files=without-match "$1" "${@:2}" 2>/dev/null; }
+  # exclusions mirror the rg path. graphify-out is generated analysis data,
+  # not source or a shipped capability surface.
+  search() {
+    grep -rEn --binary-files=without-match --exclude-dir=graphify-out "$1" "${@:2}" 2>/dev/null
+  }
   search_glob_no_tests() {
-    grep -rEn --binary-files=without-match --exclude='*.test.ts' "$1" "${@:2}" 2>/dev/null
+    grep -rEn --binary-files=without-match --exclude='*.test.ts' --exclude-dir=graphify-out "$1" "${@:2}" 2>/dev/null
   }
 fi
 
@@ -58,7 +63,9 @@ else
 fi
 
 # 3) The core never network-fetches an extension — discovery is filesystem-only.
-if search_glob_no_tests 'fetch\(|https?://|curl|download' cli daemon shared | grep -i 'extension' 2>/dev/null; then
+#    Match "extension" in the code after `path:line:`, not in the path itself,
+#    so a file named extension-*.ts that links a release page is not a hit.
+if search_glob_no_tests 'fetch\(|https?://|curl|download' cli daemon shared | grep -iE '^[^:]+:[0-9]+:.*extension' 2>/dev/null; then
   note "FAIL: extension-related network fetch found in the core (see above)"
   fail=1
 else

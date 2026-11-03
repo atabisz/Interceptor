@@ -14,6 +14,7 @@
  */
 
 import { existsSync } from "node:fs"
+import { bridgeSocketPathForDetection } from "../../shared/bridge-paths"
 
 export type Surfaces = { browser: true; macos: boolean; ios: boolean }
 
@@ -29,9 +30,11 @@ export function detectSurfaces(argv: string[] = [], env: Record<string, string |
   }
   const full = process.platform === "darwin" &&
     (existsSync(LAUNCH_AGENT_SYSTEM) || existsSync(launchAgentUser()) ||
-     existsSync("/tmp/interceptor-bridge.sock"))
+     existsSync(bridgeSocketPathForDetection(env)))
   return { browser: true, macos: full, ios: full }
 }
 
 export const SURFACE_UPGRADE_HINT =
-  "macos/ios: not available in this install — 'interceptor upgrade --full' adds computer-use mode (macOS only)."
+  process.platform === "darwin"
+    ? "macos/ios: not available in this install. 'interceptor upgrade --full' adds computer-use mode (macOS only)."
+    : "macos/ios commands require macOS. Use 'interceptor desktop' for native commands supported by this host."

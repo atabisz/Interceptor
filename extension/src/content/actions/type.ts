@@ -1,13 +1,20 @@
-import { resolveElement } from "../input-simulation"
+import { resolveElement, staleElementError } from "../input-simulation"
 import { getShadowRoot } from "../element-discovery"
 import { getOrAssignRef } from "../ref-registry"
+import { isSensitive, markSensitive } from "../sensitive"
 
 type Action = { type: string; [key: string]: unknown }
 type ActionResult = { success: boolean; error?: string; warning?: string; data?: unknown }
 
 export async function handleInputText(action: Action): Promise<ActionResult> {
   const el = resolveElement(action.index as number | undefined, action.ref as string | undefined) as HTMLElement | null
-  if (!el) return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` }
+  if (!el) return staleElementError(action, "typed")
+  if (el.tagName === "SELECT") {
+    if (action.sensitive === true) return { success: false, error: "credential delivery requires a text field" }
+    return handleSelectOption({ ...action, value: action.text })
+  }
+  // issue #244: a vault delivery marks the field so the monitor masks its value.
+  if (action.sensitive === true || isSensitive(el)) markSensitive(el)
   el.focus()
   const text = action.text as string
   const tag = el.tagName
@@ -38,6 +45,17 @@ export async function handleInputText(action: Action): Promise<ActionResult> {
     if (action.clear) {
       document.execCommand("selectAll", false)
       document.execCommand("delete", false)
+    } else {
+      // --append: focus() leaves the caret at the start of an editor with no
+      // selection inside it, so the text was prepended.
+      const selection = window.getSelection()
+      if (selection) {
+        const range = document.createRange()
+        range.selectNodeContents(el)
+        range.collapse(false)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
     }
     document.execCommand("insertText", false, text)
     el.dispatchEvent(new Event("input", { bubbles: true }))
@@ -48,7 +66,7 @@ export async function handleInputText(action: Action): Promise<ActionResult> {
   if (shadowRoot) {
     const innerInput = shadowRoot.querySelector("input, textarea, [contenteditable='true']") as HTMLElement | null
     if (innerInput) {
-      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear })
+      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear, sensitive: action.sensitive })
     }
   }
 
@@ -65,17 +83,70 @@ export async function handleInputText(action: Action): Promise<ActionResult> {
   return { success: false, error: `element is <${tag.toLowerCase()}${isContentEditable ? " contenteditable" : ""}> — unsupported input type` }
 }
 
+/**
+ * Submit the form that holds a field, the way the
+ * browser's own Enter would (implicit submission clicks the default button).
+ * A synthetic Enter runs no default action, so it never submits.
+ */
+export async function handleSubmitForm(action: Action): Promise<ActionResult> {
+  const el = resolveElement(action.index as number | undefined, action.ref as string | undefined) as HTMLElement | null
+  if (!el) return staleElementError(action, "submitted")
+  const form = (el as HTMLInputElement).form ?? el.closest("form")
+  if (!form) {
+    return { success: false, error: "this element is not inside a form, so there is nothing to submit; click the page's search or submit button instead (or use --keys Enter --trusted)" }
+  }
+  // Enter clicks the default button: the first submit button in tree order
+  // whose form is this one. form.elements leaves out image buttons, and a
+  // button can sit outside the form through its form attribute.
+  const submitter = Array.from(form.ownerDocument.querySelectorAll("button, input[type=submit], input[type=image]")).find(e =>
+    (e as HTMLButtonElement).form === form && ((e as HTMLButtonElement).type === "submit" || (e as HTMLInputElement).type === "image")
+  ) as HTMLButtonElement | HTMLInputElement | undefined
+  if (submitter?.matches(":disabled")) {
+    return { success: false, error: "the form's submit button is disabled, so Enter would not submit it; read the page for what it is waiting on" }
+  }
+  if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity()) {
+    const invalid = Array.from(form.elements).find(e => (e as HTMLInputElement).validity && !(e as HTMLInputElement).validity.valid) as HTMLInputElement | undefined
+    return { success: false, error: `the form did not pass its own validation${invalid ? `: ${invalid.validationMessage || "a field is invalid"}` : ""}` }
+  }
+  if (submitter) submitter.click()
+  else if (typeof form.requestSubmit === "function") form.requestSubmit()
+  else form.submit()
+  return { success: true, data: { submitted: true, action: form.getAttribute("action") ?? "", method: (form.getAttribute("method") || "get").toLowerCase(), submitter: submitter ? (submitter.value || submitter.textContent || "").trim() : null } }
+}
+
 export async function handleSelectOption(action: Action): Promise<ActionResult> {
   const el = resolveElement(action.index as number | undefined, action.ref as string | undefined) as HTMLSelectElement | null
-  if (!el) return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` }
-  el.value = action.value as string
+  if (!el) return staleElementError(action, "selected")
+  if (el.tagName !== "SELECT") return { success: false, error: "select requires a native <select>; use click/read for a custom dropdown" }
+  if (typeof action.value !== "string") return { success: false, error: "select requires an option value or label" }
+  if (el.matches(":disabled") || el.getAttribute("aria-disabled") === "true") return { success: false, error: "select is disabled" }
+  const options = Array.from(el.options)
+  const exact = options.find(option => option.value === action.value)
+  const labels = exact ? [] : options.filter(option => option.label === action.value)
+  const option = exact || (labels.length === 1 ? labels[0] : undefined)
+  if (!option) return {
+    success: false,
+    error: (labels.length > 1 ? "option label is ambiguous; use its exact value" : "no matching option; use an exact value or unique label") +
+      `. Available options: ${JSON.stringify(options.slice(0, 30).map(o => ({ value: o.value.slice(0, 160), label: o.label.slice(0, 160) })))}${options.length > 30 ? " (first 30)" : ""}`,
+    data: { options: options.slice(0, 30).map(o => ({ value: o.value.slice(0, 160), label: o.label.slice(0, 160), disabled: o.matches(":disabled") })), total: options.length, truncated: options.length > 30 }
+  }
+  if (option.matches(":disabled")) return { success: false, error: "option or its optgroup is disabled" }
+  if (el.selectedOptions.length === 1 && el.selectedOptions[0] === option) {
+    return { success: true, data: { value: option.value, label: option.label, changed: false } }
+  }
+  el.selectedIndex = options.indexOf(option)
+  el.dispatchEvent(new Event("input", { bubbles: true }))
   el.dispatchEvent(new Event("change", { bubbles: true }))
-  return { success: true }
+  await Promise.resolve()
+  if (!el.isConnected || el.selectedOptions.length !== 1 || el.selectedOptions[0] !== option) {
+    return { success: false, error: "page did not retain the selected option; read the dropdown before retrying" }
+  }
+  return { success: true, data: { value: option.value, label: option.label, changed: true } }
 }
 
 export async function handleCheck(action: Action): Promise<ActionResult> {
   const el = resolveElement(action.index as number | undefined, action.ref as string | undefined) as HTMLInputElement | null
-  if (!el) return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` }
+  if (!el) return staleElementError(action, "toggled")
   const target = action.checked !== undefined ? !!(action.checked) : !el.checked
   if (el.checked !== target) {
     el.checked = target

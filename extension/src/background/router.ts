@@ -1,4 +1,4 @@
-import { sendToContentScript } from "./content-bridge"
+import { sendToContentScript, waitStable } from "./content-bridge"
 import { activeTransport } from "./transport"
 import { handleOsInputActions } from "./capabilities/os-input"
 import { handleScreenshotActions } from "./capabilities/screenshot"
@@ -25,6 +25,7 @@ import { handlePassiveNetActions, restorePageCommCaptureConfig } from "./capabil
 import { handleCdpNetworkActions } from "./capabilities/cdp-network-actions"
 import { handleMonitorActions, registerMonitorListeners } from "./capabilities/monitor"
 import { handlePowerIdleActions } from "./keepawake"
+import { registerKeepaliveListeners } from "./tab-keepalive"
 
 // Keep this module import-safe. `transport.ts` imports the message dispatcher,
 // which imports this router, so any top-level browser API call here runs before
@@ -35,11 +36,12 @@ import { handlePowerIdleActions } from "./keepawake"
 export function initializeActionRouter(): void {
   registerMonitorListeners()
   restorePageCommCaptureConfig()
+  registerKeepaliveListeners()
 }
 
-type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
+type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number; warning?: string }
 
-const OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move"])
+const OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move", "os_receipt", "os_detach", "os_return"])
 const SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture", "ocr"])
 const CAPTURE_STREAM_ACTIONS = new Set(["capture_start", "capture_frame", "capture_stop", "canvas_diff"])
 const CANVAS_ACTIONS = new Set([
@@ -53,7 +55,7 @@ const CANVAS_ACTIONS = new Set([
   "canvas_ocr"
 ])
 const TAB_ACTIONS = new Set([
-  "tab_create", "tab_close", "tab_switch", "tab_list", "tab_duplicate",
+  "tab_create", "tab_close", "tab_switch", "tab_keepalive", "tab_list", "tab_duplicate",
   "tab_reload", "tab_mute", "tab_pin", "tab_zoom_get", "tab_zoom_set",
   "tab_group", "tab_ungroup", "tab_move", "tab_discard",
   "group_list", "group_close"
@@ -81,7 +83,7 @@ const EVALUATE_ACTIONS = new Set(["evaluate"])
 const BINARY_SINK_ACTIONS = new Set(["binary_sink_save"])
 const STYLE_ACTIONS = new Set(["style_inject", "style_remove"])
 const FRAME_ACTIONS = new Set(["frames_list", "frames_read_tree", "frames_find"])
-const META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group"])
+const META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group", "context_set"])
 const PASSIVE_NET_ACTIONS = new Set([
   "net_log", "net_clear", "net_headers", "sse_log", "sse_streams", "sse_chunk",
   "set_net_overrides", "clear_net_overrides",
@@ -102,6 +104,9 @@ export async function routeAction(
   tabId: number
 ): Promise<ActionResult> {
   if (OS_INPUT_ACTIONS.has(action.type)) return handleOsInputActions(action, tabId)
+  if (action.type === "wait_stable") {
+    return waitStable(tabId, (action.ms as number) || undefined, (action.timeout as number) || undefined, action.frameId as number | undefined)
+  }
   if (SCREENSHOT_ACTIONS.has(action.type)) return handleScreenshotActions(action, tabId)
   if (CAPTURE_STREAM_ACTIONS.has(action.type)) return handleCaptureStreamActions(action, tabId)
   if (CANVAS_ACTIONS.has(action.type)) return handleCanvasActions(action, tabId)
@@ -170,6 +175,18 @@ export async function routeAction(
             reason: action.os === true ? "scene click requested trusted input" : "no DOM mutation after synthetic click"
           }
         },
+        tabId
+      }
+    }
+    const guardRefused = action.os !== true
+      && !!(typeof osResult.data === "object" && osResult.data && (osResult.data as { hint?: string }).hint)
+    if (guardRefused) {
+      // Only the synthetic layer ran: the foreground guard (issue #166) refused
+      // to fire an OS event at a backgrounded tab. That is a skipped escalation,
+      // not a failed click, so report the synthetic delivery and say so.
+      return {
+        ...contentResult,
+        warning: `${contentResult.warning}; OS-level escalation skipped: ${osResult.error}`,
         tabId
       }
     }

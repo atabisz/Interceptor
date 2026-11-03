@@ -34,6 +34,8 @@ describe("manifest command specs", () => {
   test("no duplicate command names", () => {
     const names = COMMAND_SPECS.map(s => s.name)
     expect(new Set(names).size).toBe(names.length)
+    // MCP puts each manifest name into one argv token; subcommands belong in usage.
+    for (const spec of COMMAND_SPECS.filter(s => s.surface === "browser")) expect(spec.name).not.toMatch(/\s/)
   })
 
   test("browser search semantics cannot drift back to false in-page wording", () => {
@@ -48,7 +50,11 @@ describe("manifest command specs", () => {
 
   test("every spec has a valid surface", () => {
     for (const s of COMMAND_SPECS) {
-      expect(["browser", "macos", "ios", "local"]).toContain(s.surface)
+      expect(["browser", "macos", "desktop", "ios", "local"]).toContain(s.surface)
     }
+    const desktop = COMMAND_SPECS.find(s => s.name === "desktop")!
+    expect(desktop.surface).toBe("desktop")
+    expect(desktop.usage).toBe("interceptor desktop <verb> …")
+    expect(desktop.returns).toContain("permissions, limits and availability")
   })
 })

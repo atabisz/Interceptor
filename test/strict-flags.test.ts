@@ -37,31 +37,56 @@ afterEach(() => {
 })
 
 describe("strict unknown-flag rejection (#212)", () => {
-  test("a typo'd flag exits 1 naming the flag and the command", () => {
-    expect(() => normalizeArgs(["screenshot", "--zzz-nonsense-flag", "foo"])).toThrow("__exit_1")
-    expect(exitCode).toBe(1)
-    expect(errors.join("\n")).toContain("unknown flag '--zzz-nonsense-flag' for 'screenshot'")
+  test("a typo'd flag throws naming the flag and command without exiting its host", () => {
+    expect(() => normalizeArgs(["screenshot", "--zzz-nonsense-flag", "foo"])).toThrow("unknown flag '--zzz-nonsense-flag' for 'screenshot'")
+    expect(exitCode).toBeUndefined()
   })
 
-  test("the issue's sharpest trap: screenshot --out points at --save", () => {
-    expect(() => normalizeArgs(["screenshot", "--out", "/tmp/shot.png"])).toThrow("__exit_1")
-    expect(errors.join("\n")).toContain("'screenshot --save' writes the image to disk")
+  test("the issue's sharpest trap: screenshot --out is a real flag; the rest of the family still points at it", () => {
+    expect(normalizeArgs(["screenshot", "--out", "/tmp/shot.png"])).toEqual(["screenshot", "--out", "/tmp/shot.png"])
+    expect(() => normalizeArgs(["canvas", "--out", "/tmp/shot.png"])).toThrow("'screenshot --out <path>' or '--save' writes an image to disk")
   })
 
   test("--flag=value form validates the name before '='", () => {
-    expect(() => normalizeArgs(["open", "--bogus=1", "https://example.com"])).toThrow("__exit_1")
-    expect(errors.join("\n")).toContain("unknown flag '--bogus=1' for 'open'")
+    expect(() => normalizeArgs(["open", "--bogus=1", "https://example.com"])).toThrow("unknown flag '--bogus=1' for 'open'")
   })
 
   test("a boolean flag given a value is rejected — net log --redact-auth=true must not export unredacted", () => {
-    expect(() => normalizeArgs(["net", "log", "--redact-auth=true"])).toThrow("__exit_1")
-    expect(errors.join("\n")).toContain("flag '--redact-auth' for 'net' does not take a value")
+    expect(() => normalizeArgs(["net", "log", "--redact-auth=true"])).toThrow("flag '--redact-auth' for 'net' does not take a value")
   })
 
   test("global booleans reject values too, and lax mode does not soften it", () => {
     process.env.INTERCEPTOR_LAX_FLAGS = "1"
-    expect(() => normalizeArgs(["open", "--json=1", "https://example.com"])).toThrow("__exit_1")
-    expect(errors.join("\n")).toContain("does not take a value")
+    expect(() => normalizeArgs(["open", "--json=1", "https://example.com"])).toThrow("does not take a value")
+  })
+
+  test("the unreleased --no-group spelling is rejected in favor of --shared-group", () => {
+    expect(() => normalizeArgs(["open", "--no-group", "https://example.com"])).toThrow("unknown flag '--no-group' for 'open'")
+  })
+
+  test("tab new accepts the reuse controls consumed by its shared create parser", () => {
+    expect(normalizeArgs(["tab", "new", "https://example.com", "--reuse"]))
+      .toEqual(["tab", "new", "https://example.com", "--reuse"])
+    expect(normalizeArgs(["tab", "new", "https://example.com", "--no-reuse"]))
+      .toEqual(["tab", "new", "https://example.com", "--no-reuse"])
+    expect(exitCode).toBeUndefined()
+  })
+
+  test("tab new accepts the explicit activation flag consumed by its shared create parser", () => {
+    expect(normalizeArgs(["tab", "new", "https://example.com", "--activate"]))
+      .toEqual(["tab", "new", "https://example.com", "--activate"])
+    expect(exitCode).toBeUndefined()
+  })
+
+  test("tab close and tab switch reject tab-creation flags", () => {
+    for (const args of [
+      ["tab", "close", "123", "--reuse"],
+      ["tab", "close", "123", "--no-reuse"],
+      ["tab", "switch", "123", "--activate"],
+    ]) {
+      errors = []
+      expect(() => normalizeArgs(args)).toThrow("is only valid with 'tab new'")
+    }
   })
 
   test("INTERCEPTOR_LAX_FLAGS=1 downgrades to a warning and keeps going", () => {
@@ -163,17 +188,19 @@ describe("every module-consumed flag is declared (reverse direction)", () => {
 describe("the whole inventory is accepted (table-driven)", () => {
   for (const [cmd, valueFlags] of Object.entries(FLAG_INVENTORY.value)) {
     test(`every declared flag parses for '${cmd}'`, () => {
+      const prefix = cmd === "tab" ? [cmd, "new"] : [cmd]
       for (const flag of valueFlags) {
-        normalizeArgsSplit([cmd, flag, "x"])
+        normalizeArgsSplit([...prefix, flag, "x"])
       }
       for (const flag of FLAG_INVENTORY.boolean[cmd] || []) {
-        normalizeArgsSplit([cmd, flag])
+        // tab flags are per subverb: --off belongs to keepalive, the rest to new.
+        normalizeArgsSplit([...(cmd === "tab" && flag === "--off" ? [cmd, "keepalive"] : prefix), flag])
       }
       for (const flag of FLAG_INVENTORY.globalValue) {
-        normalizeArgsSplit([cmd, flag, "x"])
+        normalizeArgsSplit([...prefix, flag, "x"])
       }
       for (const flag of FLAG_INVENTORY.globalBoolean) {
-        if (flag.startsWith("--")) normalizeArgsSplit([cmd, flag])
+        if (flag.startsWith("--")) normalizeArgsSplit([...prefix, flag])
       }
       expect(exitCode).toBeUndefined()
     })

@@ -11,41 +11,123 @@
  * (tree/click/type/…) and the host-side post-processing (tree formatting, ref
  * registry, sips resize) are identical regardless of channel.
  *
- * Bring-up defaults to the no-Xcode stack: userspace CoreDeviceProxy
- * tunnel + testmanagerd. A legacy Xcode launch path remains as an explicit
- * operator fallback. No signing material is embedded (capability-blind).
+ * Bring-up defaults to Xcode's supported `test-without-building` route. The
+ * userspace CoreDeviceProxy + testmanagerd launcher remains an explicit
+ * diagnostic. No signing material is embedded (capability-blind).
  */
 
 import {
   classifyIosWayIn, describeIosDevice, describeIosWayIn, iosContextId, iosUdidSlug, udidFromContextId,
-  type IosDeviceDescriptor, type IosDeviceState, type IosTunnelState, type IosDeviceKind,
+  type IosDeviceDescriptor, type IosDeviceState, type IosTunnelState, type IosDeviceKind, type IosLaunchedBy,
+  IOS_RUNNER_OPS,
 } from "../../shared/ios-device"
 import { WdaClient } from "./wda-client"
-import { RunnerChannel, type IosDeviceChannel, type RunnerSocket, type RunnerResult } from "./channel"
+import { RunnerChannel, type IosDeviceChannel, type RunnerSocket, type RunnerResult, type GestureFinger } from "./channel"
 import {
   IosRefRegistry, formatWdaTree, findInTree, frameCenter, type WdaSourceNode,
 } from "./tree"
 import {
   detectToolchain, listDeviceApps, listPhysicalDevices, listSimulators,
-  resizePngToBudget, run, runJson, spawnLongLived, killChild,
-  prepareXctestrunWithEnv, stageRunner, findXctestrun, installRunnerApp, isRunnerInstalled,
-  RUNNER_BUNDLE_ID, findRunnerApp, preferNoXcodeIosPath, buildRunnerWithXcode,
+  resizePngToBudget, runAsync, spawnLongLived, killChild,
+  prepareXctestrunWithEnv, stageRunner, findXctestrun, findRunnerApp, inspectRunnerIdentity,
+  installRunnerApp, isRunnerInstalled,
+  RUNNER_BUNDLE_ID, preferNoXcodeIosPath, buildRunnerWithXcode,
 } from "./tools"
 import {
   setAlias, aliasForUdid, resolveUdid, markInstalled, knownInstalledUdids,
-  getAppleAccount, setAppleAccount, clearAppleAccount, installsExpiringBy,
+  getInstalled, getAppleAccount, setAppleAccount, clearAppleAccount, installsExpiringBy,
+  getOrCreateRunnerSecret, hasRunnerSecret, verifyRunnerProof, serverProof, markDeviceStartReady, deviceStartReady,
 } from "./state"
-// Self-service install (pure-Bun, no Xcode). These modules carry real
-// codecs + honest on-device gates; imports are inert until the new verbs run.
 import * as keychain from "./keychain"
-import * as signer from "./signer"
 import * as testmanagerd from "./testmanagerd"
 import { helperAvailable, runRemotectl } from "./tunnel"
 import type { RunnerEnv } from "./tunnel"
-import { networkInterfaces } from "node:os"
+import { resolveRunnerDialBack, runnerDialHint, remoteDialBack, probeDialBack, savedDialBack, classifyDialBackHost, type DialBack } from "./ws-host"
 import net from "node:net"
+import { renameSync, writeFileSync } from "node:fs"
+import { isAbsolute } from "node:path"
 
 export type IosResult = { success: boolean; error?: string; data?: unknown }
+
+/** Daemon-side state of a running (or last) frame stream for one device. */
+export type StreamState = {
+  running: boolean
+  startedAt: number
+  fps: number
+  scale: number
+  quality: number
+  outPath?: string
+  frames: number
+  seq: number
+  lastAt: number
+  last?: Buffer
+  bytes: number
+  width: number
+  height: number
+  writeErrors: number
+  lastWriteError?: string
+  /** Arrival times of the most recent frames, for the received-fps estimate. */
+  arrivals: number[]
+}
+
+export const MAX_GESTURE_FINGERS = 10
+export const MAX_GESTURE_MS = 55_000
+
+/**
+ * Check a gesture request before it reaches the runner. Returns the error text,
+ * or undefined when `fingers` is 1 to 10 arrays of finite {x, y, t} samples with
+ * t non-negative, non-decreasing within a finger, and at most 55,000 ms.
+ */
+export function validateGestureFingers(fingers: unknown): string | undefined {
+  if (!Array.isArray(fingers) || fingers.length === 0) return "ios gesture requires at least one finger"
+  if (fingers.length > MAX_GESTURE_FINGERS) return `ios gesture takes at most ${MAX_GESTURE_FINGERS} fingers`
+  for (let f = 0; f < fingers.length; f++) {
+    const samples = fingers[f]
+    if (!Array.isArray(samples) || samples.length === 0) return `ios gesture: finger ${f + 1} has no samples`
+    let last = -1
+    for (const s of samples) {
+      const { x, y, t } = (s ?? {}) as { x?: unknown; y?: unknown; t?: unknown }
+      if (![x, y, t].every((v) => typeof v === "number" && Number.isFinite(v))) return `ios gesture: finger ${f + 1} has a sample without numeric x, y, t`
+      if ((t as number) < 0) return `ios gesture: finger ${f + 1} has a negative time offset`
+      if ((t as number) < last) return `ios gesture: finger ${f + 1} time offsets must not decrease`
+      last = t as number
+    }
+    if (last > MAX_GESTURE_MS) return `ios gesture: the last offset is at most ${MAX_GESTURE_MS} ms (the gesture deadline is 60 s)`
+  }
+  return undefined
+}
+
+/** Width and height from a JPEG's start-of-frame marker; undefined when it is not a JPEG. */
+export function jpegSize(buf: Buffer): { width: number; height: number } | undefined {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return undefined
+  let pos = 2
+  while (pos + 9 < buf.length) {
+    if (buf[pos] !== 0xff) { pos++; continue }
+    const marker = buf[pos + 1]
+    if (marker === 0xff) { pos++; continue }
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: buf.readUInt16BE(pos + 5), width: buf.readUInt16BE(pos + 7) }
+    }
+    pos += 2 + buf.readUInt16BE(pos + 2)
+  }
+  return undefined
+}
+
+/** Write `data` to `path` so a concurrent reader sees the old file or the new one, never a partial one. */
+export function writeFileAtomic(path: string, data: Buffer): void {
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, data)
+  renameSync(tmp, path)
+}
+
+
+export function parseIosPoint(value: unknown): { x: number; y: number } | undefined {
+  if (typeof value !== "string") return undefined
+  const match = value.match(/^(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$/)
+  if (!match) return undefined
+  const x = Number(match[1]), y = Number(match[2])
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : undefined
+}
 
 /** Re-sign this far ahead of expiry so a phone never goes stale. */
 const REFRESH_LEAD_MS = 24 * 60 * 60 * 1000 // 1 day
@@ -53,6 +135,8 @@ type ManagerDeps = {
   emit: (event: string, data?: Record<string, unknown>) => void
   /** Daemon WS port the on-device runner dials back into. */
   wsPort: number
+  /** Open the daemon's runner-only listener on a non-loopback host a runner dials (the main server binds loopback). */
+  listenRunner?: (host: string) => void
 }
 
 type IosDeviceContext = {
@@ -64,11 +148,72 @@ type IosDeviceContext = {
   procs: Bun.Subprocess[]
   registeredAt: number
   signingExpiresAt?: number
+  /** The dial-back the live runner was launched with; status reports this, not a fresh resolution. */
+  dialBack?: DialBack
+  /** Per-session registration token the live runner dialed in with (re-dials must match). */
+  token?: string
+  /** Set while the runner's socket is closed but its re-dial may still arrive (see handleRunnerClose). */
+  grace?: RunnerGrace
+  /** Frame stream state; kept after stop so the last frame stays readable. */
+  stream?: StreamState
+  /** `device` when the runner was opened on the device (no launch process here). */
+  launchedBy?: IosLaunchedBy
 }
+
+/** The daemon's reply to a registration. `serverProof` lets a device-started runner check it reached this Mac. */
+export type RunnerAck = { ok: boolean; error?: string; contextId?: string; serverProof?: string }
+
+/** What a runner sends when it registers (`{type:"ios", …}`). */
+export type RunnerRegistration = {
+  udid?: string
+  token?: string
+  contextId?: string
+  /**
+   * A device-started runner proves it holds the device secret without
+   * sending it: proof = HMAC-SHA256(secret, "runner|UDID|ts|nonce").
+   */
+  ts?: number
+  nonce?: string
+  proof?: string
+  /** `device` when the runner was opened on the device rather than launched by this Mac. */
+  launchedBy?: string
+  /** The URL the runner dialed. */
+  url?: string
+  /** `simulator` or `device`, reported by the runner build. */
+  kind?: string
+}
+
+/** A closed runner socket being held open for the runner's own re-dial. */
+type RunnerGrace = {
+  token: string
+  timer: ReturnType<typeof setTimeout>
+  /** Resolves true when the runner re-registered, false when the window lapsed or its process died. */
+  settled: Promise<boolean>
+  resolve: (rebound: boolean) => void
+}
+
+/**
+ * How long a closed runner socket is held before the session is torn down. The
+ * on-device runner re-dials up to five times, one second apart, with the same
+ * token; killing xcodebuild on the first close frame forced a fresh XCTest
+ * launch (and its on-device authorization sheet) for every transient drop.
+ */
+export const RUNNER_RECONNECT_GRACE_MS = 10_000
+
+/**
+ * Grace for a runner the device started. Its re-dial backs off to one
+ * try every 30 s, so the window covers a full step before the context is dropped
+ * (the runner's next re-dial then registers a fresh one).
+ */
+export const RUNNER_DEVICE_GRACE_MS = 30_000
+
+const PROOF_REJECTED = "ios runner proof rejected (wrong device secret, a clock more than 2 minutes off, or a replay)"
 
 /** A pending `enable` waiting for its InterceptorRunner to dial back in. */
 type PendingRunner = {
   token: string
+  /** The launch env carried the device secret, so a runner that reports `launchedBy: "mac"` saved it. */
+  savesConnection: boolean
   resolve: (ch: RunnerChannel) => void
   reject: (e: Error) => void
   timer: ReturnType<typeof setTimeout>
@@ -86,6 +231,17 @@ export class IosManager {
   private ensuring = new Map<string, Promise<{ ok: boolean; error?: string; contextId?: string }>>()
   /** Live runner sockets → their channel + udid (for response/close routing). */
   private runnerByWs = new Map<RunnerSocket, { udid: string; channel: RunnerChannel }>()
+  /** How long a launch waits for the runner to dial in. Tests shorten it. */
+  private registerTimeoutMs = 120_000
+  /** How long a closed runner socket is held for its re-dial. Tests shorten it. */
+  private reconnectGraceMs = RUNNER_RECONNECT_GRACE_MS
+  /** Grace for device-started runners. Tests shorten it. */
+  private deviceGraceMs = RUNNER_DEVICE_GRACE_MS
+  /** The Mac's Tailscale URL and its reachability probe. Tests stub both. */
+  private remoteDialBackFor = (): DialBack | undefined => remoteDialBack(this.deps.wsPort)
+  private probeRemote = probeDialBack
+  /** UDID slugs whose device-started runner `ios disable` could not reach; its next registration is told to quit. */
+  private quitRequested = new Set<string>()
 
   private refreshTimer?: ReturnType<typeof setInterval>
 
@@ -95,7 +251,7 @@ export class IosManager {
   }
 
   /**
-   * background refresh. Every 6h, if an Apple-ID account is signed in
+   * background refresh. Every 6h, if an Xcode team is configured
    * and any install is within REFRESH_LEAD_MS of its cert expiry (≤7d free / ~1y
    * paid), re-sign+reinstall+relaunch it. unref'd so it never holds the process.
    */
@@ -130,7 +286,7 @@ export class IosManager {
    * it to a pending `enable`, validates the per-session token, and binds the
    * socket to a RunnerChannel. Returns an ack the daemon sends back.
    */
-  registerRunner(ws: RunnerSocket, msg: { udid?: string; token?: string; contextId?: string }): { ok: boolean; error?: string; contextId?: string } {
+  registerRunner(ws: RunnerSocket, msg: RunnerRegistration): RunnerAck {
     const udid = msg.udid || (msg.contextId ? udidFromContextId(msg.contextId) : undefined)
     if (!udid) return { ok: false, error: "ios runner registration missing udid" }
     // Key by slug (case-insensitive): the runner may report the raw devicectl udid
@@ -138,7 +294,30 @@ export class IosManager {
     // resolve to the same pending entry that awaitRunner registered.
     const key = iosUdidSlug(udid)
     const pending = this.pendingRunners.get(key)
-    if (!pending) return { ok: false, error: `no pending 'ios enable' for udid ${udid}` }
+    if (!pending) {
+      // A live session whose socket just closed: the runner re-dials with the
+      // same token inside the grace window. Rebind its channel instead of
+      // rejecting it as "no pending enable" and letting the session die.
+      const ctx = this.contexts.get(iosContextId(udid))
+      if (ctx?.grace && ctx.channel instanceof RunnerChannel) {
+        // The same runner re-dialing: its launch token, or the device secret when the
+        // device started this session. A device-started runner never takes over a Mac
+        // launch's session; it registers fresh below, replacing it.
+        const byToken = typeof msg.token === "string" && msg.token !== "" && msg.token === ctx.grace.token
+        if (byToken || (ctx.launchedBy === "device" && verifyRunnerProof(udid, msg))) {
+          ctx.channel.rebind(ws)
+          this.runnerByWs.set(ws, { udid, channel: ctx.channel })
+          this.settleGrace(ctx, true)
+          const proof = byToken ? undefined : serverProof(udid, String(msg.nonce))
+          return proof ? { ok: true, contextId: ctx.descriptor.contextId, serverProof: proof } : { ok: true, contextId: ctx.descriptor.contextId }
+        }
+        if (ctx.launchedBy === "device" || msg.launchedBy !== "device") {
+          return { ok: false, error: msg.launchedBy === "device" ? PROOF_REJECTED : "ios runner token mismatch" }
+        }
+      }
+      if (msg.launchedBy === "device") return this.registerDeviceStarted(ws, udid, msg)
+      return { ok: false, error: `no pending 'ios enable' for udid ${udid}` }
+    }
     // A pending runner always carries a per-session token; reject any mismatch
     // outright (a runner dials in over a routable LAN IP, so this is the gate).
     if (msg.token !== pending.token) return { ok: false, error: "ios runner token mismatch" }
@@ -146,8 +325,70 @@ export class IosManager {
     this.runnerByWs.set(ws, { udid, channel })
     clearTimeout(pending.timer)
     this.pendingRunners.delete(key)
+    // Only runners that save the connection report launchedBy; older ones ignore the secret.
+    if (pending.savesConnection && msg.launchedBy === "mac") markDeviceStartReady(udid)
     pending.resolve(channel)
     return { ok: true, contextId: iosContextId(udid) }
+  }
+
+  /**
+   * A runner opened on the device, with no launch from this Mac. It must
+   * present the secret this Mac gave it at an earlier launch. It replaces any
+   * context for the device, because only one runner process can run there.
+   */
+  private registerDeviceStarted(ws: RunnerSocket, udid: string, msg: RunnerRegistration): RunnerAck {
+    if (!hasRunnerSecret(udid)) {
+      return { ok: false, error: `no device secret for ${udid} on this Mac: run any interceptor ios command once while the device is on this Mac's network or USB` }
+    }
+    if (!verifyRunnerProof(udid, msg)) return { ok: false, error: PROOF_REJECTED }
+    const contextId = iosContextId(udid)
+    const ack: RunnerAck = { ok: true, contextId, serverProof: serverProof(udid, String(msg.nonce)) }
+    if (this.quitRequested.delete(iosUdidSlug(udid))) {
+      // `ios disable` ran while this runner was between sockets: accept it only to tell it to stop.
+      const channel = new RunnerChannel(ws)
+      this.runnerByWs.set(ws, { udid, channel })
+      // A microtask, so the quit follows the ack the daemon sends on return.
+      queueMicrotask(() => {
+        void channel.rawOp(IOS_RUNNER_OPS.quit).catch(() => {})
+          .finally(() => { this.runnerByWs.delete(ws); channel.teardown() })
+      })
+      return ack
+    }
+    const prior = this.contexts.get(contextId)
+    if (prior) {
+      // Ending a re-dial window here: callers waiting on it get the new session under the same id.
+      const grace = prior.grace
+      if (grace) { clearTimeout(grace.timer); prior.grace = undefined }
+      this.dropContext(prior, "replaced by a runner opened on the device")
+      grace?.resolve(true)
+    }
+    const kind: IosDeviceKind = msg.kind === "simulator" ? "simulator" : "device"
+    const descriptor = describeIosDevice({ udid, name: aliasForUdid(udid) ?? udid, kind, paired: true, developerMode: true })
+    const channel = new RunnerChannel(ws)
+    const ctx: IosDeviceContext = {
+      descriptor, channel, registry: new IosRefRegistry(), wdaPort: 0, tunnel: "none", procs: [],
+      registeredAt: Date.now(), token: crypto.randomUUID(), launchedBy: "device",
+      dialBack: typeof msg.url === "string" && msg.url ? savedDialBack(msg.url) : undefined,
+    }
+    this.contexts.set(contextId, ctx)
+    this.runnerByWs.set(ws, { udid, channel })
+    // The real name and iOS version, when this Mac can see the device.
+    void this.resolveDescriptor(udid)
+      .then((d) => { if (d && this.contexts.get(contextId) === ctx) ctx.descriptor = d })
+      .catch(() => {})
+    this.deps.emit("ios_enabled", { contextId, udid, kind, transport: "runner", launchedBy: "device" })
+    return ack
+  }
+
+  /** Fail a launch that is still waiting for its runner (the launch process died). */
+  private failPendingRunner(udid: string, err: Error): boolean {
+    const key = iosUdidSlug(udid)
+    const pending = this.pendingRunners.get(key)
+    if (!pending) return false
+    clearTimeout(pending.timer)
+    this.pendingRunners.delete(key)
+    pending.reject(err)
+    return true
   }
 
   /** Route a runner's `{ id, result }` reply to its channel. Returns true if handled. */
@@ -158,24 +399,86 @@ export class IosManager {
     return true
   }
 
-  /** A runner socket closed: tear down its channel and drop the backing context. */
+  /**
+   * A binary message from a registered runner is one JPEG frame of the stream.
+   * Only the newest frame is kept; with `--out` it is also written atomically so
+   * a reader never sees a partial file. Frames that arrive with no stream state
+   * (after stop, or from a runner that never started one) are dropped.
+   */
+  handleRunnerFrame(ws: RunnerSocket, frame: Buffer): boolean {
+    const rec = this.runnerByWs.get(ws)
+    if (!rec) return false
+    const st = this.contexts.get(iosContextId(rec.udid))?.stream
+    // A frame captured before `stop` reached the runner can land after it; the
+    // daemon's count must not move once the caller has been told it stopped.
+    if (!st || !st.running) return true
+    const now = Date.now()
+    st.seq += 1
+    st.frames += 1
+    st.lastAt = now
+    st.last = frame
+    st.bytes = frame.length
+    const size = jpegSize(frame)
+    if (size) { st.width = size.width; st.height = size.height }
+    st.arrivals.push(now)
+    if (st.arrivals.length > 60) st.arrivals.shift()
+    if (st.outPath) {
+      try { writeFileAtomic(st.outPath, frame) }
+      catch (err) { st.writeErrors += 1; st.lastWriteError = (err as Error).message }
+    }
+    return true
+  }
+
+  /**
+   * A runner socket closed. Hold the session for RUNNER_RECONNECT_GRACE_MS so the
+   * runner's own re-dial (same token) can rebind; only a lapsed window or a dead
+   * launch process tears the context down. In-flight ops are failed at once —
+   * their replies died with the socket.
+   */
   handleRunnerClose(ws: RunnerSocket): void {
     const rec = this.runnerByWs.get(ws)
     if (!rec) return
     this.runnerByWs.delete(ws)
-    rec.channel.teardown()
     const ctx = this.contexts.get(iosContextId(rec.udid))
-    if (ctx && ctx.channel === rec.channel) {
-      for (const p of ctx.procs) killChild(p)
-      this.contexts.delete(ctx.descriptor.contextId)
-      testmanagerd.closeRunner(rec.udid)
-      this.deps.emit("ios_disabled", { contextId: ctx.descriptor.contextId, udid: rec.udid, reason: "runner disconnected" })
+    if (!ctx || ctx.channel !== rec.channel) { rec.channel.teardown(); return }
+    if (ctx.grace) return
+    if (!ctx.token || !(ctx.channel instanceof RunnerChannel)) {
+      this.dropContext(ctx, "runner disconnected")
+      return
     }
+    ctx.channel.failInflight("ios runner disconnected (waiting for it to re-dial)")
+    let resolve!: (rebound: boolean) => void
+    const settled = new Promise<boolean>((r) => { resolve = r })
+    const graceMs = ctx.launchedBy === "device" ? this.deviceGraceMs : this.reconnectGraceMs
+    const timer = setTimeout(() => this.settleGrace(ctx, false), graceMs)
+    ctx.grace = { token: ctx.token, timer, settled, resolve }
+    this.deps.emit("ios_reconnecting", { contextId: ctx.descriptor.contextId, udid: rec.udid, graceMs })
   }
 
-  private awaitRunner(udid: string, token: string, timeoutMs: number): Promise<RunnerChannel> {
+  /** End a grace window: keep the session (rebound) or run the old immediate teardown. */
+  private settleGrace(ctx: IosDeviceContext, rebound: boolean): void {
+    const grace = ctx.grace
+    if (!grace) return
+    clearTimeout(grace.timer)
+    ctx.grace = undefined
+    if (!rebound) this.dropContext(ctx, "runner disconnected")
+    grace.resolve(rebound)
+  }
+
+  /** The pre-grace teardown: kill the launch process, forget the context, announce it. */
+  private dropContext(ctx: IosDeviceContext, reason: string): void {
+    if (ctx.channel instanceof RunnerChannel) { try { ctx.channel.teardown() } catch {} }
+    for (const p of ctx.procs) killChild(p)
+    if (this.contexts.get(ctx.descriptor.contextId) === ctx) this.contexts.delete(ctx.descriptor.contextId)
+    testmanagerd.closeRunner(ctx.descriptor.udid)
+    this.deps.emit("ios_disabled", { contextId: ctx.descriptor.contextId, udid: ctx.descriptor.udid, reason })
+  }
+
+  private awaitRunner(udid: string, token: string, timeoutMs: number, savesConnection = false): Promise<RunnerChannel> {
     // Key by slug so registerRunner matches regardless of udid case (see registerRunner).
     const key = iosUdidSlug(udid)
+    // A launch from this Mac replaces whatever runner `ios disable` was waiting to stop.
+    this.quitRequested.delete(key)
     const prior = this.pendingRunners.get(key)
     if (prior) { clearTimeout(prior.timer); prior.reject(new Error("superseded by a newer enable")) }
     return new Promise<RunnerChannel>((resolve, reject) => {
@@ -183,23 +486,39 @@ export class IosManager {
         this.pendingRunners.delete(key)
         reject(new Error(`InterceptorRunner did not register within ${Math.round(timeoutMs / 1000)}s`))
       }, timeoutMs)
-      this.pendingRunners.set(key, { token, resolve, reject, timer })
+      this.pendingRunners.set(key, { token, savesConnection, resolve, reject, timer })
     })
   }
 
-  /** ws://<host>:<port> the on-device runner dials back into. */
-  private daemonWsUrl(kind: IosDeviceKind): string {
-    const override = process.env.INTERCEPTOR_WS_URL
-    if (override) return override
-    const port = this.deps.wsPort
-    if (kind === "simulator") return `ws://127.0.0.1:${port}`
-    // Physical device: it reaches the Mac over the LAN, so it needs a routable IPv4.
-    for (const addrs of Object.values(networkInterfaces())) {
-      for (const ni of addrs ?? []) {
-        if (ni.family === "IPv4" && !ni.internal) return `ws://${ni.address}:${port}`
-      }
-    }
-    return `ws://127.0.0.1:${port}`
+  /**
+   * ws://<host>:<port> the on-device runner dials back into. VPN (CGNAT utun)
+   * first — iOS silently denies a backgrounded runner's first LAN connection
+   * (Local Network privacy) but a VPN address is exempt — then the Mac interface
+   * usbmuxd discovered the phone on (InterfaceIndex), then the phone's IPv4
+   * subnet, then the default route. See ./ws-host.ts.
+   */
+  private async resolveDialBack(kind: IosDeviceKind, udid: string): Promise<DialBack> {
+    const d = await resolveRunnerDialBack(kind, udid, this.deps.wsPort)
+    this.listenOn(d)
+    return d
+  }
+
+  /**
+   * Before launching XCTest: when the runner is handed a LAN or VPN address and
+   * nothing on this Mac answers there, say so now instead of after the launch.
+   * Loopback (simulators) is the main server's own address, and an
+   * INTERCEPTOR_WS_URL override may name a host only the phone can resolve, so
+   * neither is probed.
+   */
+  private async dialBackUnreachable(d: DialBack): Promise<string | undefined> {
+    if (!probedDialBack(d) || await this.probeRemote(d)) return undefined
+    return `this Mac does not answer on ${d.url} (${d.via}), so InterceptorRunner could not connect to it. `
+      + `The daemon could not listen on that address: check that it still belongs to this Mac, and look for a line starting "ios runner listener" in the daemon log.`
+  }
+
+  /** The daemon answers a runner on a LAN or VPN address only through its runner-only listener there. */
+  private listenOn(d: DialBack | undefined): void {
+    if (d && d.via !== "override" && classifyDialBackHost(d.host) !== "loopback") this.deps.listenRunner?.(d.host)
   }
 
   // ── lifecycle dispatch ───────────────────────────────────────────────────────
@@ -213,7 +532,8 @@ export class IosManager {
       case "ios_enable": return this.enable(action)
       case "ios_disable": return this.disable(action)
       case "ios_status": return this.status()
-      // self-service (Apple-ID re-sign, no Xcode)
+      // Xcode is the supported signing route. Login remains as an explicit
+      // early failure so older clients never prompt for a password.
       case "ios_login": return this.login(action)
       case "ios_setup": return this.setup(action)
       case "ios_refresh": return this.refresh(action)
@@ -227,9 +547,23 @@ export class IosManager {
 
   async executeVerb(contextId: string, action: { type: string; [k: string]: unknown }): Promise<IosResult> {
     // Resolve alias/udid/ios: → canonical ios:<udid> (or the single ready device).
-    const canonical = this.canonicalContextId(contextId)
-    if (!canonical) return { success: false, error: this.noDeviceHint() }
+    const canonical = await this.canonicalContextId(contextId)
+    if (!canonical) return { success: false, error: await this.noDeviceHint() }
     let ctx = this.contexts.get(canonical)
+    if (ctx?.grace) {
+      // The runner's socket just closed. Give its re-dial the grace window
+      // instead of sending on a dead socket (60 s op timeout) or launching a
+      // second XCTest session on top of a live one.
+      if (action.type === "ios_unlock") { await ctx.grace.settled; ctx = this.contexts.get(canonical) }
+      else {
+        const ensured = await this.ensureRunner(udidFromContextId(canonical)!)
+        if (!ensured.ok) return { success: false, error: ensured.error }
+        ctx = this.contexts.get(canonical)
+      }
+    }
+    if (!ctx && action.type === "ios_unlock") {
+      return { success: false, error: "ios unlock requires a connected resident runner. It cannot launch a runner on a locked phone. Unlock the phone once, run 'interceptor ios tree' to connect, then retry unlock or --probe while the runner remains resident." }
+    }
     if (!ctx) {
       // Seamless: auto-connect the agent on demand (no manual enable).
       const udid = udidFromContextId(canonical)!
@@ -249,7 +583,11 @@ export class IosManager {
         case "ios_scroll": return await this.verbScroll(ctx, action)
         case "ios_drag": return await this.verbDrag(ctx, action)
         case "ios_press": return await this.verbPress(ctx, action)
+        case "ios_unlock": return await this.verbUnlock(ctx, action)
         case "ios_screenshot": return await this.verbScreenshot(ctx, action)
+        case "ios_stream": return await this.verbStream(ctx, action)
+        case "ios_frame": return this.verbFrame(ctx, action)
+        case "ios_gesture": return await this.verbGesture(ctx, action)
         case "ios_apps": return this.verbApps(ctx)
         case "ios_app": return await this.verbApp(ctx, action)
         case "ios_fgdebug":
@@ -275,12 +613,12 @@ export class IosManager {
 
   // ── discover ─────────────────────────────────────────────────────────────────
 
-  private discover(): IosResult {
-    const tc = detectToolchain()
+  private async discover(): Promise<IosResult> {
+    const tc = await detectToolchain()
     const descriptors: IosDeviceDescriptor[] = []
 
     if (tc.simctl) {
-      for (const sim of listSimulators()) {
+      for (const sim of await listSimulators()) {
         if (sim.isAvailable === false) continue
         descriptors.push(describeIosDevice({
           udid: sim.udid, name: `${sim.name} (Simulator)`, kind: "simulator",
@@ -288,7 +626,7 @@ export class IosManager {
         }))
       }
     }
-    const phys = tc.devicectl ? listPhysicalDevices() : []
+    const phys = tc.devicectl ? await listPhysicalDevices() : []
     const transportByUdid = new Map(phys.map((d) => [d.udid, d.transport]))
     for (const dev of phys) {
       descriptors.push(describeIosDevice({
@@ -326,18 +664,18 @@ export class IosManager {
 
   // ── install / devices / name (seamless surface) ──────────────────────────────
 
-  /** Push the pre-built, pre-signed agent to a device (no build/sign/env). */
+  /** Install an already Xcode-signed staged agent, refusing the unsigned release input. */
   private async install(action: { [k: string]: unknown }): Promise<IosResult> {
     const ref = typeof action.device === "string" ? action.device : typeof action.udid === "string" ? action.udid : undefined
-    const udid = this.pickDeviceUdid(ref)
-    if (!udid) return { success: false, error: this.noDeviceHint() }
-    const descriptor = this.resolveDescriptor(udid)
+    const udid = await this.pickDeviceUdid(ref)
+    if (!udid) return { success: false, error: await this.noDeviceHint() }
+    const descriptor = await this.resolveDescriptor(udid)
     if (!descriptor) return { success: false, error: `device not found — plug the iPhone in, unlock it, and tap "Trust This Computer", then re-run 'interceptor ios install'` }
     if (descriptor.wayIn === "unsupported") return { success: false, error: `'${descriptor.name}' is not ready: ${missingSetup(descriptor)}` }
 
-    const res = await installRunnerApp(udid)
+    const res = await installRunnerApp(udid, getInstalled(udid)?.bundleId, true)
     if (!res.ok) return { success: false, error: res.error }
-    markInstalled(udid)
+    markInstalled(udid, undefined, res.bundleId)
 
     // Bring it up now so the first verb is instant.
     const ensured = await this.ensureRunner(udid)
@@ -354,12 +692,12 @@ export class IosManager {
   }
 
   /** Progressive disclosure: only devices with the agent installed (or connected). */
-  private devices(): IosResult {
-    const phys = listPhysicalDevices()
+  private async devices(): Promise<IosResult> {
+    const phys = await listPhysicalDevices()
     const known = new Set(knownInstalledUdids())
-    const out = phys
-      .filter((d) => known.has(d.udid.toUpperCase()) || isRunnerInstalled(d.udid))
-      .map((d) => ({
+    const installed = []
+    for (const d of phys) if (known.has(d.udid.toUpperCase()) || await isRunnerInstalled(d.udid, this.runnerBundleId(d.udid))) installed.push(d)
+    const out = installed.map((d) => ({
         name: d.name,
         alias: aliasForUdid(d.udid),
         udid: d.udid,
@@ -378,104 +716,58 @@ export class IosManager {
         ...(out.length === 0
           ? { note: "no devices have the Interceptor agent yet — plug your iPhone in (unlocked) and run: interceptor ios install" }
           : anyIdle
-            ? { note: "connected:false is the normal idle state — the on-device runner auto-connects on the next verb (e.g. 'interceptor ios tree --on <name>'). Keep the phone unlocked & awake while driving." }
+            ? { note: "connected:false means the runner is not dialed in — it auto-connects on the next drive verb (e.g. 'interceptor ios tree --on <name>'); 'ios unlock' needs the runner already connected. Keep the phone unlocked & awake while driving." }
             : {}),
       },
     }
   }
 
-  private name(action: { [k: string]: unknown }): IosResult {
+  private async name(action: { [k: string]: unknown }): Promise<IosResult> {
     const ref = typeof action.device === "string" ? action.device : typeof action.udid === "string" ? action.udid : undefined
     const alias = typeof action.alias === "string" ? action.alias : typeof action.name === "string" ? action.name : undefined
     if (!alias) return { success: false, error: "usage: interceptor ios name <device> <alias>" }
-    const udid = this.pickDeviceUdid(ref)
-    if (!udid) return { success: false, error: this.noDeviceHint() }
+    const udid = await this.pickDeviceUdid(ref)
+    if (!udid) return { success: false, error: await this.noDeviceHint() }
     setAlias(alias, udid)
     return { success: true, data: { alias, udid, note: `named — use it: interceptor ios tree --on ${alias}` } }
   }
 
-  // ── self-service install ───────────────────────────────────────────
-
-  /** Store the Apple-ID session token (Keychain) + account metadata. One-time. */
-  private async login(action: { [k: string]: unknown }): Promise<IosResult> {
-    const appleId = typeof action.appleId === "string" ? action.appleId : undefined
-    const password = typeof action.password === "string" ? action.password : undefined
-    const twoFactor = typeof action.code === "string" ? action.code : undefined
-    if (!appleId || !password) return { success: false, error: "usage: interceptor ios login (prompts for Apple ID + password + 2FA)" }
-    let session: signer.AppleSession
-    try { session = await signer.appleLogin(appleId, password, twoFactor) }
-    catch (err) { return { success: false, error: (err as Error).message } }
-    const stored = keychain.storeToken(session.token)
-    if (!stored.ok) return { success: false, error: `could not store token in Keychain: ${stored.error}` }
-    setAppleAccount({ teamId: session.teamId, kind: session.kind })
-    return { success: true, data: { teamId: session.teamId, tier: session.kind, note: "signed in — run: interceptor ios setup" } }
+  /** Old state can only refer to the one historical Interceptor bundle id. */
+  private runnerBundleId(udid: string): string {
+    return getInstalled(udid)?.bundleId ?? RUNNER_BUNDLE_ID
   }
 
-  /**
-   * Idempotent per-device self-service: install → (Dev-Mode prompt) → register +
-   * re-sign with the user's Apple ID → reinstall → (Trust prompt) → launch via our
-   * native stack. Surfaces the exact Apple-mandated next step whenever it stops.
-   */
+  // ── self-service install ───────────────────────────────────────────
+
+  private async login(_action: { [k: string]: unknown }): Promise<IosResult> {
+    return { success: false, error: "ios login is unavailable because no-Xcode Apple-ID signing is not implemented. Use: interceptor ios setup [device]" }
+  }
+
+  /** Build, sign, install, and launch through Xcode's configured developer team. */
   private async setup(action: { [k: string]: unknown }): Promise<IosResult> {
     const ref = typeof action.device === "string" ? action.device : typeof action.udid === "string" ? action.udid : undefined
-    const udid = this.pickDeviceUdid(ref)
+    const udid = await this.pickDeviceUdid(ref)
     if (!udid) {
       return { success: false, error: "no device — plug your iPhone in over USB and tap \"Trust This Computer\" (enter the passcode), then re-run." }
     }
-    const xcodeSetup = await this.setupWithXcode(action, udid)
-    if (xcodeSetup.success || !getAppleAccount() || !keychain.hasToken()) return xcodeSetup
-
-    const account = getAppleAccount()!
-    // register UDID under the user's team + create a get-task-allow cert/profile.
-    let prov: signer.ProvisionResult
-    try {
-      const token = keychain.loadToken()!
-      prov = await signer.provisionForDevice({ token, teamId: account.teamId, kind: account.kind }, udid)
-    } catch (err) { return { success: false, error: (err as Error).message } }
-
-    // re-sign the bundled (unsigned) runner with the user's identity.
-    const staged = stageRunner()
-    if (staged.error || !staged.dir) return { success: false, error: staged.error ?? "the Interceptor agent is not available" }
-    const app = findRunnerApp(staged.dir)
-    if (!app) return { success: false, error: "bundled agent is missing its .app" }
-    try {
-      signer.resignRunnerApp(app, {
-        signingIdentity: prov.signingIdentity,
-        entitlements: { applicationIdentifier: prov.applicationIdentifier, teamId: prov.teamId },
-        profilePath: prov.profilePath,
-      })
-    } catch (err) { return { success: false, error: (err as Error).message } }
-    const installed = await installRunnerApp(udid)
-    if (!installed.ok) return { success: false, error: installed.error ?? "could not install the signed InterceptorRunner" }
-
-    setAppleAccount({ ...account, teamId: prov.teamId, kind: prov.kind, certSha: prov.signingIdentity, profilePath: prov.profilePath, expiresAt: prov.expiresAt })
-    markInstalled(udid, prov.expiresAt)
-
-    // launch via our native (no-Xcode) stack; the runner dials back.
-    const ensured = await this.ensureRunner(udid)
-    const alias = aliasForUdid(udid)
-    return {
-      success: ensured.ok,
-      error: ensured.ok ? undefined : ensured.error,
-      data: ensured.ok ? { udid, tier: prov.kind, expiresAt: prov.expiresAt, note: `ready — drive it: interceptor ios tree --on ${alias ?? udid}` } : undefined,
-    }
+    return this.setupWithXcode(action, udid)
   }
 
   private async setupWithXcode(action: { [k: string]: unknown }, udid: string): Promise<IosResult> {
     const teamId = typeof action.team === "string" ? action.team : undefined
     const projectPath = typeof action.project === "string" ? action.project : undefined
-    let built: ReturnType<typeof buildRunnerWithXcode>
+    let built: Awaited<ReturnType<typeof buildRunnerWithXcode>>
     try {
-      built = buildRunnerWithXcode(udid, { teamId, projectPath })
+      built = await buildRunnerWithXcode(udid, { teamId, projectPath })
     } catch (err) {
       return { success: false, error: (err as Error).message }
     }
 
-    const installed = await installRunnerApp(udid)
+    const installed = await installRunnerApp(udid, built.bundleId, true)
     if (!installed.ok) return { success: false, error: installed.error ?? "could not install the Xcode-built InterceptorRunner" }
 
     setAppleAccount({ teamId: built.teamId, kind: built.kind, profilePath: built.profilePath, expiresAt: built.expiresAt })
-    markInstalled(udid, built.expiresAt)
+    markInstalled(udid, built.expiresAt, installed.bundleId ?? built.bundleId)
 
     const ensured = await this.ensureRunner(udid)
     const alias = aliasForUdid(udid)
@@ -494,16 +786,17 @@ export class IosManager {
 
   /** Force a re-sign+reinstall+relaunch now (also runs on the refresh timer). */
   private async refresh(action: { [k: string]: unknown }): Promise<IosResult> {
+    const team = typeof action.team === "string" ? action.team : getAppleAccount()?.teamId
     const ref = typeof action.device === "string" ? action.device : typeof action.udid === "string" ? action.udid : undefined
     // No device ref → refresh everything that's expiring.
     if (!ref) {
       const due = installsExpiringBy(REFRESH_LEAD_MS)
       if (due.length === 0) return { success: true, data: { note: "nothing to refresh — all installs are current" } }
       const results = [] as Array<{ udid: string; ok: boolean; error?: string }>
-      for (const udid of due) { const r = await this.setup({ udid }); results.push({ udid, ok: r.success, error: r.error }) }
+      for (const udid of due) { const r = await this.setup({ ...action, udid, team }); results.push({ udid, ok: r.success, error: r.error }) }
       return { success: results.every((r) => r.ok), data: { refreshed: results } }
     }
-    return this.setup(action)
+    return this.setup({ ...action, team })
   }
 
   /** Legacy root-helper diagnostic retained only to give operators a clear hint. */
@@ -525,8 +818,8 @@ export class IosManager {
     // Bring up the CoreDeviceProxy utun tunnel (root helper) and verify RSD is
     // reachable over it via plain node:net — the M3 end-to-end proof.
     const ref = typeof action.device === "string" ? action.device : typeof action.udid === "string" ? action.udid : undefined
-    const udid = this.pickDeviceUdid(ref)
-    if (!udid) return { success: false, error: this.noDeviceHint() }
+    const udid = await this.pickDeviceUdid(ref)
+    if (!udid) return { success: false, error: await this.noDeviceHint() }
     const { getTunnel } = await import("./tunnel")
     let tunnel
     try { tunnel = await getTunnel(udid) } catch (e) { return { success: false, error: (e as Error).message } }
@@ -538,40 +831,39 @@ export class IosManager {
     return { success: reachable, data: { tunnel, rsdReachable: reachable, note: reachable ? "tunnel up; RSD reachable over utun" : "tunnel up but RSD TCP connect failed" } }
   }
 
-  /** Drop the stored Apple-ID token + account metadata. Always works (no gate). */
+  /** Remove legacy Apple-ID token data and the stored Xcode-team metadata. */
   private async logout(): Promise<IosResult> {
-    const del = keychain.deleteToken()
+    const del = await keychain.deleteToken()
     clearAppleAccount()
     if (!del.ok) return { success: false, error: `token removed from state, but Keychain delete failed: ${del.error}` }
-    return { success: true, data: { note: "signed out — Apple-ID token removed from the Keychain" } }
+    return { success: true, data: { note: "legacy Apple-ID data and stored Xcode-team metadata removed" } }
   }
 
   /**
    * Launch the runner WITHOUT Xcode: our RemoteXPC tunnel (M3) + DDI (M4) +
    * testmanagerd (M5). Same WS env payload; the runner dials back unchanged.
-   * Default launch route. Set INTERCEPTOR_IOS_USE_XCODE=1 or
-   * INTERCEPTOR_NO_XCODE=0 for the legacy xcodebuild fallback.
+   * Diagnostic launch route. Set INTERCEPTOR_NO_XCODE=1 to exercise it.
    */
   private async launchRunnerNative(
     descriptor: IosDeviceDescriptor,
-  ): Promise<{ ok: true; channel: RunnerChannel; tunnel: IosTunnelState } | { ok: false; error: string }> {
+  ): Promise<{ ok: true; channel: RunnerChannel; tunnel: IosTunnelState; dialBack: DialBack; token: string } | { ok: false; error: string }> {
     const udid = descriptor.udid
     const token = crypto.randomUUID()
-    const env: RunnerEnv = {
-      INTERCEPTOR_WS_URL: this.daemonWsUrl(descriptor.kind), INTERCEPTOR_WS_TOKEN: token,
-      INTERCEPTOR_UDID: udid, INTERCEPTOR_CONTEXT_ID: descriptor.contextId,
-    }
+    const dialBack = await this.resolveDialBack(descriptor.kind, udid)
+    const unreachable = await this.dialBackUnreachable(dialBack)
+    if (unreachable) return { ok: false, error: unreachable }
+    const env: RunnerEnv = this.runnerLaunchEnv(descriptor, dialBack, token)
     try {
       if (descriptor.needsTunnel) {
         // The userspace launcher owns CoreDeviceProxy, RSD, DDI lookup, appservice,
         // and the testmanagerd DTX handshake. No root helper is on the product path.
         this.deps.emit("ios_tunnel_userspace", { udid })
       }
-      await testmanagerd.launchRunner(udid, { bundleId: RUNNER_BUNDLE_ID, env })
-      const channel = await this.awaitRunner(udid, token, 120_000)
-      return { ok: true, channel, tunnel: "native" }
+      await testmanagerd.launchRunner(udid, { bundleId: this.runnerBundleId(udid), env })
+      const channel = await this.awaitRunner(udid, token, this.registerTimeoutMs, Boolean(env.INTERCEPTOR_DEVICE_SECRET))
+      return { ok: true, channel, tunnel: "native", dialBack, token }
     } catch (err) {
-      return { ok: false, error: `${(err as Error).message}` }
+      return { ok: false, error: registrationFailure(err as Error, dialBack) }
     }
   }
 
@@ -580,9 +872,9 @@ export class IosManager {
   private async enable(action: { [k: string]: unknown }): Promise<IosResult> {
     const wdaUrlOverride = typeof action.wdaUrl === "string" && action.wdaUrl ? action.wdaUrl : undefined
     const ref = typeof action.udid === "string" ? action.udid : typeof action.device === "string" ? action.device : undefined
-    const udid = this.pickDeviceUdid(ref)
+    const udid = await this.pickDeviceUdid(ref)
     if (wdaUrlOverride && udid) return this.enableViaWda(udid, wdaUrlOverride, action)
-    if (!udid) return { success: false, error: this.noDeviceHint() }
+    if (!udid) return { success: false, error: await this.noDeviceHint() }
     const ensured = await this.ensureRunner(udid)
     if (!ensured.ok) return { success: false, error: ensured.error }
     const ctx = this.contexts.get(ensured.contextId!)!
@@ -593,7 +885,7 @@ export class IosManager {
   /** Legacy escape hatch: drive an already-running WebDriverAgent over HTTP. */
   private async enableViaWda(udid: string, baseUrl: string, action: { [k: string]: unknown }): Promise<IosResult> {
     const bundleId = typeof action.bundleId === "string" ? action.bundleId : undefined
-    const descriptor = this.resolveDescriptor(udid) ?? describeIosDevice({ udid, name: udid, kind: "device", paired: true, developerMode: true })
+    const descriptor = await this.resolveDescriptor(udid) ?? describeIosDevice({ udid, name: udid, kind: "device", paired: true, developerMode: true })
     const wda = new WdaClient({ baseUrl })
     if (!(await pollHealthy(wda, 30_000))) return { success: false, error: `WebDriverAgent did not become healthy at ${baseUrl} within 30s (--wda-url is the deprecated legacy path).` }
     try { await wda.createSession(bundleId) } catch (err) { return { success: false, error: `WDA session failed: ${(err as Error).message}` } }
@@ -618,32 +910,63 @@ export class IosManager {
 
   private async ensureRunnerInner(udid: string, contextId: string): Promise<{ ok: boolean; error?: string; contextId?: string }> {
     const existing = this.contexts.get(contextId)
-    if (existing) {
+    if (existing?.grace) {
+      // Let the runner's own re-dial win before launching a second session.
+      if (await existing.grace.settled) return { ok: true, contextId }
+    } else if (existing) {
       try { await existing.channel.status(); return { ok: true, contextId } }
       catch { await this.teardownContext(existing); this.contexts.delete(contextId) }
     }
     // Tolerate transient devicectl gaps for a device we've already installed onto:
     // synthesize a descriptor and let the launch surface a real error if it's gone.
-    let descriptor = this.resolveDescriptor(udid)
+    let descriptor = await this.resolveDescriptor(udid)
     if (!descriptor && knownInstalledUdids().includes(udid.toUpperCase())) {
       // Physical-device UDIDs are canonically upper-case; carry that form so a
       // synthesized descriptor still matches devicectl (`ios apps`, install).
       const canonical = udid.toUpperCase()
       descriptor = describeIosDevice({ udid: canonical, name: aliasForUdid(canonical) ?? canonical, kind: "device", paired: true, developerMode: true })
     }
-    if (!descriptor) return { ok: false, error: "device not found — plug it in and unlock it (interceptor ios devices)" }
+    if (!descriptor) return { ok: false, error: this.withDeviceStartHint(udid, "device not found — plug it in and unlock it (interceptor ios devices)") }
     if (descriptor.wayIn === "unsupported") return { ok: false, error: `'${descriptor.name}' is not ready: ${missingSetup(descriptor)}` }
 
     const procs: Bun.Subprocess[] = []
     const brought = await this.launchRunner(descriptor, procs)
-    if (!brought.ok) { for (const p of procs) killChild(p); return { ok: false, error: brought.error } }
+    if (!brought.ok) { for (const p of procs) killChild(p); return { ok: false, error: descriptor.kind === "simulator" ? brought.error : this.withDeviceStartHint(udid, brought.error) } }
     const ctx: IosDeviceContext = {
       descriptor, channel: brought.channel, registry: new IosRefRegistry(),
-      wdaPort: 0, tunnel: brought.tunnel, procs, registeredAt: Date.now(),
+      wdaPort: 0, tunnel: brought.tunnel, procs, registeredAt: Date.now(), dialBack: brought.dialBack,
+      token: brought.token,
     }
     this.contexts.set(contextId, ctx)
     this.deps.emit("ios_enabled", { contextId, udid, kind: descriptor.kind, transport: "runner" })
     return { ok: true, contextId }
+  }
+
+  /**
+   * The test env for a launch from this Mac. Besides the session values,
+   * the runner gets this device's secret and the URLs to try (the launch URL,
+   * then the Mac's Tailscale URL) and saves them, so the device can start it later.
+   */
+  private runnerLaunchEnv(descriptor: IosDeviceDescriptor, dialBack: DialBack, token: string): RunnerEnv {
+    const env: RunnerEnv = {
+      INTERCEPTOR_WS_URL: dialBack.url, INTERCEPTOR_WS_TOKEN: token,
+      INTERCEPTOR_UDID: descriptor.udid, INTERCEPTOR_CONTEXT_ID: descriptor.contextId,
+    }
+    // Only loopback (simulator) and VPN addresses are saved: a LAN address
+    // replayed on someone else's network could reach a stranger.
+    const urls = [...new Set([dialBack, this.remoteDialBackFor()]
+      .filter((d): d is DialBack => Boolean(d) && classifyDialBackHost(d!.host) !== "lan")
+      .map((d) => d.url))]
+    if (urls.length === 0) return env
+    return { ...env, INTERCEPTOR_DEVICE_SECRET: getOrCreateRunnerSecret(descriptor.udid), INTERCEPTOR_WS_URLS: urls.join(",") }
+  }
+
+  /** After a failed launch, point at opening the runner on the device when it can connect that way. */
+  private withDeviceStartHint(udid: string, error: string): string {
+    if (!deviceStartReady(udid)) return error
+    const remote = this.remoteDialBackFor()
+    if (!remote) return error
+    return `${error.replace(/\.+$/, "")}. Away from this Mac's network? Open InterceptorRunner on the device (tap its icon); it connects back over ${remote.url}.`
   }
 
   /**
@@ -653,69 +976,113 @@ export class IosManager {
    */
   private async launchRunner(
     descriptor: IosDeviceDescriptor, procs: Bun.Subprocess[],
-  ): Promise<{ ok: true; channel: RunnerChannel; tunnel: IosTunnelState } | { ok: false; error: string }> {
-    // no-Xcode path (our tunnel + testmanagerd) by default.
+  ): Promise<{ ok: true; channel: RunnerChannel; tunnel: IosTunnelState; dialBack: DialBack; token: string } | { ok: false; error: string }> {
+    // The userspace testmanagerd path is an explicit diagnostic opt-in.
     if (preferNoXcodeIosPath()) return this.launchRunnerNative(descriptor)
 
     const udid = descriptor.udid
     const token = crypto.randomUUID()
-    const wsUrl = this.daemonWsUrl(descriptor.kind)
+    const dialBack = await this.resolveDialBack(descriptor.kind, udid)
 
     const staged = stageRunner()
     if (staged.error || !staged.dir) return { ok: false, error: staged.error ?? "the Interceptor agent is not available" }
+    const app = findRunnerApp(staged.dir)
+    if (!app) return { ok: false, error: "the bundled agent is missing its .app — reinstall Interceptor" }
+    // Validate the signature BEFORE spawning. An unsigned or stale staged runner
+    // (a package upgrade used to restage the unsigned bundled build over the
+    // signed one; a bundled runner that was never set up still is unsigned)
+    // makes xcodebuild exit within seconds; without this check that death only
+    // surfaced two minutes later as a "did not register" network timeout.
+    if (descriptor.kind !== "simulator") {
+      try { inspectRunnerIdentity(app, { expectedBundleId: this.runnerBundleId(udid), udid }) }
+      catch (err) { return { ok: false, error: (err as Error).message } }
+    }
     const xctestrun = findXctestrun(staged.dir)
     if (!xctestrun) return { ok: false, error: "the bundled agent is missing its launch descriptor (.xctestrun) — reinstall Interceptor" }
-    const prepared = prepareXctestrunWithEnv(xctestrun, {
-      INTERCEPTOR_WS_URL: wsUrl, INTERCEPTOR_WS_TOKEN: token,
-      INTERCEPTOR_UDID: udid, INTERCEPTOR_CONTEXT_ID: descriptor.contextId,
-    })
+    const env = this.runnerLaunchEnv(descriptor, dialBack, token)
+    const prepared = prepareXctestrunWithEnv(xctestrun, env as Record<string, string>, this.runnerBundleId(udid))
     if (!prepared) return { ok: false, error: "could not prepare the agent launch descriptor" }
+    // Last check before XCTest starts; signing and staging problems are reported first.
+    const unreachable = await this.dialBackUnreachable(dialBack)
+    if (unreachable) return { ok: false, error: unreachable }
 
-    if (descriptor.kind === "simulator") run("/usr/bin/xcrun", ["simctl", "boot", udid])
+    if (descriptor.kind === "simulator") await runAsync("/usr/bin/xcrun", ["simctl", "boot", udid])
     const destination = descriptor.kind === "simulator" ? `platform=iOS Simulator,id=${udid}` : `id=${udid}`
-    procs.push(spawnLongLived("/usr/bin/xcrun", ["xcodebuild", "test-without-building", "-xctestrun", prepared, "-destination", destination]))
+    const proc = spawnLongLived("/usr/bin/xcrun", ["xcodebuild", "test-without-building", "-xctestrun", prepared, "-destination", destination], undefined, { stderr: "pipe", stdout: "pipe" })
+    procs.push(proc)
+    this.watchLaunchProcess(udid, proc, dialBack)
 
     try {
-      const channel = await this.awaitRunner(udid, token, 120_000)
-      return { ok: true, channel, tunnel: descriptor.needsTunnel ? "xcode" : "none" }
+      const channel = await this.awaitRunner(udid, token, this.registerTimeoutMs, Boolean(env.INTERCEPTOR_DEVICE_SECRET))
+      return { ok: true, channel, tunnel: descriptor.needsTunnel ? "xcode" : "none", dialBack, token }
     } catch (err) {
-      return { ok: false, error: `${(err as Error).message} — confirm the iPhone is unlocked and on the same network as this Mac.` }
+      return { ok: false, error: registrationFailure(err as Error, dialBack) }
     }
+  }
+
+  /**
+   * Report a launch process that dies. Before registration: fail the waiting
+   * launch with the exit code and stderr tail (xcodebuild's real reason) instead
+   * of the registration timeout. During a reconnect grace window: the runner is
+   * gone for good, so end the window without waiting for it to lapse.
+   */
+  private watchLaunchProcess(udid: string, proc: Bun.Subprocess, dialBack?: DialBack): void {
+    const stderr = proc.stderr
+    const tail: Promise<string> = stderr && typeof stderr !== "number"
+      ? new Response(stderr as ReadableStream).text().then((t) => t.trim().split("\n").slice(-6).join("\n")).catch(() => "")
+      : Promise.resolve("")
+    // xcodebuild prints the runner's XCTFail on stdout. Keep only that line: the
+    // stream runs for the whole session and must be drained, never buffered.
+    const stdout = proc.stdout
+    const failure: Promise<string | undefined> = stdout && typeof stdout !== "number"
+      ? lastRunnerFailure(stdout as ReadableStream<Uint8Array>)
+      : Promise.resolve(undefined)
+    void proc.exited.then(async (code) => {
+      const [detail, runnerSaid] = await Promise.all([tail, failure])
+      const err = new Error(launchExitMessage(code, detail, runnerSaid, dialBack))
+      if (this.failPendingRunner(udid, err)) return
+      const ctx = this.contexts.get(iosContextId(udid))
+      if (ctx?.grace && ctx.procs.includes(proc)) this.settleGrace(ctx, false)
+    }).catch(() => {})
   }
 
   // ── device-ref resolution helpers ────────────────────────────────────────────
 
   /** Resolve a user ref (alias|udid|ios:) to a udid; if omitted, the single ready device. */
-  private pickDeviceUdid(ref?: string): string | undefined {
+  private async pickDeviceUdid(ref?: string): Promise<string | undefined> {
     if (ref && ref.trim()) {
       const u = resolveUdid(ref)
       if (u) {
         // exact udid/alias hit; verify it's a real device when discoverable
-        if (this.resolveDescriptor(u)) return u
+        if (await this.resolveDescriptor(u)) return u
         // alias may point at a device that's temporarily offline — still return it
         if (resolveUdid(ref) !== ref.toUpperCase()) return u
         return u
       }
       return undefined
     }
-    const phys = listPhysicalDevices()
+    const phys = await listPhysicalDevices()
     if (phys.length === 1) return phys[0].udid
     const known = new Set(knownInstalledUdids())
-    const installed = phys.filter((d) => known.has(d.udid.toUpperCase()) || isRunnerInstalled(d.udid))
+    const installed = []
+    for (const d of phys) if (known.has(d.udid.toUpperCase()) || await isRunnerInstalled(d.udid, this.runnerBundleId(d.udid))) installed.push(d)
     return installed.length === 1 ? installed[0].udid : undefined
   }
 
-  private canonicalContextId(ref: string | undefined): string | undefined {
+  private async canonicalContextId(ref: string | undefined): Promise<string | undefined> {
     if (ref && ref.trim() && ref !== "undefined") {
       const u = resolveUdid(ref)
       return u ? iosContextId(u) : undefined
     }
-    const u = this.pickDeviceUdid(undefined)
+    // A runner opened on the device away from home is live here even when devicectl cannot see the phone.
+    const only = this.contexts.size === 1 ? [...this.contexts.values()][0] : undefined
+    if (only?.launchedBy === "device") return only.descriptor.contextId
+    const u = await this.pickDeviceUdid(undefined)
     return u ? iosContextId(u) : undefined
   }
 
-  private noDeviceHint(): string {
-    const phys = listPhysicalDevices()
+  private async noDeviceHint(): Promise<string> {
+    const phys = await listPhysicalDevices()
     if (phys.length === 0) return 'no iPhone detected — plug it in, unlock it, and tap "Trust This Computer"'
     return "more than one device — pick one: interceptor ios devices, then add --on <name>"
   }
@@ -726,10 +1093,18 @@ export class IosManager {
     const ref = typeof action.contextId === "string" ? action.contextId
       : typeof action.udid === "string" ? action.udid
         : typeof action.device === "string" ? action.device : undefined
-    const contextId = this.canonicalContextId(ref)
+    const contextId = await this.canonicalContextId(ref)
     if (!contextId) return { success: false, error: "ios disable: specify a device (--on <name>) — see interceptor ios devices" }
     const ctx = this.contexts.get(contextId)
     if (!ctx) return { success: false, error: `ios context '${contextId}' not found` }
+    // A device-started runner re-dials until told to stop. Between sockets (or when
+    // the quit goes unanswered) it hears the quit on its next registration.
+    if (ctx.launchedBy === "device" && ctx.channel instanceof RunnerChannel) {
+      const told = !ctx.grace && await Promise.race([
+        ctx.channel.rawOp(IOS_RUNNER_OPS.quit).then(() => true, () => false), Bun.sleep(2_000).then(() => false),
+      ])
+      if (!told) this.quitRequested.add(iosUdidSlug(ctx.descriptor.udid))
+    }
     await this.teardownContext(ctx)
     this.contexts.delete(contextId)
     this.deps.emit("ios_disabled", { contextId, udid: ctx.descriptor.udid })
@@ -737,6 +1112,8 @@ export class IosManager {
   }
 
   private async teardownContext(ctx: IosDeviceContext): Promise<void> {
+    // An explicit teardown ends any reconnect window without a second announcement.
+    if (ctx.grace) { const g = ctx.grace; ctx.grace = undefined; clearTimeout(g.timer); g.resolve(false) }
     try { await ctx.channel.deleteSession() } catch {}
     // Drop any runner socket mapping for this context.
     for (const [ws, rec] of this.runnerByWs) {
@@ -749,20 +1126,42 @@ export class IosManager {
 
   // ── status ───────────────────────────────────────────────────────────────────
 
-  private status(): IosResult {
-    const data: IosDeviceState[] = [...this.contexts.values()].map((ctx) => ({
-      contextId: ctx.descriptor.contextId,
-      udid: ctx.descriptor.udid,
-      name: ctx.descriptor.name,
-      kind: ctx.descriptor.kind,
-      wayIn: ctx.descriptor.wayIn,
-      productVersion: ctx.descriptor.productVersion,
-      wdaPort: ctx.wdaPort,
-      tunnel: ctx.tunnel,
-      connection: "connected",
-      signingExpiresAt: ctx.signingExpiresAt,
-      registeredAt: ctx.registeredAt,
-    }))
+  private async status(): Promise<IosResult> {
+    const data: IosDeviceState[] = []
+    // The URL a device-started runner uses away from home, and whether this Mac answers on it.
+    const remote = this.remoteDialBackFor()
+    this.listenOn(remote)
+    const remoteFields = remote ? { remoteDialBack: remote.url, remoteReachable: await this.probeRemote(remote) } : {}
+    // Whether this Mac answers on each device's dial-back address (LAN and VPN only).
+    const probed = new Map<string, Promise<boolean>>()
+    const reachable = async (d: DialBack) => {
+      if (!probedDialBack(d)) return {}
+      if (!probed.has(d.url)) probed.set(d.url, this.probeRemote(d))
+      return { dialBackReachable: await probed.get(d.url)! }
+    }
+    for (const ctx of this.contexts.values()) {
+      // A runner keeps the URL it was launched with; re-resolving after a route change would report an address it never had.
+      const dial = ctx.dialBack ?? await this.resolveDialBack(ctx.descriptor.kind, ctx.descriptor.udid)
+      data.push({
+        contextId: ctx.descriptor.contextId,
+        udid: ctx.descriptor.udid,
+        name: ctx.descriptor.name,
+        kind: ctx.descriptor.kind,
+        wayIn: ctx.descriptor.wayIn,
+        productVersion: ctx.descriptor.productVersion,
+        wdaPort: ctx.wdaPort,
+        tunnel: ctx.tunnel,
+        connection: ctx.grace ? "connecting" : "connected",
+        signingExpiresAt: ctx.signingExpiresAt,
+        registeredAt: ctx.registeredAt,
+        dialBack: dial.url,
+        dialBackVia: dial.via,
+        ...await reachable(dial),
+        launchedBy: ctx.launchedBy ?? "mac",
+        deviceStartReady: deviceStartReady(ctx.descriptor.udid),
+        ...remoteFields,
+      })
+    }
     // The runner drops on idle and re-dials per verb, so live contexts alone make
     // status read empty between calls even though the phone is fully driveable.
     // Also surface every device with our agent installed but no live channel as
@@ -772,11 +1171,13 @@ export class IosManager {
       const contextId = iosContextId(udid)
       if (seen.has(contextId)) continue
       seen.add(contextId)
-      const d = this.resolveDescriptor(udid)
+      const d = await this.resolveDescriptor(udid)
         ?? describeIosDevice({ udid, name: aliasForUdid(udid) ?? udid, kind: "device", paired: true, developerMode: true })
+      const dial = await this.resolveDialBack(d.kind, d.udid)
       data.push({
         contextId, udid: d.udid, name: d.name, kind: d.kind, wayIn: d.wayIn,
         productVersion: d.productVersion, tunnel: "none", connection: "disconnected", registeredAt: 0,
+        dialBack: dial.url, dialBackVia: dial.via, ...await reachable(dial), deviceStartReady: deviceStartReady(d.udid), ...remoteFields,
       })
     }
     return { success: true, data }
@@ -841,21 +1242,43 @@ export class IosManager {
       if ("error" in pt) return { success: false, error: `ios type ${pt.error}` }
       await ctx.channel.tap(pt.x, pt.y)
     }
-    await ctx.channel.sendKeys(text)
+    await ctx.channel.sendKeys(text, typeof action.bundleId === "string" ? action.bundleId : undefined)
     return { success: true, data: { typed: text.length } }
   }
 
   private async verbKeys(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
     const text = typeof action.text === "string" ? action.text : typeof action.keys === "string" ? action.keys : undefined
     if (!text) return { success: false, error: "ios keys requires text" }
-    await ctx.channel.sendKeys(text)
+    await ctx.channel.sendKeys(text, typeof action.bundleId === "string" ? action.bundleId : undefined)
     return { success: true, data: { sent: text.length } }
+  }
+
+  /**
+   * issue #244: lock-screen passcode entry. The runner wakes the phone, swipes up,
+   * waits for SpringBoard's "Passcode field", types, and waits for lockstate 0.
+   * `probe` stops before typing and reports what it found.
+   */
+  private async verbUnlock(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
+    if (!(ctx.channel instanceof RunnerChannel)) return { success: false, error: "ios unlock is runner-only" }
+    const probe = action.probe === true
+    const passcode = typeof action.passcode === "string" ? action.passcode : undefined
+    if (!probe && !passcode) return { success: false, error: "ios unlock requires --secret <name> (or --probe)" }
+    const data = await ctx.channel.unlock(passcode, probe)
+    const d = (data ?? {}) as { unlocked?: boolean; passcodeField?: boolean; locked?: boolean }
+    if (!probe && d.unlocked !== true) {
+      return { success: false, error: d.passcodeField === false ? "no passcode field appeared on the lock screen (is the phone locked? is the runner resident?)" : "the phone is still locked after typing the passcode", data }
+    }
+    return { success: true, data }
   }
 
   private async verbScroll(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
     const dir = typeof action.dir === "string" ? action.dir.toLowerCase() : "down"
-    const pt = this.resolvePoint(ctx, action)
-    const center = "error" in pt ? await this.screenCenter(ctx) : pt
+    // Only a scroll that named no origin starts from the screen center. A stale
+    // ref or half a coordinate pair is an error, not a swipe somewhere else.
+    const namedOrigin = action.ref !== undefined || action.x !== undefined || action.y !== undefined
+    const pt = namedOrigin ? this.resolvePoint(ctx, action) : await this.screenCenter(ctx)
+    if ("error" in pt) return { success: false, error: `ios scroll ${pt.error}` }
+    const center = pt
     const delta = 250
     let toX = center.x, toY = center.y
     if (dir === "down") toY = center.y - delta
@@ -863,17 +1286,25 @@ export class IosManager {
     else if (dir === "left") toX = center.x + delta
     else if (dir === "right") toX = center.x - delta
     await ctx.channel.drag(center.x, center.y, toX, toY, 0.4)
-    return { success: true, data: { scrolled: dir } }
+    return { success: true, data: { scrolled: dir, from: center } }
+  }
+
+  /** A drag endpoint: "x,y" is a screen point, anything else is a ref from the last tree. */
+  private resolveEndpoint(ctx: IosDeviceContext, value: string): { x: number; y: number } | undefined {
+    const point = parseIosPoint(value)
+    if (point) return point
+    const el = ctx.registry.resolve(value)
+    return el ? frameCenter(el) : undefined
   }
 
   private async verbDrag(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
-    const fromRef = typeof action.from === "string" ? action.from : undefined
-    const toRef = typeof action.to === "string" ? action.to : undefined
-    if (!fromRef || !toRef) return { success: false, error: "ios drag requires <from> and <to> refs" }
-    const a = ctx.registry.resolve(fromRef)
-    const b = ctx.registry.resolve(toRef)
-    if (!a || !b) return { success: false, error: "stale ref in drag — re-read with 'interceptor ios tree'" }
-    const pa = frameCenter(a), pb = frameCenter(b)
+    const from = typeof action.from === "string" ? action.from : undefined
+    const to = typeof action.to === "string" ? action.to : undefined
+    if (!from || !to) return { success: false, error: "ios drag requires <from> and <to>: each a ref or an x,y coordinate" }
+    const pa = this.resolveEndpoint(ctx, from)
+    const pb = this.resolveEndpoint(ctx, to)
+    const bad = !pa ? from : !pb ? to : undefined
+    if (!pa || !pb) return { success: false, error: `ios drag: '${bad}' is not an x,y coordinate or a live ref; re-read with 'interceptor ios tree'` }
     await ctx.channel.drag(pa.x, pa.y, pb.x, pb.y, typeof action.duration === "number" ? action.duration : 0.6)
     return { success: true, data: { from: pa, to: pb } }
   }
@@ -888,8 +1319,11 @@ export class IosManager {
     }
     const name = map[raw.toLowerCase()]
     if (!name) return { success: false, error: `unknown button '${raw}' (home|lock|volume-up|volume-down)` }
-    await ctx.channel.pressButton(name)
-    return { success: true, data: { pressed: name } }
+    const observed = await ctx.channel.pressButton(name)
+    const detail = observed && typeof observed === "object" ? observed as Record<string, unknown> : {}
+    const data = { pressed: name, ...detail }
+    if (name === "lock" && detail.locked === false) return { success: false, error: "the lock button was delivered but the phone remained unlocked", data }
+    return { success: true, data: name === "lock" && detail.locked !== true ? { ...data, verified: false } : data }
   }
 
   private async verbScreenshot(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
@@ -899,13 +1333,82 @@ export class IosManager {
     return { success: true, data: { dataUrl, format } }
   }
 
-  private verbApps(ctx: IosDeviceContext): IosResult {
+  // ── frame stream + multi-touch (runner-only) ─────────────────────────────────
+
+  private streamSummary(st: StreamState | undefined) {
+    if (!st) return { running: false, frames: 0 }
+    const now = Date.now()
+    const window = st.arrivals.filter((t) => now - t <= 3000)
+    const span = window.length > 1 ? (window[window.length - 1] - window[0]) / 1000 : 0
+    return {
+      running: st.running, frames: st.frames, lastSeq: st.seq,
+      ageMs: st.lastAt ? now - st.lastAt : undefined,
+      receivedFps: span > 0 ? Math.round(((window.length - 1) / span) * 10) / 10 : 0,
+      bytes: st.bytes, width: st.width, height: st.height,
+      // `outPath`, not `out`: the MCP formatter treats an `out` key as a saved artifact
+      // and would return the frame image in place of these numbers.
+      outPath: st.outPath, writeErrors: st.writeErrors, lastWriteError: st.lastWriteError,
+      fps: st.fps, scale: st.scale, quality: st.quality,
+    }
+  }
+
+  private async verbStream(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
+    if (!(ctx.channel instanceof RunnerChannel)) return { success: false, error: "ios stream is runner-only" }
+    const op = typeof action.op === "string" ? action.op : "status"
+    if (op === "start") {
+      const fps = action.fps === undefined ? 10 : Number(action.fps)
+      const scale = action.scale === undefined ? 0.5 : Number(action.scale)
+      const quality = action.quality === undefined ? 0.3 : Number(action.quality)
+      if (!(fps >= 1 && fps <= 30)) return { success: false, error: "ios stream --fps must be 1 to 30" }
+      if (!(scale >= 0.1 && scale <= 1)) return { success: false, error: "ios stream --scale must be 0.1 to 1.0" }
+      if (!(quality >= 0.05 && quality <= 1)) return { success: false, error: "ios stream --quality must be 0.05 to 1.0" }
+      const outPath = typeof action.out === "string" && action.out ? action.out : undefined
+      if (outPath && !isAbsolute(outPath)) return { success: false, error: "ios stream --out must be an absolute path" }
+      const runner = await ctx.channel.stream("start", { fps, scale, quality })
+      ctx.stream = {
+        running: true, startedAt: Date.now(), fps, scale, quality, outPath,
+        frames: 0, seq: ctx.stream?.seq ?? 0, lastAt: 0, bytes: 0, width: 0, height: 0, writeErrors: 0, arrivals: [],
+      }
+      return { success: true, data: { started: true, ...this.streamSummary(ctx.stream), runner } }
+    }
+    if (op === "stop") {
+      const runner = await ctx.channel.stream("stop")
+      if (ctx.stream) ctx.stream.running = false
+      return { success: true, data: { stopped: true, ...this.streamSummary(ctx.stream), runner } }
+    }
+    if (op === "status") {
+      const runner = ctx.stream?.running ? await ctx.channel.stream("status") : undefined
+      return { success: true, data: { ...this.streamSummary(ctx.stream), runner } }
+    }
+    return { success: false, error: `unknown stream op '${op}' (start|stop|status)` }
+  }
+
+  /** The newest frame the stream delivered, written to `out`. No device round trip. */
+  private verbFrame(ctx: IosDeviceContext, action: { [k: string]: unknown }): IosResult {
+    const st = ctx.stream
+    if (!st?.last) return { success: false, error: "no frame received yet: run 'interceptor ios stream start' first" }
+    const out = typeof action.out === "string" ? action.out : ""
+    if (!out || !isAbsolute(out)) return { success: false, error: "ios frame needs an absolute --out path" }
+    try { writeFileAtomic(out, st.last) }
+    catch (err) { return { success: false, error: `ios frame: could not write ${out}: ${(err as Error).message}` } }
+    return { success: true, data: { path: out, seq: st.seq, ageMs: Date.now() - st.lastAt, bytes: st.bytes, width: st.width, height: st.height, running: st.running } }
+  }
+
+  private async verbGesture(ctx: IosDeviceContext, action: { [k: string]: unknown }): Promise<IosResult> {
+    if (!(ctx.channel instanceof RunnerChannel)) return { success: false, error: "ios gesture is runner-only" }
+    const problem = validateGestureFingers(action.fingers)
+    if (problem) return { success: false, error: problem }
+    const data = await ctx.channel.gesture(action.fingers as GestureFinger[])
+    return { success: true, data: (data && typeof data === "object") ? data as Record<string, unknown> : { fingers: (action.fingers as unknown[]).length } }
+  }
+
+  private async verbApps(ctx: IosDeviceContext): Promise<IosResult> {
     if (ctx.descriptor.kind === "device") {
-      const apps = listDeviceApps(ctx.descriptor.udid)
+      const apps = await listDeviceApps(ctx.descriptor.udid)
       if (apps) return { success: true, data: apps }
     } else {
-      const apps = runJson<unknown>("/usr/bin/xcrun", ["simctl", "listapps", ctx.descriptor.udid])
-      if (apps) return { success: true, data: apps }
+      const result = await runAsync("/usr/bin/xcrun", ["simctl", "listapps", ctx.descriptor.udid])
+      try { if (result.ok) return { success: true, data: JSON.parse(result.stdout) } } catch {}
     }
     return { success: false, error: "could not list installed apps (xcrun devicectl/simctl unavailable for this device kind)" }
   }
@@ -934,19 +1437,19 @@ export class IosManager {
     }
   }
 
-  private resolveDescriptor(udid: string): IosDeviceDescriptor | undefined {
+  private async resolveDescriptor(udid: string): Promise<IosDeviceDescriptor | undefined> {
     // Match case-insensitively: an auto-connected device is resolved from its
     // lower-cased context slug, but devicectl/simctl report the canonical udid
     // (upper-case hex for physical devices). Returning the descriptor with the
     // TOOL's udid — not the slug — is what lets devicectl ops (e.g. `ios apps`)
     // match the device; devicectl's --device lookup is case-sensitive.
     const norm = udid.toLowerCase()
-    for (const sim of listSimulators()) {
+    for (const sim of await listSimulators()) {
       if (sim.udid.toLowerCase() === norm) {
         return describeIosDevice({ udid: sim.udid, name: `${sim.name} (Simulator)`, kind: "simulator", productVersion: sim.runtimeVersion })
       }
     }
-    for (const dev of listPhysicalDevices()) {
+    for (const dev of await listPhysicalDevices()) {
       if (dev.udid.toLowerCase() === norm) {
         return describeIosDevice({ udid: dev.udid, name: dev.name, kind: "device", productVersion: dev.productVersion, paired: dev.paired, developerMode: dev.developerMode })
       }
@@ -968,7 +1471,7 @@ export class IosManager {
 
 // ── module helpers ─────────────────────────────────────────────────────────────
 
-function deviceDiscoveryHint(tc: ReturnType<typeof detectToolchain>): string {
+function deviceDiscoveryHint(tc: Awaited<ReturnType<typeof detectToolchain>>): string {
   const parts: string[] = []
   if (!tc.simctl) parts.push("Xcode/simctl not found (no Simulators)")
   if (!tc.devicectl) parts.push("xcrun devicectl not found — install Xcode to see physical devices")
@@ -989,4 +1492,53 @@ async function pollHealthy(channel: IosDeviceChannel, timeoutMs: number): Promis
     await new Promise((r) => setTimeout(r, 500))
   }
   return false
+}
+
+/**
+ * The runner never registered: say which address it was handed and what that
+ * implies. Only a registration timeout gets the dial-back explanation; a failure
+ * before the launch (usbmuxd cannot see the phone, tunnel down, DTX handshake)
+ * passes through unchanged because no runner was ever told to dial anything.
+ */
+/** LAN and VPN dial-backs are served by the runner-only listener and worth probing; loopback and overrides are not. */
+export function probedDialBack(d: DialBack): boolean {
+  return d.via !== "override" && classifyDialBackHost(d.host) !== "loopback"
+}
+
+/** The text after "testRunner] : failed - " in xcodebuild's output: the runner's own XCTFail. */
+export const RUNNER_FAILURE_LINE = /testRunner\] : failed - (.+)$/
+
+/** Drain xcodebuild's stdout line by line and return the last runner failure, if any. */
+export async function lastRunnerFailure(stream: ReadableStream<Uint8Array>): Promise<string | undefined> {
+  let last: string | undefined
+  let rest = ""
+  const decoder = new TextDecoder()
+  try {
+    for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
+      const lines = (rest + decoder.decode(chunk, { stream: true })).split("\n")
+      rest = lines.pop() ?? ""
+      // A device's lines end in \r\n (a simulator's in \n); `.` does not match \r.
+      for (const line of lines) { const m = RUNNER_FAILURE_LINE.exec(line.replace(/\r$/, "")); if (m) last = m[1].trim() }
+      if (rest.length > 65_536) rest = "" // a runaway line without a newline is never a failure line
+    }
+    const m = RUNNER_FAILURE_LINE.exec(rest.replace(/\r$/, ""))
+    if (m) last = m[1].trim()
+  } catch {}
+  return last
+}
+
+/** Why the launch process ended before the runner registered. */
+export function launchExitMessage(code: number | null, stderrTail: string, runnerSaid: string | undefined, dialBack?: DialBack): string {
+  // The hint follows a full stop here, so it starts a sentence.
+  const hint = dialBack ? ` ${runnerDialHint(dialBack).replace(/^./, (c) => c.toUpperCase())}` : ""
+  if (runnerSaid) return `${runnerSaid}.${hint}`
+  if (code === 0 && dialBack) {
+    return `InterceptorRunner started but ended without reaching this Mac at ${dialBack.url} (${dialBack.via}); a runner built before 2.1.6 does not report why. Run 'interceptor ios refresh' for one that does.${hint}`
+  }
+  return `xcodebuild exited with code ${code} before the runner registered${stderrTail ? `:\n${stderrTail}` : ""}`
+}
+
+export function registrationFailure(err: Error, dialBack: DialBack): string {
+  if (!/did not register/.test(err.message)) return err.message
+  return `${err.message} — the runner was told to dial ${dialBack.url} (${dialBack.via}). ${runnerDialHint(dialBack)}`
 }

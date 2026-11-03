@@ -19,7 +19,8 @@ When the default DOM render fails outright on a heavy page, a whole-page `screen
 
 ## Token-cost reality
 
-Screenshots are a **last-resort** read surface. Structured reads (`read`, `text`, `inspect`, `scene text`, `canvas log`, `macos tree`) cost roughly **10× fewer tokens per turn** than pixels, and they survive DOM churn far better. Use a screenshot only when pixels are genuinely the answer:
+Screenshots are a **last-resort** read surface. Structured reads (`read`, `text`, `inspect`, `scene text`, `canvas log`, `macos tree`) cost roughly **10× fewer tokens per turn** than pixels, and they survive DOM churn far better. Use a screenshot only when pixels are genuinely the answer: <!-- os:darwin -->
+Screenshots are a **last-resort** read surface. Structured reads (`read`, `text`, `inspect`, `scene text`, `canvas log`, `desktop tree`) cost roughly **10× fewer tokens per turn** than pixels, and they survive DOM churn far better. Use a screenshot only when pixels are genuinely the answer: <!-- os:win32,linux -->
 - Explicit visual evidence requested (the user said "show me a screenshot")
 - Layout / color / chart issue that cannot be confirmed structurally
 - Specific render artifact must be captured (a font glyph, a CSS bug, a hardware-rendered frame)
@@ -60,14 +61,16 @@ Use `--save` whenever you don't need to re-attach the image immediately.
 - `--format webp` — re-encode at the SW boundary via OffscreenCanvas. ~5–8× smaller than PNG at q=85 with no measurable VLM accuracy loss. Falls back to PNG for archive use cases.
 - `--quality <n>` — encoder quality. Defaults: WebP 85, PNG/JPEG 92.
 - `--save` — write bytes to disk and strip `dataUrl` from the result.
+- `--out <path>` — the same, to the file you name (`.png`, `.jpg`/`.jpeg` or `.webp` picks the format; the folder must exist).
 - `--selector <css>` — capture a single matching element. Off-screen elements supported.
 - `--element <ref>` — capture a refRegistry-tracked element (`e5`, `e2_7`).
 - `--region X,Y,W,H` — capture an arbitrary page rectangle.
 - `--scale <n>` — override pixel ratio. `--target-max-long-edge` wins when both are set.
-- `--pixel` — pixel-true compositor capture via `chrome.tabs.captureVisibleTab`. Requires the browser window visible and focused. Use only when DOM-render fidelity is insufficient (compositor effects, hardware video frames, the browser chrome itself).
+- `--pixel` — pixel-true compositor capture via `chrome.tabs.captureVisibleTab`. The tab's window must be on screen (not minimized, not parked on another Space). A fully covered Brave window captured correctly; Chrome can pause a window that is completely covered and return a stale frame. The browser does not need to be the focused app, and the capture switches the window's active tab to the target and back by itself. Do not `tab switch` or `window focus` for it. Use only when DOM-render fidelity is insufficient (compositor effects, hardware video frames, the browser chrome itself).
 - `--pixel --full` — scroll-and-stitch full page. Throttled to clear Chrome's 2/sec `captureVisibleTab` quota; expect ~1.1s per viewport strip.
 
-Default DOM-render works from a backgrounded Chrome on a different macOS Space — no focus required.
+Default DOM-render works from a backgrounded Chrome on a different macOS Space — no focus required. <!-- os:darwin -->
+Default DOM-render works from a background tab, with no focus required. <!-- os:win32,linux -->
 
 ## Quick decision rules
 

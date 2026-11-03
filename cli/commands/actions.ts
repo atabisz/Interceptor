@@ -80,7 +80,41 @@ export function parseActionsCommand(filtered: string[], positionalCount?: number
       // callers (tests) that don't pass the boundary working.
       const textArgs = positionalCount !== undefined
         ? filtered.slice(2, positionalCount + 1)
-        : filtered.slice(2).filter(a => a !== "--append" && !TRUSTED_FLAG_VALUES.includes(a))
+        : filtered.slice(2).filter(a => a !== "--append" && a !== "--user" && !TRUSTED_FLAG_VALUES.includes(a) && a !== "--secret" && a !== "--browser-login" && a !== "--browser" && filtered[filtered.indexOf(a) - 1] !== "--secret" && filtered[filtered.indexOf(a) - 1] !== "--browser-login" && filtered[filtered.indexOf(a) - 1] !== "--browser")
+      // issue #244: `--secret <name>` types a vault value by name. The daemon
+      // resolves it after logging and checks the page host against the
+      // secret's allowlist; the CLI process never holds the value.
+      const secretIdx = filtered.indexOf("--secret")
+      if (secretIdx !== -1) {
+        const secretName = filtered[secretIdx + 1]
+        if (!secretName || secretName.startsWith("--")) { console.error("error: --secret requires a secret name"); process.exit(1) }
+        if (textArgs.join("").length) { console.error("error: --secret and literal text are mutually exclusive"); process.exit(1) }
+        if (useOs) return { type: "os_type", ...target, secret: secretName }
+        if (target.semantic) return { type: "find_and_type", name: target.semantic.name, role: target.semantic.role, secret: secretName, clear: !append }
+        return { type: "input_text", ...target, secret: secretName, clear: !append }
+      }
+      // issue #248: `--browser-login <host>` fills a field from a Chromium
+      // browser's own saved logins for the current page. `--user` picks the
+      // username, else the password. `--browser <key>` restricts to one browser
+      // (chrome|brave|vivaldi|edge|chromium|arc); default searches all installed.
+      // The daemon reads and decrypts the credential, verifies the requested
+      // host matches the live page host, and delivers the value by the same
+      // leak-proof legs as --secret; the CLI never holds it.
+      const browserLoginIdx = filtered.indexOf("--browser-login")
+      if (browserLoginIdx !== -1) {
+        const host = filtered[browserLoginIdx + 1]
+        if (!host || host.startsWith("--")) { console.error("error: --browser-login requires a host (e.g. --browser-login my.functionhealth.com)"); process.exit(1) }
+        if (secretIdx !== -1) { console.error("error: --browser-login and --secret are mutually exclusive"); process.exit(1) }
+        if (textArgs.join("").length) { console.error("error: --browser-login and literal text are mutually exclusive"); process.exit(1) }
+        const field = filtered.includes("--user") ? "user" : "pass"
+        const browserIdx = filtered.indexOf("--browser")
+        const browserKey = browserIdx !== -1 ? filtered[browserIdx + 1] : undefined
+        if (browserIdx !== -1 && (!browserKey || browserKey.startsWith("--"))) { console.error("error: --browser requires a value (chrome|brave|vivaldi|edge|chromium|arc)"); process.exit(1) }
+        const browserLogin: { host: string; field: string; browser?: string } = browserKey ? { host, field, browser: browserKey } : { host, field }
+        if (useOs) return { type: "os_type", ...target, browserLogin }
+        if (target.semantic) return { type: "find_and_type", name: target.semantic.name, role: target.semantic.role, browserLogin, clear: !append }
+        return { type: "input_text", ...target, browserLogin, clear: !append }
+      }
       if (useOs) {
         return { type: "os_type", ...target, text: textArgs.join(" ") }
       } else if (target.semantic) {
@@ -179,8 +213,13 @@ export function parseActionsCommand(filtered: string[], positionalCount?: number
       return { type: "rightclick", ...parseElementTarget(filtered[1]), ...parseAt(filtered) }
     }
 
-    case "check":
-      return { type: "check", ...parseElementTarget(filtered[1]), checked: filtered[2] !== "false" }
+    case "check": {
+      const target = parseElementTarget(filtered[1])
+      const checked = filtered[2] !== "false"
+      // A role:name target resolves in the page, the way click and type already do.
+      if (target.semantic) return { type: "find_and_check", name: target.semantic.name, role: target.semantic.role, checked }
+      return { type: "check", ...target, checked }
+    }
 
     case "keys": {
       if (hasTrustedFlag(filtered)) {

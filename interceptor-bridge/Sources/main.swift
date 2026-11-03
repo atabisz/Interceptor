@@ -3,8 +3,16 @@ import Network
 import AppKit
 import Sparkle
 
+// One-shot OCR child (VisionDomain.recognizeOutOfProcess). It must not take the bridge's locks or start the app.
+if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--vision-text-helper" { VisionDomain.textHelperMain() }
+
+// Keep this descriptor open for the process lifetime. A Sparkle relaunch or
+// direct launch must not overwrite the supervised bridge's PID or socket.
+guard let bridgeInstanceLockFD = Platform.acquireLifecycleLock(path: Platform.bridgeInstanceLockPath, timeout: 0) else {
+    Platform.log("another bridge owns the instance lock, or the lock is unavailable; exiting")
+    exit(1)
+}
 Platform.log("interceptor-bridge starting")
-Platform.cleanupSocket()
 // Lifecycle lock: held from pid publication through the socket bind (released
 // after `transport.start()` below) so an exiting older instance's cleanup can
 // never interleave with this instance taking ownership of the files.
@@ -18,6 +26,7 @@ guard let lifecycleLockFD = Platform.acquireLifecycleLock(timeout: 5.0) else {
 Platform.writePID()
 
 let router = Router()
+router.register("desktop", handler: DesktopDomain(router: router))
 
 // expose the router to AppIntents perform() callbacks so declared
 // intents can dispatch into the same domain handlers the CLI uses.
@@ -28,6 +37,7 @@ let accessibilityDomain = AccessibilityDomain()
 let appsDomain = AppsDomain()
 let inputDomain = InputDomain()
 let captureDomain = CaptureDomain()
+let cameraDomain = CameraDomain()
 let speechDomain = SpeechDomain()
 let soundDomain = SoundDomain()
 let visionDomain = VisionDomain()
@@ -40,7 +50,7 @@ let notificationsDomain = NotificationsDomain()
 let clipboardDomain = ClipboardDomain()
 let displayDomain = DisplayDomain()
 let audioDomain = AudioDomain()
-let streamDomain = StreamDomain()
+let streamDomain = StreamDomain(router: router)
 let monitorDomain = MonitorDomain()
 let trustDomain = TrustDomain()
 let tccDomain = TccDomain()
@@ -74,6 +84,10 @@ let detectDomain = DetectDomain()
 let translateDomain = TranslateDomain()
 let thumbnailDomain = ThumbnailDomain()
 let authDomain = AuthDomain()
+// issue #244: the secret vault's native pieces (registration box + data
+// protection keychain) and the administrator-prompt filler.
+let secretsDomain = SecretsDomain()
+let authDialogDomain = AuthDialogDomain()
 let calendarDomain = CalendarDomain()
 let remindersDomain = RemindersDomain()
 let contactsDomain = ContactsDomain()
@@ -101,8 +115,10 @@ router.register("type", handler: inputDomain)
 router.register("keys", handler: inputDomain)
 router.register("scroll", handler: inputDomain)
 router.register("drag", handler: inputDomain)
+router.register(InputDomain.browserDomainKey, handler: inputDomain)
 router.register("screenshot", handler: captureDomain)
 router.register("capture", handler: captureDomain)
+router.register("camera", handler: cameraDomain)
 router.register("listen", handler: speechDomain)
 router.register("vad", handler: speechDomain)
 router.register("sounds", handler: soundDomain)
@@ -144,6 +160,8 @@ router.register("detect", handler: detectDomain)
 router.register("translate", handler: translateDomain)
 router.register("thumbnail", handler: thumbnailDomain)
 router.register("auth", handler: authDomain)
+router.register("secrets", handler: secretsDomain)
+router.register("authdialog", handler: authDialogDomain)
 router.register("calendar", handler: calendarDomain)
 router.register("reminders", handler: remindersDomain)
 router.register("contacts", handler: contactsDomain)
@@ -203,6 +221,7 @@ signal(SIGTERM) { _ in
 // resident on the main run loop instead.
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory) // No dock icon, no menu bar
+notificationsDomain.startNativeResponseObservation()
 
 // Install an NSApplicationDelegate so AppKit's default Apple-Event
 // handling routes Sparkle's `kAEQuitApplication` (sent at stage 2 of an
@@ -224,7 +243,8 @@ app.delegate = bridgeAppDelegate
 // SparkleUserDriverDelegate.swift for the full rationale and the gentle-
 // reminders contract. Held strongly here so it lives the lifetime of the
 // process — Sparkle weakly references its delegate.
-let sparkleUpdaterDelegate = SparkleUpdaterDelegate()
+let sparkleUpdateState = SparkleUpdateState()
+let sparkleUpdaterDelegate = SparkleUpdaterDelegate(updateState: sparkleUpdateState)
 let sparkleUserDriverDelegate = SparkleUserDriverDelegate()
 let updaterController = SPUStandardUpdaterController(
     startingUpdater: true,
@@ -236,7 +256,7 @@ let updaterController = SPUStandardUpdaterController(
 // can drive a user-initiated update check directly. Useful both for agents
 // and for verifying the activation-policy dialog path (since automatic
 // checks for LSUIElement apps may silently download rather than surface).
-let updateDomain = UpdateDomain(updaterController: updaterController)
+let updateDomain = UpdateDomain(updaterController: updaterController, updateState: sparkleUpdateState)
 router.register("update", handler: updateDomain)
 Platform.log("sparkle updater started; feed: \(updaterController.updater.feedURL?.absoluteString ?? "unset")")
 

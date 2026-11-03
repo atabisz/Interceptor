@@ -15,6 +15,9 @@ agent use. No HTTP server, no CocoaHTTPServer, no usbmux port-forward.
 - A single never-ending UI test (`InterceptorRunnerUITests.testRunner`) keeps the
   XCUITest/`testmanagerd` session alive (the same trick WDA uses) while a
   `URLSessionWebSocketTask` connects to the daemon and dispatches verbs.
+- The daemon retains the `xcodebuild` process and WebSocket channel after
+  registration. The runner has no 30-second lease; later verbs reuse it until
+  the socket closes or the device is disabled.
 - **Capability-blind:** this directory contains **source only** — no signing
   identity, team, or provisioning. You sign it with your own Apple Developer team,
   exactly as you would WebDriverAgent.
@@ -27,9 +30,35 @@ agent use. No HTTP server, no CocoaHTTPServer, no usbmux port-forward.
 | `INTERCEPTOR_WS_TOKEN` | per-session (or shared) pairing token |
 | `INTERCEPTOR_UDID` | this device's udid |
 | `INTERCEPTOR_CONTEXT_ID` | `ios:<udid>` |
+| `INTERCEPTOR_DEVICE_SECRET` | this device's secret; the runner saves it so it can register when opened on the device |
+| `INTERCEPTOR_WS_URLS` | comma-separated loopback or Tailscale URLs the runner saves for that case |
 
 The daemon injects these into the `.xctestrun` at launch (the only point env
 reaches an on-device test process).
+
+To pin the dial-back URL, set `INTERCEPTOR_WS_URL` in the daemon's environment
+before it starts. For a phone with an on-device loopback relay forwarding to
+the Mac, use `INTERCEPTOR_WS_URL=ws://127.0.0.1:19300`. The daemon uses this
+value instead of its automatic LAN/VPN address at every runner launch;
+`interceptor ios status` reports `dialBackVia: override`. Setting it only on a
+later `interceptor ios` CLI invocation does not change the running daemon.
+
+## Opened on the device
+
+When the runner is opened on the device (a tap on its icon) the environment is
+empty, so it uses the connection it saved at its last launch from the Mac
+(`Application Support/interceptor-connection.json`). It registers with a proof of
+the device secret, waits for the Mac's proof, presses Home, and keeps re-dialing
+(back-off up to 30 s) until the daemon sends `quit`. With no saved connection the
+test fails with a message that says to run one `interceptor ios` command while the
+device is on the Mac's network.
+
+Two details make that start work on a device. `interceptor ios setup` / `refresh`
+remove the XCTest frameworks Xcode embeds in the runner app and re-sign it, so
+the runner loads the copy in the device's developer disk image (Xcode's copy
+cannot reach a newer device's testmanagerd). And with no Mac launch environment
+the runner suspends itself once it is active and unlocked, before setUp
+(`ICEarlyBackground` in `ObjCSupport.m`), which XCTest requires on a device.
 
 ## Generate the Xcode project
 
@@ -41,26 +70,25 @@ xcodegen generate              # writes InterceptorRunner.xcodeproj
 
 ## Build + run
 
-**No-Xcode product path (recommended)** — the daemon uses the local Apple
-toolchain to build/sign the runner for your team, uploads the `.app` over AFC,
-installs/upgrades it with `installation_proxy`, then starts the XCUITest session
-through the userspace CoreDeviceProxy/testmanagerd route. Xcode does not launch
-the test:
+**Supported product path**: configure an Apple Developer team in Xcode, then let
+Interceptor build, validate, install, and launch the device-specific runner:
 
 ```bash
-export INTERCEPTOR_RUNNER_PROJECT="$PWD/InterceptorRunner.xcodeproj"
-export DEVELOPMENT_TEAM=<YOUR_TEAM_ID>     # automatic signing
-interceptor ios enable <UDID> --yes
+interceptor ios setup <UDID> --team <YOUR_TEAM_ID>
 ```
+
+Xcode owns automatic signing, device registration, provisioning, the iOS 17+
+tunnel, and the `test-without-building` session. The installed bundle ID is
+derived from the selected team and recorded for later launches.
 
 The first install signed by a given Apple Development certificate may require
 one on-device trust action before iOS will launch it: unlock the phone and go to
 Settings → General → VPN & Device Management → Developer App → Trust. Interceptor
 cannot bypass that device-local security decision.
 
-**Prebuilt (faster re-enables)** — build once and point the daemon at the build
-products directory. The daemon still owns install/launch and injects the
-WebSocket environment at testmanagerd launch time:
+**Prebuilt development override**: build a signed runner and point the daemon at
+the build products directory. The daemon still owns launch and injects the
+WebSocket environment into the `.xctestrun`:
 
 ```bash
 xcrun xcodebuild build-for-testing \
@@ -71,26 +99,33 @@ export INTERCEPTOR_RUNNER_DIR="/tmp/runner-dd/Build/Products/Debug-iphoneos"
 interceptor ios enable <UDID> --yes
 ```
 
-**Manual diagnostic** — set `INTERCEPTOR_IOS_USE_XCODE=1` to force the legacy
-`xcodebuild test-without-building` path. Use this only to separate Apple
-signing/provisioning issues from Interceptor launch issues; it is not the
-production route.
+**Manual diagnostic**: Xcode's `test-without-building` path is the default.
+Set `INTERCEPTOR_NO_XCODE=1` only to exercise Interceptor's experimental
+userspace CoreDeviceProxy/testmanagerd launcher.
 
 ## No cable
 
 Pair the device over WiFi (Xcode → device → *Connect via network*, or
 `xcrun devicectl`), then unplug. The runner reaches the daemon over the LAN and
-the daemon launches the test over the paired device through CoreDeviceProxy —
+the daemon launches the test over the paired device through Xcode/CoreDevice.
 **the Mac just has to stay on the same network** because it owns the
 `testmanagerd` session for the test's lifetime.
 
 ## Verb protocol (daemon ⇄ runner)
 
 ```
-daemon → runner : { id, op, ...args }     op ∈ source|screenshot|windowSize|tap|drag|keys|press|app|ping
+daemon → runner : { id, op, ...args }     op ∈ source|screenshot|windowSize|tap|drag|keys|press|app|ping|gesture|stream
 runner → daemon : { id, result: { success, data?, error? } }
 register        : { type:"ios", udid, token, contextId }   (runner → daemon, once)
 ```
 
+While `stream` is running the runner also sends **binary** messages: each one is a
+whole JPEG frame (no header), which the daemon keeps as the newest frame for the
+device. `gesture` plays one private `XCSynthesizedEventRecord` with one pointer
+path per finger (`ObjCSupport.m`, `ICSynthesizeGesture`); a missing private
+selector comes back as an error naming it.
+
 `tree`/`find`/`inspect` **auto-target the foreground app** (resolved via the private
-XCTest AX client in `ObjCSupport.m`). `app activate <bundleId>` pins a specific app if needed.
+XCTest AX client in `ObjCSupport.m`). `type`/`keys` use the same default target,
+including after a runner process restart. `app activate <bundleId>` or
+`type`/`keys --bundle <bundleId>` pins a specific app if needed.

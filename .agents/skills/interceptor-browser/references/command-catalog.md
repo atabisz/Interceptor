@@ -28,7 +28,7 @@ interceptor websearch "<query>" --activate          # Explicitly foreground the 
 interceptor websearch "<query>" --no-wait           # Return after provider dispatch
 ```
 
-In a **named group** (`--group <label>`), `open` reuses that group's most-recent tab **by default** (address-bar semantics; policy set in the extension popup) — pass `--no-reuse` to keep the current page and open another. Ungrouped `open` and `tab new` always create; `--reuse` opts in per call. Reading strategy: start with `read`/`open`, not a screenshot. Re-read after every mutating action.
+In a **named group**, including an automatic session group, `open` reuses that group's most-recent tab **by default** (address-bar semantics; policy set in the extension popup) — pass `--no-reuse` to keep the current page and open another. Shared-default `open` and `tab new` create by default; `--reuse` opts in per call. Reading strategy: start with `read`/`open`, not a screenshot. Re-read after every mutating action.
 
 **`--markdown` is a SWAP for `--text-only`, not an extra command.** It renders the same content with structure preserved (`<strong>` → `**bold**`, `<h1-6>` → `#`/`##`/..., lists, tables). Use it *instead of* plain `--text-only` when the task asks for the "exact text" / "exact summary" of a section, or the page has visually emphasized text near plain descriptive copy — markdown lets you tell the real answer from decoy or instructional prose. **Never run both modes** — pick one and commit. Skip markdown for raw fact lookups (single date, name, number) where flat text is enough.
 
@@ -42,14 +42,18 @@ interceptor find "Submit" --elements-only          # Accessible controls + actio
 interceptor read --include-frames                   # Populate child-frame element refs
 interceptor find "privacy" --include-frames        # Frame IDs + framed refs such as e2_7
 
-interceptor act e7                                 # Click + read after
+interceptor act e7                                 # Click + read after; '--- changes ---' lists text and elements that changed
 interceptor act e9 "example user"                  # Type into field
-interceptor act e11 --keys "Enter"
-interceptor act e15 --trusted                      # HID-sourced click; page sees isTrusted: true. ESCALATION ONLY.
+interceptor act e9 "turing award" --submit         # Type, then submit the field's form (a synthetic Enter never submits)
+interceptor act e11 --keys "Escape"                # Focus e11, then send the key
+interceptor act '[e7]'                             # A ref copied with its brackets works (quote it in zsh)
+interceptor act e15 --trusted                      # HID-sourced click; page sees isTrusted: true. ESCALATION ONLY. <!-- os:darwin -->
 interceptor act e20 --no-read
+# act takes the ref directly (act e5, never act click e5). A timeout or closed channel after dispatch
+# is reported as unverified delivery: read the target before retrying so you do not click twice.
 ```
 
-**After `act --trusted` reports success, read the page once and commit.** Do not re-execute the same click via a different surface (`interceptor macos click ...`, manual coordinates, etc.) to "verify" — the page's own state is the verification, and the trusted event is the same trusted event regardless of which surface posted it. Escalating to a different surface to redo a successful browser action is the most common way to blow the command budget. `interceptor macos` remains the right surface for native-app tasks; this rule only constrains within-task redo behavior on the browser.
+**After `act --trusted` reports success, read the page once and commit.** Do not re-execute the same click via a different surface (`interceptor macos click ...`, manual coordinates, etc.) to "verify" — the page's own state is the verification, and the trusted event is the same trusted event regardless of which surface posted it. Escalating to a different surface to redo a successful browser action is the most common way to blow the command budget. `interceptor macos` remains the right surface for native-app tasks; this rule only constrains within-task redo behavior on the browser. <!-- os:darwin -->
 
 Unqualified `find` returns two typed current-page sections: literal case-insensitive matches from the complete `document.body.innerText` snapshot, and semantic accessible-element matches. It does not navigate, scroll, focus, or highlight. `--limit` caps returned matches per category while preserving total counts. Low-level actions when `act` is not enough:
 
@@ -57,12 +61,18 @@ Unqualified `find` returns two typed current-page sections: literal case-insensi
 interceptor click e7
 interceptor click --selector "button span" --nth 4   # CSS-selector click; 0-based --nth matches query output; quote selectors with spaces
 interceptor type e9 "..."
-interceptor keys "Meta+K"
-interceptor select e12 "Option label"
+interceptor keys "Meta+K"               # Events carry legacy keyCode/which/charCode; Enter is 13, Shift+a arrives as A
+interceptor select e12 "Option label"   # native select: exact value first, then one exact label
 interceptor hover e3 | drag e4 e8 | dblclick e5 | rightclick e5
 ```
 
-On pages whose a11y tree comes back empty (some SPAs render nothing tree-visible), `interceptor query "<css>"` still finds elements — and each result carries a clickable `e<ref>`, so every ref verb (`click`, `type`, `check`, …) works on what query found. A navigating click resolves as `{navigated: true, url}` rather than an error; a selector click that produces no DOM change auto-escalates to an OS-level click when the OS transport is available.
+Native `select`, `type`, and `act <ref> <value>` share option validation. Invalid, ambiguous, disabled, and non-native targets fail without changing the selection. A multiple select replaces its selection with the one requested option. A successful changed selection emits input then change; page handlers that reject it produce an error. Use `html <ref>` to inspect coded option values. Custom dropdowns use their normal click/read workflow.
+
+Password inputs and vault-filled controls are masked in tree, forms, snapshots/diff, scoped reads, and HTML/value-attribute output. Text-backed credential fields are masked in text/markdown/query output too, and `scene list`, `scene selected`, and `scene text` mask the same fields. Eval, screenshots, network/storage capture, and page-created copies of credentials are outside this masking boundary.
+
+On pages whose a11y tree comes back empty (some SPAs render nothing tree-visible), `interceptor query "<css>"` still finds elements. Every result reports the total `count`, serialized `returned` count, and `truncated` flag; at most 20 elements are serialized. Each element carries a clickable `e<ref>`, so every ref verb (`click`, `type`, `check`, …) works on what query found. `click`, `type`, and `check` also take a `role:name` target (`checkbox:Remember me`) that the page resolves by accessible role and name. A navigating click resolves as `{navigated: true, url}` rather than an error; a selector click that produces no DOM change auto-escalates to an OS-level click when the OS transport is available.
+
+Every CSS-selector verb reaches inside web components: `query`, `exists`, `count`, `click --selector`, `wait`, `table`, `attr`, `style`, `rect`, and `screenshot --selector` search open and closed shadow roots after the light DOM. Light-DOM matches come first in document order, so `--nth` keeps its meaning on a page without shadow hosts. `wait` polls as well as observing, so an element rendered later inside an existing shadow root is found.
 
 ## Inspection + Network
 
@@ -75,32 +85,40 @@ interceptor inspect --filter api
 Passive network (preferred over CDP):
 
 ```bash
-interceptor net log [--filter <p>] [--since 30s] [--limit 100]
+interceptor net [log] [--filter <p>] [--since 30s] [--limit 100]   # --since: 500ms|30s|5m|2h|1d back from now, or an epoch-ms timestamp
 interceptor net log --format json|har|pcapng [--out <path>] [--redact-auth]   # file is 0600; headers kept unless --redact-auth
 interceptor net headers [--filter <p>]
 interceptor net clear
 ```
 
-Overrides (declarativeNetRequest — no debugger banner):
+Overrides (page-level fetch/XHR wrapper, no debugger banner). `key=value` rewrites
+query parameters; the flags change the response:
 
 ```bash
-interceptor override "*api/search*" status=500
-interceptor override "*api/search*" delay=1000
-interceptor override "*api/search*" status=200 body='{"results":[]}'
+interceptor override "*api/search*" count=5                       # rewrite a query parameter
+interceptor override "*api/search*" --status 500                  # answer locally, request never sent
+interceptor override "*api/search*" --status 200 --body '{"results":[]}' [--content-type application/json]
+interceptor override "*api/search*" --delay 1000                  # hold the real request at least 1000 ms (a background tab rounds timers up to the next second)
 interceptor override clear
 ```
+
+Each `override` call replaces the previous rule. An override lives in the page it
+was set on: a navigation or reload drops it. Overridden responses show
+`"mocked": true` in `net log`; failed requests show `status: 0` and an `error`.
 
 CDP only when passive `net` is insufficient:
 
 ```bash
 interceptor network on | log | off
-interceptor network override "*api*" status=500
+interceptor network override on '[{"urlPattern":"*api*","setHeaders":{"x-debug":"1"}}]'   # rewrites the request (url, query, headers, body), not the response
+interceptor network override off
 ```
 
 SSE:
 
 ```bash
-interceptor sse streams | log | tail
+interceptor sse streams | log
+interceptor sse tail [--filter <p>] [--timeout 60000]   # waits for a stream, prints it to its last chunk, exits 1 if none starts
 ```
 
 Page communication (WebSocket / Beacon / BroadcastChannel, no CDP):
@@ -157,7 +175,8 @@ interceptor canvas diff 1
 interceptor canvas ocr 1                           # Native canvas text: aria/fallback + semantic model (no pixel OCR)
 ```
 
-`canvas ocr` returns the canvas's *native* accessible text (aria-label / aria-labelledby / fallback subtree / figcaption) plus the page's semantic textbox model — no pixel OCR. For a canvas-rendered editor prefer `scene text`; for genuine pixel-only text use `interceptor macos vision text` (native macOS Vision OCR).
+`canvas ocr` returns the canvas's *native* accessible text (aria-label / aria-labelledby / fallback subtree / figcaption) plus the page's semantic textbox model — no pixel OCR. For a canvas-rendered editor prefer `scene text`; for genuine pixel-only text use `interceptor macos vision text` (native macOS Vision OCR). <!-- os:darwin -->
+`canvas ocr` returns the canvas's *native* accessible text (aria-label / aria-labelledby / fallback subtree / figcaption) plus the page's semantic textbox model — no pixel OCR. For a canvas-rendered editor prefer `scene text`; for genuine pixel-only text use `interceptor desktop vision text` (the operating system's OCR). <!-- os:win32,linux -->
 
 Canvas indexes are DOM canvas indexes.
 
@@ -169,7 +188,8 @@ For Canva, Google Docs/Slides/Sheets. Run `scene profile` first.
 interceptor scene profile [--verbose]
 interceptor scene list [--type text]
 interceptor scene hit 400 300
-interceptor scene click <scene-ref> [--trusted]   # --trusted posts OS-level input for isTrusted-gated canvases
+interceptor scene click <scene-ref> [--trusted]   # --trusted posts OS-level input for isTrusted-gated canvases <!-- os:darwin -->
+interceptor scene click <scene-ref> <!-- os:win32,linux -->
 interceptor scene dblclick | select | cursor-to <scene-ref>
 interceptor scene selected
 interceptor scene text <scene-ref> [--with-html]
@@ -191,19 +211,35 @@ interceptor scroll down
 interceptor wait 1000
 interceptor wait-stable
 
-interceptor tabs
+interceptor tabs                                   # 'tab list' does the same
 interceptor tab new <url>             # Background tab in the interceptor group
 interceptor tab new <url> --activate  # Explicit foregrounding
 interceptor tab new <url> --reuse     # Navigate the group's most-recent tab instead of creating
-interceptor tab switch <tab-id>
+                                      # New tabs land in the window that already holds Interceptor groups (own group's window first),
+                                      # not the focused window; the result's windowId says where. A window is created only when none is normal.
+interceptor tab keepalive <tab-id>    # Hidden tab reads visible + runs its animation frames (no focus change); --off clears
+interceptor tab switch <tab-id>       # Changes the tab showing in that window. Safe in your own window (see `window new`); in a window the user
+                                      # is working in it replaces their view: last resort, then switch back (passes the group gate once)
 interceptor tab close <tab-id>
 
 interceptor open <url> --group <label>   # Open into a named per-agent group "<brand>-<label>" (created on first use)
-interceptor read --group <label>         # Any command scopes to that group's tabs; env INTERCEPTOR_GROUP is the fallback
-interceptor group list                   # All live tab groups: label, title, color, tab count
-interceptor group close <label>          # Atomically close every tab in a named group (other groups untouched)
+interceptor read --group <label>         # Any command scopes to that group's tabs; env INTERCEPTOR_GROUP is the fallback.
+                                         # No explicit scope: supported agent shells get a soft session group (s-<hash16>).
+interceptor open <url> --shared-group     # Suppress session scope; use the shared default Interceptor group.
+interceptor group list                   # All live tab groups: label, title, color, tab count; "own": true marks yours
+interceptor group close <label>          # Atomically close every tab in a named group and delete the group (other groups untouched)
+interceptor group close                  # Close your own group. Leave other agents' s- groups alone; they close themselves when unused
+interceptor group prune [--dry-run]      # Delete every CLOSED saved group Interceptor left on the bookmarks bar (`<brand>` and `<brand>-<label>`).
+                                         # Full install only: a closed saved group has no extension API, so prune opens each chip's menu
+                                         # and presses "Delete group" through the native desktop provider, in the background. No age filter
+                                         # (the UI has no timestamp). Skips a frontmost or hidden browser; --allow-frontmost, --app <name>, --brand <title>.
+                                         # Reads the bookmarks bar only: a `warning` counts the windows that hide it (their groups were not checked).
+interceptor group prune <label>...       # Delete only `<brand>-<label>` for those labels. A delete syncs to every profile and cannot be undone.
 interceptor window list
-interceptor window new
+interceptor window new [url]                              # Background window (ordered below the user's); your tab group moves into it,
+                                                          # so its tab paints without touching the user's view
+interceptor window new --tab <id>                         # The same, built around a tab you already have (page state stays)
+interceptor window new [url] --activate                   # Explicit focus move
 interceptor window focus <window-id>                      # Explicit focus move
 interceptor window resize <window-id> <width> <height>
 interceptor window resize <window-id> --left 0 --top 0 --width 960 --height 1080
@@ -212,7 +248,7 @@ interceptor window resize --state maximized               # Don't combine maximi
 
 Use `--tab <id>` for a specific tab; `--any-tab` only when explicitly authorized.
 
-Give each agent its own `--group <label>` (or set `INTERCEPTOR_GROUP` once per agent): every command then resolves and acts only within that agent's tab group, reuse applies only to that group's tabs, and cross-group targets are rejected. Labels match `[A-Za-z0-9_-]{1,32}`; pick a color with `--group-color <grey|blue|red|yellow|green|pink|purple|cyan|orange>` on first open. Close your group when the job is done — `interceptor group close <label>`, then `group list` as proof. The extension auto-closes groups idle for 10+ minutes by default (popup-configurable, 0 disables); treat that as crash safety, not as your cleanup.
+Solo agent work needs no label: `INTERCEPTOR_SESSION_ID` is the neutral session contract, and verified Maestro, Claude Code, and Codex variables are detected automatically. Interceptor hashes the full id into `s-<hash16>` and sends only that opaque label. The scope is SOFT: it supplies tab reuse and idle cleanup, but an empty session group can fall back to the active managed tab. Concurrent lanes often share one host session id, so each lane needs its own `--group lane-<n>` or `INTERCEPTOR_SESSION_ID`. An explicit `--group <label>` or non-empty `INTERCEPTOR_GROUP` provides HARD isolation by default: resolution stays in the named group and cross-group targets are rejected unless `--any-tab` is explicitly authorized. `--shared-group` or empty `INTERCEPTOR_GROUP=` suppresses session scope but still uses the shared default Interceptor group. Labels match `[A-Za-z0-9_-]{1,32}`. Pick a color with `--group-color <grey|blue|red|yellow|green|pink|purple|cyan|orange>` on first open. Close your group when the job is done, then use `group list` as proof. The extension auto-closes groups after 10 minutes without tab activity by default; metadata polls do not keep them alive. The popup's *Delete the whole group when idle* toggle (off by default) upgrades that sweep to a full delete: every tab in the idle group goes, unsaved-form tabs and a window's last tab included, and it only waits while the user is looking at one of the group's tabs or one is playing sound. The user may have it on, so do not assume a group you left behind is still there.
 
 ## Cookies / Storage / History / Bookmarks
 
@@ -257,21 +293,39 @@ interceptor raw '{"type":"any_action","key":"value"}'
 
 ```bash
 interceptor contexts                                # List IDs of all connected browser contexts
+interceptor contexts --verbose                      # Also kind, version, store/unpacked, extension ID, transports
+interceptor contexts rename <name> --context <id>   # Restore a context name after an extension ID change (the new ID starts empty)
+interceptor contexts default <name>                 # Saved default when several contexts are connected and none is named (--clear removes)
+export INTERCEPTOR_CONTEXT=<id>                     # Lane default when several profiles are connected (--context overrides)
 interceptor --context <id> read                     # Route command to a specific profile
 interceptor --context <id> open <url>
 interceptor --context <id> act e7 "value"
-interceptor --context safari read                   # Safari uses a stable context id
+interceptor --context safari read                   # Safari uses a stable context id <!-- os:darwin -->
 ```
 
-Chrome/Brave profiles auto-generate stable UUIDs on first run (stored in `chrome.storage.local`); Safari registers the fixed id `safari`. `contexts` lists all currently connected IDs. Without `--context`, commands auto-route only when exactly one context is connected; zero or multiple connected contexts fail fast and require `--context <id>`.
+Chrome/Brave profiles auto-generate stable UUIDs on first run (stored in `chrome.storage.local`); Safari registers the fixed id `safari`. `contexts` lists all currently connected IDs. Without `--context`, commands auto-route only when exactly one context is connected; zero or multiple connected contexts fail fast and require `--context <id>`. <!-- os:darwin -->
+Chrome/Brave profiles auto-generate stable UUIDs on first run (stored in `chrome.storage.local`). `contexts` lists all currently connected IDs. Without `--context`, commands auto-route only when exactly one context is connected; zero or multiple connected contexts fail fast and require `--context <id>`. <!-- os:win32,linux -->
 
-Primary use cases: multiple Chrome profiles logged in to different accounts, or Chrome/Brave and Safari connected to the same daemon simultaneously.
+Primary use cases: multiple Chrome profiles logged in to different accounts, or Chrome/Brave and Safari connected to the same daemon simultaneously. <!-- os:darwin -->
+Primary use cases: multiple Chrome profiles logged in to different accounts, or Chrome and Brave connected to the same daemon simultaneously. <!-- os:win32,linux -->
+
+## Recently closed tabs
+
+```bash
+interceptor sessions [max]                          # Recently closed tabs and windows, newest first, with sessionIds
+interceptor sessions restore <id>                   # Reopen the page(s) as background tabs in your group; your active tab does not change
+interceptor sessions restore <id> --activate        # The browser's own restore: keeps history and form state, brings the tab to the front
+```
+
+The default gives up back/forward history and form state, and the entry stays in the list. An id is required: the no-argument form would reopen whatever closed most recently, which may be the user's own window. This is the undo for a tab the idle sweep closed.
 
 ## Capabilities + Reload
 
 ```bash
 interceptor capabilities                            # Available input layers
-interceptor reload                                  # After extension changes during dev
+interceptor reload                                  # Unpacked copy: picks up the installed files; store copy: asks the Chrome Web Store for an update first
+interceptor diagnose extension                      # Browser profiles that lose Interceptor at every browser start (a leftover old-ID entry on the extension folder), with the fix for each
+interceptor diagnose extension --fix [--browser brave]   # Quits and reopens that browser twice to move the entry aside; ask the user first <!-- os:darwin -->
 ```
 
 ## Branding (white-label)
@@ -288,9 +342,24 @@ Runtime-configurable — no rebuild, no options page. Resolved from `chrome.stor
 ```bash
 interceptor eval --main "document.title"
 interceptor eval --main "window.__APP_STATE__"
+interceptor eval "document.title" --frame 4897        # Exactly that frame; a missing frame fails
+interceptor --frame 4897 eval "document.title"        # --frame is global: before or after the command
+interceptor eval --main --no-reload "app.state"       # Refuse the CSP-recovery reload; get the CSP error instead
 ```
 
-Use only when no built-in command exposes what you need. Strict-CSP sites may trigger an automatic reload/retry on first attempt.
+Use only when no built-in command exposes what you need. Thrown exceptions, rejected promises, and syntax errors are failures (exit 1) in both worlds; top-level `await` works. The default isolated world may need Allow User Scripts enabled for the extension; `--main` is an explicit page-world choice. On a strict-CSP page `--main` may strip the header and reload the tab once; the result says so and a `warning:` line is printed, on success and on failure, for `eval` and for `save`. That reload discards the page's in-memory state (an open conversation, a half-filled form). Pass `--no-reload` on such a page to get the CSP error instead. Task verification never reloads.
+
+## Durable task state
+
+```bash
+interceptor monitor task create "Verify the saved draft"          # Returns a taskId; no recording needed
+interceptor monitor task checkpoint <taskId> --file <json>        # Revisioned constraints, target, checks, lessons
+interceptor monitor task resume <taskId>                          # Compact state + lessons scoped to this context/origin
+interceptor monitor task verify <taskId>                          # Run the stored checks now; lifecycle unchanged
+interceptor monitor task complete <taskId>                        # Completes only when every fresh check returns true
+```
+
+Checkpoint schema, locking, and verification semantics: `workflows/task-state.md`. Over MCP, `verify` and `complete` are exec tier.
 
 ## Output mode
 

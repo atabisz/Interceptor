@@ -109,6 +109,29 @@ browser_bin_for() {
   esac
 }
 
+# Is the target browser running? On Darwin BROWSER_BIN is the .app binary path,
+# which never appears in this script's own argv. On Linux it is a bare name
+# (brave, google-chrome) that DOES — `bash install.sh --brave` — so a plain
+# `pgrep -f` on that bare name matched the installer itself: every "is the browser
+# running" check answered yes, and the "force restart" pkill signalled the
+# script (issue #172). Anchor the Linux match to argv[0] so only a process
+# launched as the browser counts. Distro wrapper scripts `exec -a "$0"` the
+# real binary, so the wrapper name stays in argv[0]; the name is a prefix match
+# so google-chrome also covers google-chrome-stable.
+browser_pgrep_pattern() {
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    printf '%s' "$1"
+  else
+    printf '^([^ ]*/)?%s' "$1"
+  fi
+}
+browser_running() {
+  pgrep -f "$(browser_pgrep_pattern "$1")" >/dev/null 2>&1
+}
+kill_browser() {
+  pkill -TERM -f "$(browser_pgrep_pattern "$1")" 2>/dev/null || true
+}
+
 # ── Parse flags ────────────────────────────────────────────────────────────────
 SKIP_EXTENSION=0
 BROWSER=""
@@ -219,7 +242,8 @@ fi
 
 # ── Mode resolution ────────────────────────────────────────────────────────────
 # If neither --browser-only nor --full was passed, prompt interactively.
-# Default: macOS → "full", anything else → "browser-only" (full mode is mac-only).
+# Default: macOS -> "full", anything else -> "browser-only". Linux full mode
+# installs its native provider when explicitly selected.
 if [[ -z "$MODE" ]]; then
   if [[ "$(uname -s)" == "Darwin" ]]; then
     DEFAULT_MODE="full"
@@ -252,9 +276,24 @@ if [[ -z "$MODE" ]]; then
   fi
 fi
 
-if [[ "$MODE" == "full" && "$(uname -s)" != "Darwin" ]]; then
-  echo "ERROR: --full mode is macOS only (the Swift bridge is mac-only)." >&2
-  echo "       Use --browser-only on this platform." >&2
+if [[ "$PLATFORM" == Linux ]]; then
+  if [[ "$MODE" == browser-only && "$DRY_RUN" != 1 && -e "$HOME/.local/share/interceptor/interceptor-desktop" ]]; then
+    echo "ERROR: A full native installation is present. Run scripts/uninstall.sh --bridge-only before installing browser-only mode." >&2
+    exit 1
+  fi
+  if [[ "$MODE" == full || -f "$HOME/.local/share/interceptor/browser-install.sha256" ]]; then
+    DAEMON_PATH="$HOME/.local/share/interceptor/interceptor-daemon"
+    if [[ "$MODE" == browser-only && "$DRY_RUN" != 1 ]]; then bash "$ROOT/scripts/install-desktop-linux.sh" --refresh-browser; fi
+  fi
+fi
+if [[ "$MODE" == "full" && "$PLATFORM" == Linux ]]; then
+  if [[ "$DRY_RUN" == 1 ]]; then
+    bash "$ROOT/scripts/install-desktop-linux.sh" --dry-run
+  else
+    bash "$ROOT/scripts/install-desktop-linux.sh" --check
+  fi
+elif [[ "$MODE" == "full" && "$PLATFORM" != Darwin ]]; then
+  echo "ERROR: --full requires a supported macOS or Linux native provider." >&2
   exit 1
 fi
 
@@ -282,6 +321,16 @@ if [[ -z "$BROWSER" ]]; then
                     + BRAVE_INSTALLED + EDGE_INSTALLED + VIVALDI_INSTALLED ))
 
   if (( TOTAL_INSTALLED == 0 )); then
+    if [[ "$PLATFORM" == Linux && "$MODE" == full ]]; then
+      echo "==> No supported browser found; installing the Linux native provider, CLI and daemon."
+      if [[ "$DRY_RUN" == 1 ]]; then
+        bash "$ROOT/scripts/install-desktop-linux.sh" --dry-run
+      else
+        bash "$ROOT/scripts/install-desktop-linux.sh"
+      fi
+      echo "==> Done. Linux full mode installed. Browser integration requires a supported browser."
+      exit 0
+    fi
     echo "ERROR: No supported browser found." >&2
     echo "       Install Chrome (stable/Beta/Canary/Dev/for-Testing), Brave, Edge, or Vivaldi, then re-run." >&2
     exit 1
@@ -430,7 +479,7 @@ PY
 write_developer_mode_true() {
   local prefs="$1" browser_bin="$2"
   if [[ ! -f "$prefs" ]]; then return 1; fi
-  if pgrep -f "$browser_bin" >/dev/null 2>&1; then return 2; fi
+  if browser_running "$browser_bin"; then return 2; fi
   python3 - "$prefs" <<'PY' 2>/dev/null || return 3
 import json, sys, os, tempfile
 path = sys.argv[1]
@@ -442,6 +491,38 @@ with os.fdopen(fd, "w") as f:
     json.dump(d, f, separators=(",", ":"))
 os.replace(tmp, path)
 PY
+}
+
+# Echoes "yes" when a browser profile keeps Interceptor across restarts: a store
+# copy, or an unpacked copy whose folder still exists. A --load-extension entry
+# (location 8) does not count: Chromium skips those at every start.
+profile_has_persistent_interceptor() {
+  python3 - "$1" <<'PY' 2>/dev/null || echo "no"
+import json, os, sys
+ids = ("gomcpnagjjlhehnkoobkjgnkbleiooed", "hkjbaciefhhgekldhncknbjkofbpenng")
+settings = {}
+for name in ("Preferences", "Secure Preferences"):
+    try:
+        with open(os.path.join(sys.argv[1], name)) as f:
+            settings.update(json.load(f).get("extensions", {}).get("settings", {}))
+    except Exception:
+        pass
+def keeps(e):
+    loc = e.get("location")
+    if loc == 8 or loc is None:
+        return False
+    return loc != 4 or os.path.exists(os.path.join(e.get("path", ""), "manifest.json"))
+print("yes" if any(isinstance(settings.get(i), dict) and keeps(settings[i]) for i in ids) else "no")
+PY
+}
+
+# `interceptor diagnose extension` key for an install.sh browser target, if it has one.
+repair_key_for() {
+  case "$1" in
+    brave|chrome|edge|vivaldi) echo "$1" ;;
+    chrome-for-testing)        echo "cft" ;;
+    *) return 1 ;;
+  esac
 }
 
 # Probe whether the just-launched extension is reachable. Returns 0 if yes.
@@ -482,6 +563,11 @@ load_extension() {
       echo "ERROR: load_extension called with unknown browser '$target'." >&2
       return 1 ;;
   esac
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "==> [browser] DRY: would launch $BROWSER_NAME --load-extension=$EXTENSION_DIR"
+    return 0
+  fi
+
   if [[ "$PLATFORM" == "Darwin" ]]; then
     case "$target" in
       brave)
@@ -526,8 +612,20 @@ load_extension() {
     fi
   fi
 
-  if [[ "$DRY_RUN" == "1" ]]; then
-    echo "==> [browser] DRY: would launch $BROWSER_NAME --load-extension=$EXTENSION_DIR"
+  # ── Already installed? ───────────────────────────────────────────────────────
+  # A --load-extension start lasts one browser session, and over a copy the
+  # profile already keeps (a Chrome Web Store install) it replaces that copy with
+  # the session-only load, so Interceptor is gone after the next restart. Leave
+  # a profile that already has Interceptor alone; report its health instead.
+  local KEEP_PATH
+  KEEP_PATH="$(profile_root_for "$target" 2>/dev/null)/${PROFILE:-Default}"
+  if [[ "$(profile_has_persistent_interceptor "$KEEP_PATH")" == "yes" ]]; then
+    echo ""
+    echo "==> [browser] $BROWSER_NAME profile '${PROFILE:-Default}' already has Interceptor; not relaunching it."
+    local REPAIR_KEY
+    if REPAIR_KEY="$(repair_key_for "$target")" && [[ -x "$ROOT/dist/interceptor" ]]; then
+      "$ROOT/dist/interceptor" diagnose extension --browser "$REPAIR_KEY" || true
+    fi
     return 0
   fi
 
@@ -563,7 +661,7 @@ load_extension() {
     # AND we have a Preferences file to write to. Editing while the browser
     # runs is unsafe — the browser overwrites on shutdown.
     local CAN_AUTO=0
-    if [[ -f "$PREFS_PATH" ]] && ! pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; then
+    if [[ -f "$PREFS_PATH" ]] && ! browser_running "$BROWSER_BIN"; then
       CAN_AUTO=1
     fi
 
@@ -595,7 +693,7 @@ load_extension() {
 
   # Check if browser is already running
   local BROWSER_RUNNING=0
-  if pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; then
+  if browser_running "$BROWSER_BIN"; then
     BROWSER_RUNNING=1
   fi
 
@@ -619,11 +717,11 @@ load_extension() {
         osascript -e "tell application \"$BROWSER_NAME Browser\" to quit" 2>/dev/null || \
         osascript -e "tell application \"$BROWSER_NAME\" to quit" 2>/dev/null || true
       else
-        pkill -TERM -f "$BROWSER_BIN" 2>/dev/null || true
+        kill_browser "$BROWSER_BIN"
       fi
       sleep 2
       for j in {1..10}; do
-        if ! pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; then break; fi
+        if ! browser_running "$BROWSER_BIN"; then break; fi
         sleep 1
       done
     else
@@ -647,8 +745,9 @@ load_extension() {
     esac
     echo ""
     echo "==> $BROWSER_NAME ignores --load-extension in branded desktop builds."
-    echo "    Use one of these paths instead:"
-    echo "      1. Developer flow: open ${SCHEMA}://extensions, enable Developer Mode,"
+    echo "    Install the extension one of these ways (both share one extension ID):"
+    echo "      1. Chrome Web Store: https://chromewebstore.google.com/detail/interceptor/gomcpnagjjlhehnkoobkjgnkbleiooed"
+    echo "      2. Developer flow: open ${SCHEMA}://extensions, enable Developer Mode,"
     echo "         then Load unpacked -> $EXTENSION_DIR"
     echo ""
     echo "    Native messaging metadata has already been installed."
@@ -690,8 +789,20 @@ load_extension() {
 
   if [[ "$probed" == "1" ]]; then
     echo "==> Extension loaded into $BROWSER_NAME and reachable."
-    echo "    Extension ID: hkjbaciefhhgekldhncknbjkofbpenng"
+    echo "    Extension ID: gomcpnagjjlhehnkoobkjgnkbleiooed (same as the Chrome Web Store listing)"
     [[ -n "$PROFILE" ]] && echo "    Profile: $PROFILE"
+    echo ""
+    echo "==> Keep it: this load lasts only until $BROWSER_NAME quits."
+    echo "    Chromium drops a --load-extension load at every restart. Do one of these once:"
+    echo "      1. Install from the Chrome Web Store: https://chromewebstore.google.com/detail/interceptor/gomcpnagjjlhehnkoobkjgnkbleiooed"
+    case "$target" in
+      brave)   echo "      2. Open brave://extensions, keep Developer mode on, click Load unpacked and choose:" ;;
+      edge)    echo "      2. Open edge://extensions, keep Developer mode on, click Load unpacked and choose:" ;;
+      vivaldi) echo "      2. Open vivaldi://extensions, keep Developer mode on, click Load unpacked and choose:" ;;
+      *)       echo "      2. Open chrome://extensions, keep Developer mode on, click Load unpacked and choose:" ;;
+    esac
+    echo "         $EXTENSION_DIR"
+    echo "    Check it any time with: interceptor diagnose extension"
   else
     echo "==> WARNING: $BROWSER_NAME launched, but the extension is NOT reachable after 8s."
     echo ""
@@ -706,7 +817,7 @@ load_extension() {
       vivaldi)                                                               echo "      1. Open vivaldi://extensions/" ;;
     esac
     echo "      2. Confirm Developer mode is ON (top-right toggle)."
-    echo "      3. Confirm 'Interceptor' appears with ID hkjbaciefhhgekldhncknbjkofbpenng."
+    echo "      3. Confirm 'Interceptor' appears with ID gomcpnagjjlhehnkoobkjgnkbleiooed."
     echo "      4. If the extension is missing, click 'Load unpacked' and select:"
     echo "         $EXTENSION_DIR"
     echo ""
@@ -738,6 +849,15 @@ if [[ "$MODE" == "browser-only" ]]; then
 fi
 
 # MODE == "full" past this point.
+if [[ "$PLATFORM" == Linux ]]; then
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "==> DRY-RUN complete (Linux full mode)."
+  else
+    bash "$ROOT/scripts/install-desktop-linux.sh"
+    echo "==> Done. Installed Linux full mode; use interceptor desktop capabilities to inspect qualified operations."
+  fi
+  exit 0
+fi
 echo ""
 echo "==> [bridge] Chaining into install-bridge.sh..."
 if [[ "$DRY_RUN" == "1" ]]; then

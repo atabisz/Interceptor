@@ -50,7 +50,7 @@ const GLOBAL_VALUE_FLAGS = ["--frame", "--tab", "--context", "--group", "--group
 // Global booleans legal on every normalized command (harness-level concerns
 // handled in cli/index.ts before or after dispatch).
 const GLOBAL_BOOLEAN_FLAGS = new Set([
-  "--json", "--ws", "--no-ws", "--any-tab", "--changes", "--all-surfaces",
+  "--json", "--ws", "--no-ws", "--any-tab", "--shared-group", "--changes", "--all-surfaces",
   "--help", "-h",
   // stderr-hint suppressors read from raw argv on any command
   // (cli/commands/skills.ts maybeEmitSkillsHint) or from `open`'s filtered
@@ -63,7 +63,15 @@ const STATE = ["--depth", "--filter", "--limit", "--max-chars", "--role"]
 // --selector/--nth take VALUES. Without them declared here the normalizer
 // treats them as booleans and strips their operands, so
 // `click --selector button --nth 4` arrives with selector === "--nth".
-const ACTIONS = ["--at", "--duration", "--from", "--nth", "--selector", "--steps", "--to"]
+// --secret names a vault entry for `type` (issue #244); the value never rides argv.
+// --browser-login names the host whose saved login to fill; --browser picks one
+// Chromium browser to read (issue #248).
+const ACTIONS = ["--at", "--browser", "--browser-login", "--duration", "--from", "--secret", "--steps", "--to"]
+// CSS targeting is implemented by `click` alone (cli/commands/actions.ts). When
+// every action verb accepted --selector here, `dblclick --selector x` parsed
+// `--selector` as the element target and failed as "stale element" (agent
+// session log, 2026-09-09). Other verbs reject it with a hint instead.
+const CLICK = [...ACTIONS, "--nth", "--selector"]
 const NAV = ["--amount", "--ms", "--timeout"]
 const NET = ["--filter", "--format", "--limit", "--out", "--since", "--pattern", "--patterns", "--type"]
 const SCREENSHOT = ["--clip", "--element", "--filter", "--format", "--kind", "--limit", "--quality", "--ref", "--region", "--scale", "--selector", "--target-max-long-edge", "--threshold"]
@@ -71,7 +79,7 @@ const DATA = ["--since"]
 const META = ["--css", "--frame-ids", "--since"]
 const SAVE = ["--out", "--chunk-size"]
 const BATCH = ["--timeout"]
-const MONITOR = ["--capture", "--format", "--guard-policy", "--instruction", "--mode", "--out", "--retention-policy", "--session", "--task", "--verifier-policy", "--persist-bodies"]
+const MONITOR = ["--capture", "--file", "--format", "--guard-policy", "--instruction", "--mode", "--out", "--retention-policy", "--session", "--task", "--verifier-policy", "--persist-bodies"]
 const SCENE = ["--profile", "--slide", "--type"]
 const SSE = ["--filter", "--limit", "--timeout"]
 const RESEARCH = ["--dir", "--effort", "--note", "--slug", "--status"]
@@ -95,7 +103,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
   // state
   state: STATE, tree: STATE, diff: STATE, find: STATE, text: STATE, html: STATE,
   // actions
-  click: ACTIONS, type: ACTIONS, select: ACTIONS, focus: ACTIONS, blur: ACTIONS,
+  click: CLICK, type: ACTIONS, select: ACTIONS, focus: ACTIONS, blur: ACTIONS,
   hover: ACTIONS, drag: ACTIONS, dblclick: ACTIONS, rightclick: ACTIONS,
   check: ACTIONS, keys: ACTIONS, "click-at": ACTIONS, "what-at": ACTIONS, regions: ACTIONS,
   // navigation
@@ -105,7 +113,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
   // network
   network: NET, net: NET, headers: NET,
   // screenshot
-  screenshot: SCREENSHOT, canvas: SCREENSHOT, capture: SCREENSHOT, ocr: SCREENSHOT,
+  screenshot: [...SCREENSHOT, "--out"], canvas: SCREENSHOT, capture: SCREENSHOT, ocr: SCREENSHOT,
   // data
   cookies: DATA, storage: DATA, history: DATA, bookmarks: DATA, downloads: DATA, clear: DATA, clipboard: DATA,
   // meta
@@ -114,8 +122,8 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
   attr: META, style: META, events: META, notify: META, sessions: META,
   capabilities: META, modals: META, panels: META,
   // singles
-  eval: [], save: SAVE, brand: BRAND, group: [], batch: BATCH, raw: BATCH,
-  monitor: MONITOR, scene: SCENE, sse: SSE, override: [],
+  eval: [], save: SAVE, brand: BRAND, group: ["--app", "--brand"], batch: BATCH, raw: BATCH,
+  monitor: MONITOR, scene: SCENE, sse: SSE, override: ["--status", "--body", "--delay", "--content-type"],
   upgrade: [], init: [], research: RESEARCH, extensions: [], contexts: [],
   skills: SKILLS, daemon: DAEMON, manifest: [],
   keepawake: POWER, idle: POWER,
@@ -131,13 +139,15 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
 // consumption pattern, so keep it in sync when adding a family here.
 const COMPOUND_BOOL = ["--activate", "--append", "--full", "--include-frames", "--include-style", "--markdown", "--net-only", "--no-read", "--no-reuse", "--no-wait", "--os", "--reuse", "--text-only", "--tree-only", "--trusted"]
 const STATE_BOOL = ["--elements-only", "--full", "--include-frames", "--markdown", "--native", "--text-only"]
-const ACTIONS_BOOL = ["--append", "--dropzone", "--picker", "--trusted", "--os"]
+const ACTIONS_BOOL = ["--append", "--dropzone", "--picker", "--trusted", "--os", "--user"]
 const TABS_BOOL = ["--incognito"]
+const TAB_BOOL = ["--activate", "--no-reuse", "--off", "--reuse"]
+const WINDOW_BOOL = ["--activate", "--incognito"]
 const NET_BOOL = ["--from-start", "--persist", "--reload", "--redact-auth"]
 const SCREENSHOT_BOOL = ["--background", "--full", "--image", "--no-fallback", "--pixel", "--save", "--webgl"]
 const DATA_BOOL = ["--session"]
 const META_BOOL = ["--author", "--explain", "--tail", "--top-only", "--verbose"]
-const EVAL_BOOL = ["--main"]
+const EVAL_BOOL = ["--main", "--no-reload"]
 const SAVE_BOOL = ["--isolated", "--main"]
 const BATCH_BOOL = ["--stop-on-error"]
 const MONITOR_BOOL = ["--force-diagnostic", "--from-start", "--include-synthetic", "--no-regenerate", "--plan", "--raw", "--reload", "--snapshot-sources", "--stop-sources", "--with-bodies"]
@@ -147,24 +157,24 @@ const RESEARCH_BOOL = ["--capture", "--full", "--stdin", "--no-research-hint"]
 const SKILLS_BOOL = ["--all", "--force", "--no-skills-hint"]
 
 const BOOLEAN_FLAGS_BY_CMD: Record<string, string[]> = {
-  open: COMPOUND_BOOL, read: COMPOUND_BOOL, act: COMPOUND_BOOL, inspect: COMPOUND_BOOL,
+  open: COMPOUND_BOOL, read: COMPOUND_BOOL, act: [...COMPOUND_BOOL, "--submit"], inspect: COMPOUND_BOOL,
   websearch: COMPOUND_BOOL, search: COMPOUND_BOOL,
   state: STATE_BOOL, tree: STATE_BOOL, diff: STATE_BOOL, find: STATE_BOOL, text: STATE_BOOL, html: STATE_BOOL,
   click: ACTIONS_BOOL, type: ACTIONS_BOOL, select: ACTIONS_BOOL, focus: ACTIONS_BOOL, blur: ACTIONS_BOOL,
   hover: ACTIONS_BOOL, drag: ACTIONS_BOOL, dblclick: ACTIONS_BOOL, rightclick: ACTIONS_BOOL,
   check: ACTIONS_BOOL, keys: ACTIONS_BOOL, "click-at": ACTIONS_BOOL, "what-at": ACTIONS_BOOL, regions: ACTIONS_BOOL,
   navigate: [], back: [], forward: [], scroll: [], wait: [], "wait-stable": [], wait_for: [],
-  tabs: TABS_BOOL, tab: TABS_BOOL, window: TABS_BOOL, frames: [], session: [],
+  tabs: TABS_BOOL, tab: TAB_BOOL, window: WINDOW_BOOL, frames: [], session: [],
   network: NET_BOOL, net: NET_BOOL, headers: NET_BOOL,
   screenshot: SCREENSHOT_BOOL, canvas: SCREENSHOT_BOOL, capture: SCREENSHOT_BOOL, ocr: SCREENSHOT_BOOL,
   cookies: DATA_BOOL, storage: DATA_BOOL, history: DATA_BOOL, bookmarks: DATA_BOOL, downloads: DATA_BOOL, clear: DATA_BOOL, clipboard: DATA_BOOL,
   status: META_BOOL, reload: META_BOOL, meta: META_BOOL, links: META_BOOL, images: META_BOOL, forms: META_BOOL,
   info: META_BOOL, page_info: META_BOOL, query: META_BOOL, exists: META_BOOL, count: META_BOOL, table: META_BOOL,
-  attr: META_BOOL, style: META_BOOL, events: META_BOOL, notify: META_BOOL, sessions: META_BOOL,
+  attr: META_BOOL, style: META_BOOL, events: META_BOOL, notify: META_BOOL, sessions: [...META_BOOL, "--activate"],
   capabilities: META_BOOL, modals: META_BOOL, panels: META_BOOL,
-  eval: EVAL_BOOL, save: SAVE_BOOL, brand: [], group: [], batch: BATCH_BOOL, raw: BATCH_BOOL,
+  eval: EVAL_BOOL, save: SAVE_BOOL, brand: [], group: ["--allow-frontmost", "--dry-run"], batch: BATCH_BOOL, raw: BATCH_BOOL,
   monitor: MONITOR_BOOL, scene: SCENE_BOOL, sse: [], override: [],
-  upgrade: ["--full"], init: ["--explain", "--verbose"], research: RESEARCH_BOOL, extensions: ["--remove"], contexts: [],
+  upgrade: ["--full"], init: ["--explain", "--verbose"], research: RESEARCH_BOOL, extensions: ["--remove"], contexts: ["--clear", "--verbose"],
   skills: SKILLS_BOOL, daemon: [], manifest: [],
   keepawake: POWER_BOOL, idle: POWER_BOOL,
 }
@@ -181,16 +191,30 @@ export const FLAG_INVENTORY = {
 
 let warnedLaxFlags = false
 
+/**
+ * One argv word that holds several flags (`'--context main --group x'`): zsh
+ * does not split an unquoted `$VAR`, so a flag bundle kept in a variable
+ * arrives whole (67 errors in 54 sessions). Explain it;
+ * never split it, since guessing at quoting could pass the wrong value.
+ */
+export function flagBundleHint(tok: string): string {
+  if (!tok.startsWith("--") || !/\s/.test(tok)) return ""
+  return ` That one argument holds several flags, because the shell passed them as a single word (zsh does not split an unquoted $VAR). Split them: write \${=VAR} in zsh (interceptor \${=IC} tabs), or use a shell function such as ic() { interceptor --context <id> "$@"; }.`
+}
+
 function rejectUnknownFlag(cmd: string, tok: string): void {
   const lax = process.env.INTERCEPTOR_LAX_FLAGS === "1"
   let extra = ""
-  // The trap issue #212 documents verbatim: --out belongs to save/net; the
-  // screenshot family's write-to-disk flag is --save.
+  // The trap issue #212 documents verbatim. `screenshot --out <path>` exists
+  //; the rest of the screenshot family writes with --save.
   const name = tok.includes("=") ? tok.slice(0, tok.indexOf("=")) : tok
-  if (name === "--out" && (cmd === "screenshot" || cmd === "canvas" || cmd === "capture" || cmd === "ocr")) {
-    extra = " (--out belongs to 'save' and 'net'; 'screenshot --save' writes the image to disk)"
+  if (name === "--out" && (cmd === "canvas" || cmd === "capture" || cmd === "ocr")) {
+    extra = " (--out belongs to 'save', 'net log' and 'screenshot'; 'screenshot --out <path>' or '--save' writes an image to disk)"
   }
-  const msg = `unknown flag '${tok}' for '${cmd}'${extra}. Run 'interceptor help ${cmd}' for its flags; use '--' before positional values that begin with --.`
+  if ((name === "--selector" || name === "--nth") && cmd !== "click") {
+    extra = ` (CSS targeting is a 'click' flag; for '${cmd}' run 'interceptor query "<css>"' to get an e<ref>, then 'interceptor ${cmd} e<ref>')`
+  }
+  const msg = `unknown flag '${tok}' for '${cmd}'${extra}. Run 'interceptor help ${cmd}' for its flags; use '--' before positional values that begin with --.${flagBundleHint(tok)}`
   if (lax) {
     if (!warnedLaxFlags) {
       warnedLaxFlags = true
@@ -198,8 +222,7 @@ function rejectUnknownFlag(cmd: string, tok: string): void {
     }
     return
   }
-  console.error(`error: ${msg}`)
-  process.exit(1)
+  throw new Error(msg)
 }
 
 export type NormalizedArgs = { argv: string[]; positionalCount: number }
@@ -238,8 +261,7 @@ export function normalizeArgsSplit(filtered: string[]): NormalizedArgs {
           // A boolean flag with a value would travel as one raw token no
           // parser recognizes — `net log --redact-auth=true` would export
           // credentials unredacted and exit 0. Never legal, so no lax mode.
-          console.error(`error: flag '${name}' for '${cmd}' does not take a value (use '${name}').`)
-          process.exit(1)
+          throw new Error(`flag '${name}' for '${cmd}' does not take a value (use '${name}').`)
         }
         flags.push(tok)
         continue
@@ -256,6 +278,16 @@ export function normalizeArgsSplit(filtered: string[]): NormalizedArgs {
     // includes single-dash tokens ("-100", "-h" is handled upstream) — they
     // are values/positionals in this grammar, never short-option groups
     positionals.push(tok)
+  }
+
+  if (cmd === "tab") {
+    // Per-subverb: `tab new` takes the create flags, `tab keepalive` takes
+    // --off, the rest take none.
+    const allowed = positionals[0] === "new" ? TAB_BOOL.filter((flag) => flag !== "--off") : positionals[0] === "keepalive" ? ["--off"] : []
+    const unsupported = TAB_BOOL.find((flag) => flags.includes(flag) && !allowed.includes(flag))
+    if (unsupported) {
+      throw new Error(`flag '${unsupported}' is only valid with 'tab ${unsupported === "--off" ? "keepalive" : "new"}'.`)
+    }
   }
 
   return { argv: [cmd, ...positionals, ...flags], positionalCount: positionals.length }

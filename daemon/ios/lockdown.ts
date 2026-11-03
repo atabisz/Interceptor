@@ -25,8 +25,8 @@
  */
 
 import net from "node:net"
-import tls, { type TLSSocket } from "node:tls"
-import { spawnSync } from "node:child_process"
+import tls, { type ConnectionOptions, type TLSSocket } from "node:tls"
+import { captureSubprocessSync as spawnSync } from "../../shared/subprocess-sync"
 import { encodeUsbmuxMessage, tryReadUsbmuxMessage, plistInteger, htons, resolveDeviceId } from "./usbmux-forward"
 
 export const LOCKDOWN_PORT = 62078
@@ -154,6 +154,19 @@ export async function readPairRecord(udid: string): Promise<PairRecord | undefin
   }
 }
 
+/**
+ * The raw inner PairRecordData plist for a udid, as XML bytes. This is the
+ * pairing file the on-device idevice mounter reads (rp_pairing_file_read):
+ * HostID, SystemBUID, the host cert + key, the device/root certs, the escrow bag.
+ * ios/InterceptorCompanion/Scripts/deploy.sh writes it to disk and imports it
+ * into the InterceptorCompanion app once; it survives reboots.
+ */
+export async function exportPairRecordXml(udid: string): Promise<Buffer | undefined> {
+  const payload = await usbmuxOneShot({ MessageType: "ReadPairRecord", PairRecordID: udid })
+  const inner = xmlDataField(plistToXml(payload), "PairRecordData")
+  return inner ? Buffer.from(plistToXml(inner), "utf-8") : undefined
+}
+
 /** One-shot usbmux control request (ListDevices/ReadPairRecord/…) → response payload. */
 function usbmuxOneShot(dict: Record<string, string | number>): Promise<Buffer> {
   const CLIENT = { ProgName: "interceptor", ClientVersionString: "interceptor-lockdown-1", kLibUSBMuxVersion: 3 }
@@ -237,18 +250,26 @@ class LockdownChannel {
   }
 }
 
+/**
+ * TLS options for a lockdown or service socket: the pair record's host identity and
+ * nothing else. No `ca`: the device certificate is pinned by pairing, and when a CA
+ * verifies it Bun 1.4's handshake handler fetches the peer certificate, throws
+ * ERR_CRYPTO_OPERATION_FAILED on it, and neither the connect callback nor `error`
+ * ever fires (every runner-free lane timed out silently over Wi-Fi). An unverified
+ * chain was already tolerated by rejectUnauthorized.
+ */
+export function lockdownTlsOptions(pair: PairRecord): ConnectionOptions {
+  return { key: pair.HostPrivateKey, cert: pair.HostCertificate, rejectUnauthorized: false, minVersion: "TLSv1" }
+}
+
 /** Wrap a plaintext lockdown/service socket in the mutual-TLS session identity. */
-function upgradeTls(raw: net.Socket, pair: PairRecord): Promise<TLSSocket> {
+export function upgradeTls(raw: net.Socket, pair: PairRecord): Promise<TLSSocket> {
   return new Promise((resolve, reject) => {
     raw.removeAllListeners("data")
-    const t = tls.connect({
-      socket: raw,
-      key: pair.HostPrivateKey, cert: pair.HostCertificate,
-      ca: pair.RootCertificate ?? pair.DeviceCertificate,
-      rejectUnauthorized: false,   // lockdown uses a private CA; the device cert is pinned by pairing
-      minVersion: "TLSv1",
-    }, () => resolve(t))
+    const t = tls.connect({ socket: raw, ...lockdownTlsOptions(pair) }, () => resolve(t))
     t.on("error", reject)
+    // A socket that closes mid-handshake used to leave this promise pending until the CLI deadline.
+    raw.once("close", () => reject(new Error("lockdown TLS upgrade: the socket closed before the handshake completed")))
   })
 }
 
@@ -277,7 +298,7 @@ async function openLockdownSession(udid: string): Promise<{ chan: LockdownChanne
     )
   }
   const deviceId = await resolveDeviceId(udid)
-  if (deviceId === undefined) throw new Error(`ios: device '${udid}' not visible to usbmuxd (plugged in?)`)
+  if (deviceId === undefined) throw new Error(`ios: device '${udid}' not visible to usbmuxd — plug it in over USB or put it on the same Wi-Fi as this Mac (a VPN such as Tailscale cannot reach the phone's pairing services)`)
 
   const raw = await connectUsbmuxPort(deviceId, LOCKDOWN_PORT)
   let chan = new LockdownChannel(raw)
